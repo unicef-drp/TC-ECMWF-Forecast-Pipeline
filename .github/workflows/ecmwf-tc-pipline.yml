@@ -1,0 +1,94 @@
+name: TC Forecast Pipeline
+
+on:
+  # Run automatically every 12 hours (ECMWF releases forecasts 4 times daily)
+  schedule:
+    - cron: '0 8,12,20,0 * * *'  # After each forecast is published
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      download_date:
+        description: 'Specific date to download (YYYYMMDD format, leave empty for latest)'
+        required: false
+        type: string
+      cleanup:
+        description: 'Clean up temporary files after load'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libeccodes0 \
+            libeccodes-dev \
+            libeccodes-tools
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create directories
+        run: |
+          mkdir -p tc_data
+          mkdir -p tc_data_transformed
+
+      - name: Run TC Forecast Pipeline
+        env:
+          # Snowflake credentials from GitHub Secrets
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+
+          # Pipeline configuration
+          DOWNLOAD_DATE: ${{ github.event.inputs.download_date }}
+          DOWNLOAD_LIMIT: '2'
+          CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
+          SKIP_EXISTING: 'false'  # Always process new data in CI
+        run: |
+          python main.py
+
+      - name: Upload pipeline logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: |
+            pipeline.log
+            tc_data/verification.json
+          retention-days: 30
+
+      - name: Upload artifacts (if pipeline fails)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-data-${{ github.run_number }}
+          path: |
+            tc_data/*.csv
+            tc_data_transformed/*.csv
+          retention-days: 7
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Pipeline failed! Check logs for details."
+          exit 1
