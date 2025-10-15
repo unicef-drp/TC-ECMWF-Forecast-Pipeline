@@ -11,10 +11,12 @@ The transformer processes:
 - Standardizes column names and units
 - Adds data quality checks and validation
 - Handles wind radii data conversion
+- Creates individual wind field polygons
 
 Data Structure:
 - Input: Raw CSV with duplicated rows for wind radii data
-- Output: Clean CSV with one row per forecast point
+- Output: One CSV file:
+  - <base>_transformed.csv: Individual forecast points with wind field polygons
 - Wind radii converted from long to wide format (quadrants as columns)
 - Units standardized (km, knots, hPa)
 
@@ -32,6 +34,8 @@ import re
 
 import numpy as np
 import pandas as pd
+from shapely.geometry import Polygon, Point
+import geopandas as gpd
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -77,7 +81,7 @@ def validate_raw_data(df: pd.DataFrame) -> bool:
     if df['wlongitude'].isna().all():
         raise ValueError("All wind longitude values are missing")
 
-    print(f"✓ Validation passed: {len(df)} rows, {len(df.columns)} columns")
+    print(f" Validation passed: {len(df)} rows, {len(df.columns)} columns")
     return True
 
 
@@ -195,6 +199,152 @@ def convert_wind_radii_wide(wind_radii_df: pd.DataFrame) -> pd.DataFrame:
     return wide_df
 
 
+def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw: float, r_nw: float) -> Optional[Polygon]:
+    """
+    Create a rectangular wind region polygon from quadrant radii (in km).
+    Returns a Shapely Polygon in lon/lat degrees.
+
+    Args:
+        lat: Hurricane center latitude
+        lon: Hurricane center longitude
+        r_ne: Northeast quadrant radius in km
+        r_se: Southeast quadrant radius in km
+        r_sw: Southwest quadrant radius in km
+        r_nw: Northwest quadrant radius in km
+
+    Returns:
+        Shapely Polygon or None if invalid
+    """
+    # Check if any radius is non-zero
+    if not any([r_ne, r_se, r_sw, r_nw]):
+        return None
+
+    # Convert km to degrees (approximate: 1 degree ≈ 111 km)
+    deg_per_km = 1.0 / 111.0
+
+    # Calculate polygon bounds
+    lat_min = lat - max(r_sw, r_se) * deg_per_km
+    lat_max = lat + max(r_ne, r_nw) * deg_per_km
+    lon_min = lon - max(r_sw, r_nw) * deg_per_km
+    lon_max = lon + max(r_ne, r_se) * deg_per_km
+
+    # Create rectangular polygon (ensure it's properly closed)
+    polygon_coords = [
+        (lon_min, lat_min),  # SW corner
+        (lon_max, lat_min),  # SE corner
+        (lon_max, lat_max),  # NE corner
+        (lon_min, lat_max),  # NW corner
+        (lon_min, lat_min)  # Close polygon
+    ]
+
+    # Ensure the polygon is valid
+    try:
+        polygon = Polygon(polygon_coords)
+        if not polygon.is_valid:
+            return None
+    except Exception:
+        return None
+
+    return polygon if polygon.is_valid else None
+
+
+def create_wind_field_polygons(forecasts_df: pd.DataFrame, wind_threshold: int = 64) -> pd.DataFrame:
+    """
+    Create wind field polygons for each forecast point.
+
+    Args:
+        forecasts_df: DataFrame with forecast data and wind radii
+        wind_threshold: Wind speed threshold in knots (34, 50, 64)
+
+    Returns:
+        DataFrame with added wind field polygon columns
+    """
+    df = forecasts_df.copy()
+
+    # Get wind radius columns for the specified threshold
+    radius_cols = [
+        f'radius_{wind_threshold}_knot_winds_ne_km',
+        f'radius_{wind_threshold}_knot_winds_se_km',
+        f'radius_{wind_threshold}_knot_winds_sw_km',
+        f'radius_{wind_threshold}_knot_winds_nw_km'
+    ]
+
+    # Check if wind radius data exists
+    if not all(col in df.columns for col in radius_cols):
+        print(f"  Warning: Wind radius data for {wind_threshold} kt not found")
+        df[f'wind_field_polygon_{wind_threshold}kt'] = None
+        return df
+
+    # Create wind field polygons
+    polygons = []
+    for _, row in df.iterrows():
+        lat = row['latitude']
+        lon = row['longitude']
+
+        # Get wind radii
+        r_ne = row.get(radius_cols[0], 0) or 0
+        r_se = row.get(radius_cols[1], 0) or 0
+        r_sw = row.get(radius_cols[2], 0) or 0
+        r_nw = row.get(radius_cols[3], 0) or 0
+
+        # Create polygon
+        if any([r_ne, r_se, r_sw, r_nw]):
+            poly = wind_quadrant_polygon(lat, lon, r_ne, r_se, r_sw, r_nw)
+            polygons.append(poly)
+        else:
+            polygons.append(None)
+
+    # Add polygon column
+    df[f'wind_field_polygon_{wind_threshold}kt'] = polygons
+
+    return df
+
+
+def polygon_to_wkt(polygon) -> Optional[str]:
+    """
+    Convert Shapely polygon to WKT format for database storage.
+
+    Args:
+        polygon: Shapely Polygon or None
+
+    Returns:
+        WKT string or None
+    """
+    if polygon is None:
+        return None
+
+    try:
+        if hasattr(polygon, 'wkt'):
+            return polygon.wkt
+        else:
+            return None
+    except Exception:
+        return None
+
+
+def convert_polygons_to_wkt(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert all polygon columns to WKT format for database storage.
+
+    Args:
+        df: DataFrame with polygon columns
+
+    Returns:
+        DataFrame with WKT string columns
+    """
+    df = df.copy()
+
+    # Find all polygon columns
+    polygon_cols = [col for col in df.columns if 'polygon' in col.lower() or 'region' in col.lower()]
+
+    for col in polygon_cols:
+        if col in df.columns:
+            # Convert polygons to WKT strings
+            df[col] = df[col].apply(polygon_to_wkt)
+
+    return df
+
+
 def calculate_rmw(forecasts_df: pd.DataFrame) -> pd.Series:
     """
     Calculate radius of maximum winds from storm center to max wind location.
@@ -247,7 +397,8 @@ def calculate_rmw(forecasts_df: pd.DataFrame) -> pd.Series:
 
 
 def transform_tc_data(raw_csv_path: str,
-                      output_csv_path: Optional[str] = None, storm_name: Optional[str] = None,
+                      output_base_path: Optional[str] = None,
+                      storm_name: Optional[str] = None,
                       verbose: bool = True) -> Dict[str, Union[str, int, bool]]:
     """
     Transform raw tropical cyclone data to standardized format.
@@ -261,18 +412,22 @@ def transform_tc_data(raw_csv_path: str,
     - Wind radii in wide format
     - Proper units (km, knots, hPa)
     - Quality checks
+    - Individual wind field polygons
 
     Args:
         raw_csv_path (str): Path to raw CSV from extractor
-        output_csv_path (str, optional): Path to save transformed CSV
+        output_base_path (str, optional): Base path for output file (without suffix)
+            Will create: <base>_transformed.csv
+            Example: output_base_path='tc_data/HUMBERTO' creates:
+                - tc_data/HUMBERTO_transformed.csv
         storm_name (str, optional): Override storm ID with specific storm name
         verbose (bool): Whether to print detailed progress information
 
     Returns:
         dict: Summary dictionary with keys:
             - success (bool): Whether transformation was successful
-            - csv_file (str): Path to saved CSV file (None if failed)
-            - records (int): Total number of records transformed
+            - csv_file (str): Path to saved main CSV file (None if failed)
+            - records (int): Total number of forecast records transformed
     """
     if verbose:
         print(f"Transforming: {raw_csv_path}")
@@ -307,6 +462,7 @@ def transform_tc_data(raw_csv_path: str,
                 'storm_id', 'ensemble_member', 'step',
                 'wind_threshold', 'quadrant', 'wind_radius'
             ]
+            # Include rows with wind_radius data (including 0.0 values, but exclude NaN)
             wind_radii_df = raw_df[wind_cols].dropna(subset=['wind_radius'])
 
             if not wind_radii_df.empty:
@@ -327,8 +483,8 @@ def transform_tc_data(raw_csv_path: str,
             'step': 'lead_time',
             'datetime': 'valid_time',
             'pressure': 'pressure_hpa',  # Assuming hPa from ECMWF
-                'wind': 'wind_speed_ms'
-            })
+            'wind': 'wind_speed_ms'
+        })
 
         # Optionally overwrite track_id with extracted name
         if storm_name:
@@ -362,6 +518,33 @@ def transform_tc_data(raw_csv_path: str,
             print("  Calculating radius of maximum winds")
         forecasts_df['radius_of_maximum_winds_km'] = calculate_rmw(forecasts_df)
 
+        # Create wind field polygons for available thresholds
+        available_thresholds = [34, 50, 64]  # Common hurricane wind thresholds
+        for threshold in available_thresholds:
+            # Check if wind radius data exists for this threshold
+            threshold_cols = [
+                f'radius_{threshold}_knot_winds_ne_km',
+                f'radius_{threshold}_knot_winds_se_km',
+                f'radius_{threshold}_knot_winds_sw_km',
+                f'radius_{threshold}_knot_winds_nw_km'
+            ]
+
+            if all(col in forecasts_df.columns for col in threshold_cols):
+                if verbose:
+                    print(f"  Creating wind field polygons for {threshold} kt winds")
+
+                # Create individual wind field polygons
+                forecasts_df = create_wind_field_polygons(forecasts_df, threshold)
+
+            else:
+                if verbose:
+                    print(f"  Skipping {threshold} kt winds - no radius data available")
+
+        # Convert polygons to WKT format for database storage
+        if verbose:
+            print("  Converting polygons to WKT format")
+        forecasts_df = convert_polygons_to_wkt(forecasts_df)
+
         # Reorder columns to match standard format
         standard_columns = [
             'forecast_time',
@@ -386,7 +569,11 @@ def transform_tc_data(raw_csv_path: str,
             'radius_64_knot_winds_ne_km',
             'radius_64_knot_winds_se_km',
             'radius_64_knot_winds_sw_km',
-            'radius_64_knot_winds_nw_km'
+            'radius_64_knot_winds_nw_km',
+            # Wind field polygon columns
+            'wind_field_polygon_34kt',
+            'wind_field_polygon_50kt',
+            'wind_field_polygon_64kt'
         ]
 
         # Select columns (add missing ones as NaN)
@@ -395,6 +582,18 @@ def transform_tc_data(raw_csv_path: str,
                 forecasts_df[col] = np.nan
 
         result_df = forecasts_df[standard_columns]
+
+        # Save file (if output path provided)
+        main_csv = None
+
+        if output_base_path:
+            # Generate output filename
+            main_csv = f"{output_base_path}_transformed.csv"
+
+            # Save main forecast CSV
+            result_df.to_csv(main_csv, index=False, date_format='%Y-%m-%d %H:%M:%S')
+            if verbose:
+                print(f"  Saved {len(result_df)} forecast records to {main_csv}")
 
         # Data quality summary
         if verbose:
@@ -414,15 +613,9 @@ def transform_tc_data(raw_csv_path: str,
             for col, count in critical_nulls[critical_nulls > 0].items():
                 print(f"    {col}: {count} missing values")
 
-        # Save if output path provided
-        if output_csv_path:
-            result_df.to_csv(output_csv_path, index=False, date_format='%Y-%m-%d %H:%M:%S')
-            if verbose:
-                print(f"\n✓ Saved to: {output_csv_path}")
-
         return {
             'success': True,
-            'csv_file': output_csv_path,
+            'csv_file': main_csv,
             'records': len(result_df)
         }
 
@@ -454,7 +647,7 @@ def transform_all_in_directory(input_dir: str,
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
 
-    # Find all CSV files (excluding SUMMARY.csv)
+    # Find all CSV files
     csv_files = [f for f in input_path.glob("*.csv") if f.name != "SUMMARY.csv"]
 
     if not csv_files:
@@ -516,7 +709,7 @@ def transform_tc_data_from_file(filename: str,
     Returns:
         dict: Summary dictionary with keys:
             - success (bool): Whether transformation was successful
-            - csv_file (str): Path to saved CSV file (None if failed)
+            - csv_file (str): Path to saved main CSV file (None if failed)
             - records (int): Total number of records transformed
     """
     # Determine output directory - use same directory as input file if not specified
@@ -531,21 +724,21 @@ def transform_tc_data_from_file(filename: str,
 
     # Generate output filename
     base_name = os.path.splitext(os.path.basename(filename))[0]
-    csv_file = os.path.join(output_dir, base_name + DEFAULT_CSV_SUFFIX)
+    base_path = os.path.join(output_dir, base_name)
 
     # Try to extract storm name from filename
     match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', base_name)
     storm_name = match.group(1) if match else None
 
     # Transform data
-    result = transform_tc_data(filename, csv_file, storm_name=storm_name, verbose=verbose)
+    result = transform_tc_data(filename, base_path, storm_name=storm_name, verbose=verbose)
 
     if result['success']:
         if verbose:
             print("=" * 50)
             print(f"Summary:")
             print(f"   Successfully transformed: {result['records']} records")
-            print(f"   CSV file: {result['csv_file']}")
+            print(f"   Main CSV file: {result['csv_file']}")
             print("=" * 50)
     else:
         if verbose:
