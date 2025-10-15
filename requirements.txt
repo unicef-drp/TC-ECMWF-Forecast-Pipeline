@@ -1,9 +1,24 @@
 # Core dependencies for BUFR processing
 eccodes>=1.5.0
 
+# ECMWF data access
+ecmwf-opendata>=0.0.8
+
 # Data processing
 pandas>=2.0.0
 numpy>=1.24.0
+xarray>=2023.1.0
+
+# Geospatial processing
+shapely>=2.0.0
+scipy>=1.10.0
+geopandas>=0.13.0
+
+# GRIB data processing
+cfgrib>=0.9.10
+
+# Visualization
+matplotlib>=3.7.0
 
 # Web scraping and HTTP
 requests>=2.31.0
