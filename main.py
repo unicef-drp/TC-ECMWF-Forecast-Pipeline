@@ -596,3 +596,6 @@ def main():
         logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
         stats.log_summary()
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
