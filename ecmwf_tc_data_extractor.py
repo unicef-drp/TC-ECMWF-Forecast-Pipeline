@@ -7,7 +7,7 @@ It handles the complex BUFR Template 316082 format used by ECMWF for tropical cy
 ensemble forecasts.
 
 The extractor processes:
-- Multiple ensemble members (typically 52 members)
+- Multiple ensemble members (51 members: 1-50 perturbed + 51 control)
 - Forecast time steps (0-240 hours)
 - Storm center positions and maximum wind locations
 - Wind radii data for different thresholds (18, 26, 33 m/s = 34, 50, 64 knots)
@@ -20,7 +20,9 @@ Data Structure:
 - Wind radii: Storm size and extent for different wind speed thresholds
 
 References:
-- ECMWF BUFR Format: https://confluence.ecmwf.int/display/ECC/BUFR+examples
+- ECMWF BUFR Format:
+    - https://confluence.ecmwf.int/display/ECC/BUFR+examples
+    - https://confluence.ecmwf.int/display/FCST/Update+to+Tropical+Cyclone+tracks
 - eccodes: https://sites.ecmwf.int/docs/eccodes/
 - Tropical Cyclone Data: https://essential.ecmwf.int
 - BUFR Template 316082: https://confluence.ecmwf.int/display/ECC/bufr_read_tropical_cyclone
@@ -369,7 +371,19 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
     # Close the file
     f.close()
 
-    return pd.DataFrame(unpacked_data)
+    # Create DataFrame
+    df = pd.DataFrame(unpacked_data)
+
+    # Filter out only HRES member (52) - keep ensemble members (1-51)
+    if not df.empty and 'ensemble_member' in df.columns:
+        original_count = len(df)
+        df = df[df['ensemble_member'] != 52]  # Exclude only HRES (52)
+        filtered_count = len(df)
+
+        if verbose and original_count > filtered_count:
+            print(f"Filtered out HRES member (52): {original_count} -> {filtered_count} records")
+
+    return df
 
 
 def extract_tc_data_from_file(filename: str,
