@@ -119,10 +119,10 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
 
         if use_staging:
             # Method 1: Staging table + MERGE (handles duplicates, slightly slower)
-            staging_table = "TC_FORECASTS_STAGING"
+            staging_table = "TC_TRACKS_STAGING"
 
             # Create staging table (temporary) - use CREATE OR REPLACE to handle any existing table
-            cursor.execute(f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE TC_FORECASTS")
+            cursor.execute(f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE TC_TRACKS")
             logger.info(f"  Created staging table")
 
             # Bulk upload to staging table
@@ -151,7 +151,7 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
 
             # MERGE from staging to main table
             merge_sql = f"""
-                MERGE INTO TC_FORECASTS t
+                MERGE INTO TC_TRACKS t
                 USING {staging_table} s
                 ON t.TRACK_ID = s.TRACK_ID 
                     AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
@@ -181,7 +181,7 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
             """
             cursor.execute(merge_sql)
             rows_merged = cursor.rowcount
-            logger.info(f"  Merged {rows_merged} rows into TC_FORECASTS")
+            logger.info(f"  Merged {rows_merged} rows into TC_TRACKS")
 
             # Drop staging table
             cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
@@ -191,13 +191,13 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
             success, nchunks, nrows, _ = write_pandas(
                 conn=conn,
                 df=df_upload,
-                table_name="TC_FORECASTS",
+                table_name="TC_TRACKS",
                 auto_create_table=False,
                 quote_identifiers=False
             )
 
             if not success:
-                logger.error(f"  Failed to write to TC_FORECASTS")
+                logger.error(f"  Failed to write to TC_TRACKS")
                 return 0
 
             logger.info(f"  Inserted {nrows} rows directly")
@@ -244,7 +244,7 @@ def main():
 
             # Verify
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM TC_FORECASTS")
+            cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
             total_in_db = cursor.fetchone()[0]
             cursor.close()
 

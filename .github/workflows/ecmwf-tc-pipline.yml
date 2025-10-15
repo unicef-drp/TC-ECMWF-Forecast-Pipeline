@@ -37,12 +37,21 @@ jobs:
           sudo apt-get install -y \
             libeccodes0 \
             libeccodes-dev \
-            libeccodes-tools
+            libeccodes-tools \
+            libhdf5-dev \
+            libnetcdf-dev \
+            pkg-config \
+            libfreetype6-dev \
+            libpng-dev
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
+          echo "=== Checking critical packages ==="
+          pip list | grep -E "(xarray|matplotlib|cfgrib|ecmwf)" || echo "Some packages missing!"
+          echo "=== Installing missing packages individually ==="
+          pip install --no-cache-dir xarray matplotlib cfgrib
 
       - name: Create directories
         run: |
@@ -56,12 +65,13 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_DATABASE: AOTS
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
 
           # Pipeline configuration
           DOWNLOAD_DATE: ${{ github.event.inputs.download_date }}
-          DOWNLOAD_LIMIT: '2'
+          DOWNLOAD_LIMIT: '1'
+          PROCESS_WIND_DATA: 'true'
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
           SKIP_EXISTING: 'false'  # Always process new data in CI
         run: |
