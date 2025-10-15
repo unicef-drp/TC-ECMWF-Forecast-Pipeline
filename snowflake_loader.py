@@ -88,16 +88,29 @@ def prepare_dataframe(df):
     for col in int_columns:
         df_upload[col] = df_upload[col].where(pd.notna(df_upload[col]), None)
 
+    # Clean geography columns - ensure proper WKT format
+    geography_columns = ['ENVELOPE_REGION', 'WIND_FIELD_POLYGON_34KT', 'WIND_FIELD_POLYGON_50KT',
+                         'WIND_FIELD_POLYGON_64KT']
+    for col in geography_columns:
+        if col in df_upload.columns:
+            # Replace None, empty strings, and 'None' strings with None
+            df_upload[col] = df_upload[col].replace(['', 'None', 'null'], None)
+            # Ensure proper WKT format
+            df_upload[col] = df_upload[col].apply(
+                lambda x: None if pd.isna(x) or x is None else str(x).strip()
+            )
+
     return df_upload
 
 
-def load_csv_to_snowflake(csv_file, conn, use_staging=True):
+def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=True):
     """
     Load CSV file into Snowflake using bulk operations.
 
     Args:
         csv_file: Path to CSV file
         conn: Snowflake connection
+        table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL', 'TC_ENVELOPES_COMBINED')
         use_staging: If True, use staging table + MERGE (handles duplicates)
                      If False, direct INSERT (faster but no deduplication)
     """
@@ -119,11 +132,64 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
 
         if use_staging:
             # Method 1: Staging table + MERGE (handles duplicates, slightly slower)
-            staging_table = "TC_TRACKS_STAGING"
+            staging_table = f"{table_type}_STAGING"
 
-            # Create staging table (temporary) - use CREATE OR REPLACE to handle any existing table
-            cursor.execute(f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE TC_TRACKS")
-            logger.info(f"  Created staging table")
+            # Create staging table with proper column types for geography handling
+            if table_type == 'TC_TRACKS':
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME INTEGER,
+                        LATITUDE FLOAT,
+                        LONGITUDE FLOAT,
+                        PRESSURE_HPA FLOAT,
+                        WIND_SPEED_KNOTS FLOAT,
+                        RADIUS_OF_MAXIMUM_WINDS_KM FLOAT,
+                        RADIUS_34_KNOT_WINDS_NE_KM FLOAT,
+                        RADIUS_34_KNOT_WINDS_SE_KM FLOAT,
+                        RADIUS_34_KNOT_WINDS_SW_KM FLOAT,
+                        RADIUS_34_KNOT_WINDS_NW_KM FLOAT,
+                        RADIUS_50_KNOT_WINDS_NE_KM FLOAT,
+                        RADIUS_50_KNOT_WINDS_SE_KM FLOAT,
+                        RADIUS_50_KNOT_WINDS_SW_KM FLOAT,
+                        RADIUS_50_KNOT_WINDS_NW_KM FLOAT,
+                        RADIUS_64_KNOT_WINDS_NE_KM FLOAT,
+                        RADIUS_64_KNOT_WINDS_SE_KM FLOAT,
+                        RADIUS_64_KNOT_WINDS_SW_KM FLOAT,
+                        RADIUS_64_KNOT_WINDS_NW_KM FLOAT,
+                        WIND_FIELD_POLYGON_34KT VARCHAR,
+                        WIND_FIELD_POLYGON_50KT VARCHAR,
+                        WIND_FIELD_POLYGON_64KT VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_ENVELOPES_INDIVIDUAL':
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME INTEGER,
+                        WIND_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_ENVELOPES_COMBINED':
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
+                        WIND_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            logger.info(f"  Created staging table with proper column types")
 
             # Bulk upload to staging table
             success, nchunks, nrows, _ = write_pandas(
@@ -140,48 +206,128 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
 
             logger.info(f"  Uploaded {nrows} rows to staging table")
 
-            # Update LOCATION column using ST_POINT (handle NULL coordinates)
-            cursor.execute(f"""
-                UPDATE {staging_table}
-                SET LOCATION = ST_POINT(LONGITUDE, LATITUDE)
-                WHERE LONGITUDE IS NOT NULL AND LATITUDE IS NOT NULL
-            """)
-            updated = cursor.rowcount
-            logger.info(f"  Updated {updated} LOCATION geography points")
+            # Handle different table types
+            if table_type == 'TC_TRACKS':
+                # No special geography processing needed for TC_TRACKS
+                logger.info(f"  Processing TC_TRACKS data")
 
-            # MERGE from staging to main table
-            merge_sql = f"""
-                MERGE INTO TC_TRACKS t
-                USING {staging_table} s
-                ON t.TRACK_ID = s.TRACK_ID 
-                    AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
-                    AND t.FORECAST_TIME = s.FORECAST_TIME
-                    AND t.LEAD_TIME = s.LEAD_TIME
-                WHEN NOT MATCHED THEN INSERT (
-                    FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
-                    LATITUDE, LONGITUDE, PRESSURE_HPA, WIND_SPEED_KNOTS,
-                    RADIUS_OF_MAXIMUM_WINDS_KM, LOCATION,
-                    RADIUS_34_KNOT_WINDS_NE_KM, RADIUS_34_KNOT_WINDS_SE_KM,
-                    RADIUS_34_KNOT_WINDS_SW_KM, RADIUS_34_KNOT_WINDS_NW_KM,
-                    RADIUS_50_KNOT_WINDS_NE_KM, RADIUS_50_KNOT_WINDS_SE_KM,
-                    RADIUS_50_KNOT_WINDS_SW_KM, RADIUS_50_KNOT_WINDS_NW_KM,
-                    RADIUS_64_KNOT_WINDS_NE_KM, RADIUS_64_KNOT_WINDS_SE_KM,
-                    RADIUS_64_KNOT_WINDS_SW_KM, RADIUS_64_KNOT_WINDS_NW_KM
-                ) VALUES (
-                    s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
-                    s.LATITUDE, s.LONGITUDE, s.PRESSURE_HPA, s.WIND_SPEED_KNOTS,
-                    s.RADIUS_OF_MAXIMUM_WINDS_KM, s.LOCATION,
-                    s.RADIUS_34_KNOT_WINDS_NE_KM, s.RADIUS_34_KNOT_WINDS_SE_KM,
-                    s.RADIUS_34_KNOT_WINDS_SW_KM, s.RADIUS_34_KNOT_WINDS_NW_KM,
-                    s.RADIUS_50_KNOT_WINDS_NE_KM, s.RADIUS_50_KNOT_WINDS_SE_KM,
-                    s.RADIUS_50_KNOT_WINDS_SW_KM, s.RADIUS_50_KNOT_WINDS_NW_KM,
-                    s.RADIUS_64_KNOT_WINDS_NE_KM, s.RADIUS_64_KNOT_WINDS_SE_KM,
-                    s.RADIUS_64_KNOT_WINDS_SW_KM, s.RADIUS_64_KNOT_WINDS_NW_KM
-                )
-            """
+                # MERGE from staging to main table
+                merge_sql = f"""
+                    MERGE INTO TC_TRACKS t
+                    USING {staging_table} s
+                    ON t.TRACK_ID = s.TRACK_ID 
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.LEAD_TIME = s.LEAD_TIME
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                        LATITUDE, LONGITUDE, PRESSURE_HPA, WIND_SPEED_KNOTS,
+                        RADIUS_OF_MAXIMUM_WINDS_KM,
+                        RADIUS_34_KNOT_WINDS_NE_KM, RADIUS_34_KNOT_WINDS_SE_KM,
+                        RADIUS_34_KNOT_WINDS_SW_KM, RADIUS_34_KNOT_WINDS_NW_KM,
+                        RADIUS_50_KNOT_WINDS_NE_KM, RADIUS_50_KNOT_WINDS_SE_KM,
+                        RADIUS_50_KNOT_WINDS_SW_KM, RADIUS_50_KNOT_WINDS_NW_KM,
+                        RADIUS_64_KNOT_WINDS_NE_KM, RADIUS_64_KNOT_WINDS_SE_KM,
+                        RADIUS_64_KNOT_WINDS_SW_KM, RADIUS_64_KNOT_WINDS_NW_KM,
+                        WIND_FIELD_POLYGON_34KT, WIND_FIELD_POLYGON_50KT, WIND_FIELD_POLYGON_64KT
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
+                        s.LATITUDE, s.LONGITUDE, s.PRESSURE_HPA, s.WIND_SPEED_KNOTS,
+                        s.RADIUS_OF_MAXIMUM_WINDS_KM,
+                        s.RADIUS_34_KNOT_WINDS_NE_KM, s.RADIUS_34_KNOT_WINDS_SE_KM,
+                        s.RADIUS_34_KNOT_WINDS_SW_KM, s.RADIUS_34_KNOT_WINDS_NW_KM,
+                        s.RADIUS_50_KNOT_WINDS_NE_KM, s.RADIUS_50_KNOT_WINDS_SE_KM,
+                        s.RADIUS_50_KNOT_WINDS_SW_KM, s.RADIUS_50_KNOT_WINDS_NW_KM,
+                        s.RADIUS_64_KNOT_WINDS_NE_KM, s.RADIUS_64_KNOT_WINDS_SE_KM,
+                        s.RADIUS_64_KNOT_WINDS_SW_KM, s.RADIUS_64_KNOT_WINDS_NW_KM,
+                        s.WIND_FIELD_POLYGON_34KT, s.WIND_FIELD_POLYGON_50KT, s.WIND_FIELD_POLYGON_64KT
+                    )
+                """
+
+            elif table_type == 'TC_ENVELOPES_INDIVIDUAL':
+                # No need to update geography in staging table - keep as VARCHAR
+                # Geography conversion will happen during MERGE
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+
+                # MERGE from staging to main table with geography conversion
+                merge_sql = f"""
+                    MERGE INTO TC_ENVELOPES_INDIVIDUAL t
+                    USING (
+                        SELECT 
+                            FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                            WIND_THRESHOLD,
+                            CASE 
+                                WHEN ENVELOPE_REGION IS NOT NULL 
+                                     AND ENVELOPE_REGION != '' 
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID 
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.LEAD_TIME = s.LEAD_TIME
+                        AND t.WIND_THRESHOLD = s.WIND_THRESHOLD
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                        WIND_THRESHOLD, ENVELOPE_REGION
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
+                        s.WIND_THRESHOLD, s.ENVELOPE_REGION
+                    )
+                """
+
+            elif table_type == 'TC_ENVELOPES_COMBINED':
+                # No need to update geography in staging table - keep as VARCHAR
+                # Geography conversion will happen during MERGE
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+                logger.info(f"  LEAD_TIME will be parsed from VARCHAR to INTEGER during MERGE")
+
+                # MERGE from staging to main table with geography conversion and lead time range handling
+                merge_sql = f"""
+                    MERGE INTO TC_ENVELOPES_COMBINED t
+                    USING (
+                        SELECT 
+                            CASE 
+                                WHEN FORECAST_TIME IS NULL THEN VALID_TIME
+                                ELSE FORECAST_TIME
+                            END AS FORECAST_TIME,
+                            TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME,
+                            CASE 
+                                WHEN LEAD_TIME LIKE '%-%' THEN 
+                                    CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
+                                ELSE CAST(LEAD_TIME AS INTEGER)
+                            END AS LEAD_TIME_RANGE,
+                            WIND_THRESHOLD,
+                            CASE 
+                                WHEN ENVELOPE_REGION IS NOT NULL 
+                                     AND ENVELOPE_REGION != '' 
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID 
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.WIND_THRESHOLD = s.WIND_THRESHOLD
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME_RANGE,
+                        WIND_THRESHOLD, ENVELOPE_REGION
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME_RANGE,
+                        s.WIND_THRESHOLD, s.ENVELOPE_REGION
+                    )
+                """
+
             cursor.execute(merge_sql)
             rows_merged = cursor.rowcount
-            logger.info(f"  Merged {rows_merged} rows into TC_TRACKS")
+            logger.info(f"  Merged {rows_merged} rows into {table_type}")
 
             # Drop staging table
             cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
@@ -191,13 +337,13 @@ def load_csv_to_snowflake(csv_file, conn, use_staging=True):
             success, nchunks, nrows, _ = write_pandas(
                 conn=conn,
                 df=df_upload,
-                table_name="TC_TRACKS",
+                table_name=table_type,
                 auto_create_table=False,
                 quote_identifiers=False
             )
 
             if not success:
-                logger.error(f"  Failed to write to TC_TRACKS")
+                logger.error(f"  Failed to write to {table_type}")
                 return 0
 
             logger.info(f"  Inserted {nrows} rows directly")
