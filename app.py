@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, State
 import snowflake.connector
 import numpy as np
+from shapely import wkt
 
 
 # Snowflake connection
@@ -29,7 +30,7 @@ def get_snowflake_data():
                                      FORECAST_TIME, \
                                      COUNT(DISTINCT ENSEMBLE_MEMBER) as ensemble_count, \
                                      MAX(LEAD_TIME)                  as max_lead_time
-                     FROM TC_FORECASTS
+                     FROM TC_TRACKS
                      GROUP BY TRACK_ID, FORECAST_TIME
                      ORDER BY FORECAST_TIME DESC, TRACK_ID \
                      """
@@ -63,10 +64,42 @@ def get_forecast_data(track_id, forecast_time):
         LONGITUDE,
         WIND_SPEED_KNOTS,
         PRESSURE_HPA
-    FROM TC_FORECASTS
+    FROM TC_TRACKS
     WHERE TRACK_ID = '{track_id}'
       AND FORECAST_TIME = '{forecast_time}'
     ORDER BY ENSEMBLE_MEMBER, LEAD_TIME
+    """
+
+    cursor = conn.cursor()
+    cursor.execute(query)
+    df = cursor.fetch_pandas_all()
+    cursor.close()
+    conn.close()
+
+    return df
+
+
+def get_combined_envelopes(track_id, forecast_time):
+    """Get combined wind envelopes for a specific storm and forecast time"""
+    conn = snowflake.connector.connect(
+        account=os.getenv('SNOWFLAKE_ACCOUNT'),
+        user=os.getenv('SNOWFLAKE_USER'),
+        password=os.getenv('SNOWFLAKE_PASSWORD'),
+        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
+        database=os.getenv('SNOWFLAKE_DATABASE'),
+        schema=os.getenv('SNOWFLAKE_SCHEMA')
+    )
+
+    query = f"""
+    SELECT 
+        ENSEMBLE_MEMBER,
+        LEAD_TIME_RANGE,
+        WIND_THRESHOLD,
+        ST_ASWKT(ENVELOPE_REGION) AS ENVELOPE_REGION
+    FROM TC_ENVELOPES_COMBINED
+    WHERE TRACK_ID = '{track_id}'
+      AND FORECAST_TIME = '{forecast_time}'
+    ORDER BY ENSEMBLE_MEMBER, LEAD_TIME_RANGE, WIND_THRESHOLD
     """
 
     cursor = conn.cursor()
@@ -179,6 +212,45 @@ app.layout = html.Div([
                         tooltip={"placement": "bottom"}
                     ),
                 ], style={'flex': '1', 'minWidth': '200px'}),
+
+                html.Div([
+                    html.Label("Wind Envelopes",
+                               style={'fontSize': '13px', 'fontWeight': '500', 'color': '#444', 'marginBottom': '8px'}),
+                    dcc.RadioItems(
+                        id='envelope-toggle',
+                        options=[
+                            {'label': 'None', 'value': 'none'},
+                            {'label': 'Combined', 'value': 'combined'}
+                        ],
+                        value='none',
+                        style={'fontSize': '14px'},
+                        inputStyle={'marginRight': '8px'}
+                    ),
+                ], style={'flex': '1', 'minWidth': '200px'}),
+
+                html.Div([
+                    html.Label("Wind Thresholds",
+                               style={'fontSize': '13px', 'fontWeight': '500', 'color': '#444', 'marginBottom': '8px'}),
+                    dcc.Checklist(
+                        id='threshold-filter',
+                        options=[
+                            {'label': html.Span(
+                                ['34kt ', html.Span('●', style={'color': '#FFD700', 'fontSize': '16px'})]),
+                             'value': 34},
+                            {'label': html.Span(
+                                ['40kt ', html.Span('●', style={'color': '#FFA500', 'fontSize': '16px'})]),
+                             'value': 40},
+                            {'label': html.Span(
+                                ['50kt ', html.Span('●', style={'color': '#FF8C00', 'fontSize': '16px'})]),
+                             'value': 50},
+                            {'label': html.Span(
+                                ['64kt ', html.Span('●', style={'color': '#FF0000', 'fontSize': '16px'})]), 'value': 64}
+                        ],
+                        value=[34, 40, 50, 64],  # All selected by default
+                        style={'fontSize': '14px'},
+                        inputStyle={'marginRight': '8px'}
+                    ),
+                ], style={'flex': '1', 'minWidth': '250px'}),
             ], style={
                 'display': 'flex',
                 'gap': '20px',
@@ -385,10 +457,14 @@ def load_forecast_data(selected_date, selected_time, storm_id, metadata):
     # Get the forecast data
     forecast_df = get_forecast_data(storm_id, forecast_time)
 
+    # Get combined envelope data
+    combined_envelopes_df = get_combined_envelopes(storm_id, forecast_time)
+
     return {
         'track_id': storm_id,
         'forecast_time': forecast_time,
-        'data': forecast_df.to_dict('records')
+        'data': forecast_df.to_dict('records'),
+        'combined_envelopes': combined_envelopes_df.to_dict('records')
     }
 
 
@@ -404,17 +480,68 @@ def update_sidebar_title(stored_data):
 
 
 @app.callback(
+    Output('threshold-filter', 'options'),
+    Input('forecast-data-store', 'data')
+)
+def update_threshold_options(stored_data):
+    """Dynamically update threshold filter options based on available data"""
+    if not stored_data or not stored_data.get('combined_envelopes'):
+        # Default options when no data
+        return [
+            {'label': html.Span(['34kt ', html.Span('●', style={'color': '#FFD700', 'fontSize': '16px'})]),
+             'value': 34},
+            {'label': html.Span(['40kt ', html.Span('●', style={'color': '#FFA500', 'fontSize': '16px'})]),
+             'value': 40},
+            {'label': html.Span(['50kt ', html.Span('●', style={'color': '#FF8C00', 'fontSize': '16px'})]),
+             'value': 50},
+            {'label': html.Span(['64kt ', html.Span('●', style={'color': '#FF0000', 'fontSize': '16px'})]), 'value': 64}
+        ]
+
+    # Get available thresholds from the data
+    available_thresholds = set()
+    for envelope in stored_data['combined_envelopes']:
+        available_thresholds.add(envelope['WIND_THRESHOLD'])
+
+    # Color mapping for visual indicators
+    color_map = {
+        34: '#FFD700',  # Gold/Yellow
+        40: '#FFA500',  # Orange
+        50: '#FF8C00',  # Dark Orange
+        64: '#FF0000',  # Red
+        74: '#CC0000',  # Dark Red (Category 3)
+        96: '#990000',  # Darker Red (Category 4)
+        113: '#660000'  # Darkest Red (Category 5)
+    }
+
+    # Create options for available thresholds
+    options = []
+    for threshold in sorted(available_thresholds):
+        color = color_map.get(threshold, '#808080')  # Gray for unknown thresholds
+        options.append({
+            'label': html.Span([f'{threshold}kt ', html.Span('●', style={'color': color, 'fontSize': '16px'})]),
+            'value': threshold
+        })
+
+    return options
+
+
+@app.callback(
     Output('tc-map', 'figure'),
     Input('forecast-data-store', 'data'),
-    Input('opacity-slider', 'value')
+    Input('opacity-slider', 'value'),
+    Input('envelope-toggle', 'value'),
+    Input('threshold-filter', 'value')
 )
-def update_map(stored_data, opacity):
-    """Update map with TC tracks using Plotly animation frames and Mapbox"""
+def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
+    """Update map with TC tracks and wind envelopes using Plotly animation frames and Mapbox"""
     if not stored_data or not stored_data.get('data'):
         return go.Figure()
 
     df = pd.DataFrame(stored_data['data'])
     track_id = stored_data['track_id']
+
+    # Get combined envelope data
+    combined_envelopes = stored_data.get('combined_envelopes', [])
 
     # Get all unique time steps
     time_steps = sorted(df['LEAD_TIME'].unique())
@@ -482,6 +609,91 @@ def update_map(stored_data, opacity):
                                       '<br>Hour: %{text}<br>Lat: %{lat:.2f}<br>Lon: %{lon:.2f}<extra></extra>',
                         text=seg_times
                     ))
+
+        # Add combined wind envelopes
+        if envelope_mode == 'combined' and combined_envelopes:
+            # Add combined envelopes - these represent the TOTAL area across ALL forecast steps
+            # Show them for all time steps since they represent the total possible impact
+
+            for envelope in combined_envelopes:
+                # Filter by selected thresholds
+                threshold = envelope['WIND_THRESHOLD']
+                if threshold not in selected_thresholds:
+                    continue
+
+                try:
+                    # Parse polygon data - could be WKT or JSON format
+                    envelope_data = envelope['ENVELOPE_REGION']
+
+                    if envelope_data and isinstance(envelope_data, str):
+                        # Check if it's JSON format (from Snowflake GEOGRAPHY)
+                        if envelope_data.startswith('{"coordinates"'):
+                            import json
+                            try:
+                                # Parse JSON coordinates
+                                geo_data = json.loads(envelope_data)
+                                coords = geo_data['coordinates'][0][0]  # Get first ring of first polygon
+
+                                # Convert to lon/lat arrays
+                                lons_env = [coord[0] for coord in coords]
+                                lats_env = [coord[1] for coord in coords]
+
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+
+                        # Check if it's WKT format (POLYGON or MULTIPOLYGON)
+                        elif envelope_data.startswith(('POLYGON', 'MULTIPOLYGON')):
+                            try:
+                                polygon = wkt.loads(envelope_data)
+                                if polygon.is_valid:
+                                    # Handle both POLYGON and MULTIPOLYGON
+                                    if hasattr(polygon, 'geoms'):  # MULTIPOLYGON
+                                        # For MULTIPOLYGON, use the first polygon
+                                        first_polygon = polygon.geoms[0]
+                                        exterior_coords = list(first_polygon.exterior.coords)
+                                    else:  # POLYGON
+                                        exterior_coords = list(polygon.exterior.coords)
+
+                                    lons_env = [coord[0] for coord in exterior_coords]
+                                    lats_env = [coord[1] for coord in exterior_coords]
+                                else:
+                                    continue
+                            except Exception:
+                                continue
+                        else:
+                            continue
+                    else:
+                        continue
+
+                    # Determine envelope color based on wind threshold
+                    member = envelope.get('ENSEMBLE_MEMBER', 'Unknown')
+
+                    # Color mapping matching the UI indicators (expanded for all thresholds)
+                    color_map = {
+                        34: 'rgba(255, 215, 0, 0.3)',  # Gold/Yellow (#FFD700)
+                        40: 'rgba(255, 165, 0, 0.3)',  # Orange (#FFA500)
+                        50: 'rgba(255, 140, 0, 0.3)',  # Dark Orange (#FF8C00)
+                        64: 'rgba(255, 0, 0, 0.3)',  # Red (#FF0000)
+                        74: 'rgba(204, 0, 0, 0.3)',  # Dark Red (Category 3)
+                        96: 'rgba(153, 0, 0, 0.3)',  # Darker Red (Category 4)
+                        113: 'rgba(102, 0, 0, 0.3)'  # Darkest Red (Category 5)
+                    }
+                    env_color = color_map.get(threshold, 'rgba(128, 128, 128, 0.3)')  # Gray for others
+
+                    frame_data.append(go.Scattermap(
+                        lon=lons_env,
+                        lat=lats_env,
+                        mode='lines',
+                        line=dict(width=1, color=env_color),
+                        fill='toself',
+                        fillcolor=env_color,
+                        showlegend=False,
+                        name=f"Combined - {threshold}kt - M{member}",
+                        hovertemplate=f"<b>Combined Envelope</b><br>Member: {member}<br>{threshold}kt Wind Field<br>Total Forecast Period<extra></extra>"
+                    ))
+
+                except Exception:
+                    continue
 
         frames.append(go.Frame(data=frame_data, name=str(time_step)))
 
