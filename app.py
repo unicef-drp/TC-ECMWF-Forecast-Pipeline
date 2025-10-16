@@ -246,10 +246,11 @@ app.layout = html.Div([
                             {'label': html.Span(
                                 ['64kt ', html.Span('●', style={'color': '#FF0000', 'fontSize': '16px'})]), 'value': 64}
                         ],
-                        value=[34, 40, 50, 64],  # All selected by default
+                        value=[],  # Empty by default - will be populated by callback
                         style={'fontSize': '14px'},
                         inputStyle={'marginRight': '8px'}
                     ),
+                    html.Div(id='threshold-note', style={'fontSize': '12px', 'color': '#666', 'marginTop': '6px'}),
                 ], style={'flex': '1', 'minWidth': '250px'}),
             ], style={
                 'display': 'flex',
@@ -480,22 +481,25 @@ def update_sidebar_title(stored_data):
 
 
 @app.callback(
-    Output('threshold-filter', 'options'),
+    [Output('threshold-filter', 'options'),
+     Output('threshold-filter', 'value'),
+     Output('threshold-note', 'children'),
+     Output('envelope-toggle', 'options'),
+     Output('envelope-toggle', 'value')],
     Input('forecast-data-store', 'data')
 )
 def update_threshold_options(stored_data):
-    """Dynamically update threshold filter options based on available data"""
-    if not stored_data or not stored_data.get('combined_envelopes'):
-        # Default options when no data
-        return [
-            {'label': html.Span(['34kt ', html.Span('●', style={'color': '#FFD700', 'fontSize': '16px'})]),
-             'value': 34},
-            {'label': html.Span(['40kt ', html.Span('●', style={'color': '#FFA500', 'fontSize': '16px'})]),
-             'value': 40},
-            {'label': html.Span(['50kt ', html.Span('●', style={'color': '#FF8C00', 'fontSize': '16px'})]),
-             'value': 50},
-            {'label': html.Span(['64kt ', html.Span('●', style={'color': '#FF0000', 'fontSize': '16px'})]), 'value': 64}
+    """Dynamically update threshold filter options and envelope toggle based on available data"""
+    has_envelopes = stored_data and stored_data.get('combined_envelopes') and len(stored_data['combined_envelopes']) > 0
+
+    if not has_envelopes:
+        # No options when no data - empty list and informative note
+        note_text = "No wind envelopes available for the current selection."
+        envelope_options = [
+            {'label': 'None', 'value': 'none'},
+            {'label': 'Combined (Not Available)', 'value': 'combined', 'disabled': True}
         ]
+        return [], [], note_text, envelope_options, 'none'
 
     # Get available thresholds from the data
     available_thresholds = set()
@@ -515,14 +519,22 @@ def update_threshold_options(stored_data):
 
     # Create options for available thresholds
     options = []
+    selected_values = []
     for threshold in sorted(available_thresholds):
         color = color_map.get(threshold, '#808080')  # Gray for unknown thresholds
         options.append({
             'label': html.Span([f'{threshold}kt ', html.Span('●', style={'color': color, 'fontSize': '16px'})]),
             'value': threshold
         })
+        selected_values.append(threshold)  # Select all available thresholds by default
 
-    return options
+    # When envelopes are available, show normal options
+    envelope_options = [
+        {'label': 'None', 'value': 'none'},
+        {'label': 'Combined', 'value': 'combined'}
+    ]
+
+    return options, selected_values, None, envelope_options, 'none'
 
 
 @app.callback(
