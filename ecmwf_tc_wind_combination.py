@@ -428,7 +428,7 @@ def process_wind_combination(
                 
                 # Extract wind polygons for this time step
                 wkt_polygons = extract_wind_polygons_for_time_step(
-                    wind_file, track_point, bbox, ensemble_member
+                    wind_file, bbox, ensemble_member
                 )
                 
                 # Create envelope records for this time step
