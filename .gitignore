@@ -21,6 +21,8 @@ __pycache__/
 .idea/
 
 tc_data/
+tc_extracted/
+tc_transformed/
 tc_data_transformed/
 wind_data/
 wind_extracted/
