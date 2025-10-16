@@ -18,7 +18,7 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Optional, Dict
 import pandas as pd
 
 from ecmwf_tc_data_downloader import download_tc_data
@@ -336,7 +336,7 @@ def step4_download_wind(config: PipelineConfig, stats: PipelineStats, tc_data_in
         tc_run_time = tc_data_info.get('run_time')
         tc_date = tc_data_info.get('date')
 
-        if not tc_run_time or not tc_date:
+        if tc_run_time is None or tc_date is None:
             logger.warning("Could not determine TC run time or date, skipping wind download")
             return []
 
@@ -596,6 +596,7 @@ def main():
         logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
         stats.log_summary()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
