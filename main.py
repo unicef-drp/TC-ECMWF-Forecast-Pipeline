@@ -4,8 +4,8 @@ ECMWF TC Forecast Pipeline
 Automates: Download → Extract → Transform → Wind Download → Wind Processing → Load to Snowflake
 
 The pipeline downloads wind forecast data to match the tropical cyclone forecast run time.
-Wind forecast hours are every 6 hours from 0 to 144 hours (0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60,
-66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144).
+Wind forecast hours are every 6 hours from 0 to 144 hours (0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84,
+90, 96, 102, 108, 114, 120, 126, 132, 138, 144).
 
 The wind data download automatically matches:
 - The same forecast date as the TC data
@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
 import pandas as pd
+
 
 from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data
@@ -64,6 +65,7 @@ class PipelineConfig:
 
         # Download options
         self.download_date = os.getenv('DOWNLOAD_DATE')  # e.g., "20250929"
+        self.run_time = os.getenv('RUN_TIME')  # e.g., "00", "06", "12", "18"
         self.download_limit = int(os.getenv('DOWNLOAD_LIMIT', '1'))
 
         # Wind processing options
@@ -84,6 +86,17 @@ class PipelineConfig:
             missing.append('SNOWFLAKE_USER')
         if not self.sf_password:
             missing.append('SNOWFLAKE_PASSWORD')
+
+        # Validate run time when specific date is provided
+        if self.download_date and not self.run_time:
+            logger.error("RUN_TIME is required when DOWNLOAD_DATE is specified")
+            logger.error("Please specify run time (00, 06, 12, or 18) in the manual trigger")
+            return False
+
+        # Validate run time format
+        if self.run_time and self.run_time not in ['00', '06', '12', '18']:
+            logger.error(f"Invalid RUN_TIME: {self.run_time}. Must be 00, 06, 12, or 18")
+            return False
 
         if missing:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
@@ -155,6 +168,9 @@ def step1_download(config: PipelineConfig, stats: PipelineStats) -> List[Path]:
         if config.download_date:
             logger.info(f"Downloading for specific date: {config.download_date}")
             download_kwargs['date'] = config.download_date
+            if config.run_time:
+                logger.info(f"Filtering for run time: {config.run_time}Z")
+                download_kwargs['run_time'] = config.run_time
         else:
             logger.info(f"Downloading latest {config.download_limit} forecast(s)")
             download_kwargs['limit'] = config.download_limit
@@ -547,7 +563,7 @@ def main():
     # Create directories
     config.create_directories()
 
-    # Log configuration
+    # Log configuration (without sensitive data)
     logger.info(f"Configuration:")
     logger.info(f"  Raw data directory: {config.raw_data_dir}")
     logger.info(f"  Transformed data directory: {config.transformed_data_dir}")
@@ -559,6 +575,12 @@ def main():
     logger.info(f"  Wind forecast hours: {config.wind_forecast_hours}")
     logger.info(f"  Cleanup after load: {config.cleanup_after_load}")
     logger.info(f"  Skip existing files: {config.skip_existing}")
+    if config.download_date:
+        logger.info(f"  Download date: {config.download_date}")
+        if config.run_time:
+            logger.info(f"  Run time filter: {config.run_time}Z")
+        else:
+            logger.info(f"  Run time filter: None (all run times)")
 
     try:
         # Execute pipeline steps

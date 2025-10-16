@@ -12,6 +12,11 @@ on:
         description: 'Specific date to download (YYYYMMDD format, leave empty for latest)'
         required: false
         type: string
+      run_time:
+        description: 'Run time (00, 06, 12, or 18) - required when date is specified'
+        required: false
+        type: choice
+        options: ['00', '06', '12', '18']
       cleanup:
         description: 'Clean up temporary files after load'
         required: false
@@ -70,6 +75,7 @@ jobs:
 
           # Pipeline configuration
           DOWNLOAD_DATE: ${{ github.event.inputs.download_date }}
+          RUN_TIME: ${{ github.event.inputs.run_time }}
           DOWNLOAD_LIMIT: '1'
           PROCESS_WIND_DATA: 'true'
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}

@@ -14,6 +14,7 @@ References:
 import os
 import re
 import requests
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from typing import List, Optional, Dict
@@ -208,6 +209,7 @@ def parse_filename(filename: str) -> Optional[Dict[str, str]]:
 def download_tc_data(limit: int = 1,
                      storm_name: Optional[str] = None,
                      date: Optional[str] = None,
+                     run_time: Optional[str] = None,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None,
                      output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -219,6 +221,7 @@ def download_tc_data(limit: int = 1,
         limit (int): Number of latest forecasts to download (default: 1)
         storm_name (str, optional): Specific storm name to filter
         date (str, optional): Specific date to download (YYYYMMDD format)
+        run_time (str, optional): Specific run time to download (00, 06, 12, 18)
         start_date (str, optional): Start date for range (YYYYMMDD format)
         end_date (str, optional): End date for range (YYYYMMDD format)
         output_dir (str): Output directory for downloaded files
@@ -226,18 +229,45 @@ def download_tc_data(limit: int = 1,
 
     Returns:
         dict: Summary with 'downloaded' and 'failed' counts
+
+    Example:
+        # Download latest 1 forecast (named storms only)
+        result = download_tc_data()
+
+        # Download all storms including numbered ones
+        result = download_tc_data(named_storms_only=False)
+
+        # Download only KIKO storm data
+        result = download_tc_data(storm_name="KIKO")
+
+        # Download specific date and run time
+        result = download_tc_data(date="20251015", run_time="12")
+
+        # Download specific date range
+        result = download_tc_data(start_date="20250909", end_date="20250910")
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
     # Determine which dates to process
     if date:
-        # Single specific date - find all forecast times for that date
+        # Single specific date - find forecast times for that date
         target_date = date
         all_dates = get_available_dates()
         target_dates = [d for d in all_dates if d.startswith(target_date)]
+
+        # Filter by run time if specified
+        if run_time:
+            # ECMWF format: YYYYMMDDHHMMSS, where HH is the run time
+            run_time_hour = run_time.zfill(2)  # Ensure 2 digits
+            target_dates = [d for d in target_dates if d[8:10] == run_time_hour]
+            print(f"Filtering for run time: {run_time_hour}Z")
+
         if not target_dates:
-            print(f"Error: No forecasts found for date {target_date}")
+            if run_time:
+                print(f"Error: No forecasts found for date {target_date} at run time {run_time}Z")
+            else:
+                print(f"Error: No forecasts found for date {target_date}")
             return {'downloaded': 0, 'failed': 0}
     elif start_date and end_date:
         # Date range
