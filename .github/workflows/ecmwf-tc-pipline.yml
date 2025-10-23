@@ -3,7 +3,7 @@ name: TC Forecast Pipeline
 on:
   # Run automatically every 12 hours (ECMWF releases forecasts 4 times daily)
   schedule:
-    - cron: '0 8,12,20,0 * * *'  # After each forecast is published
+     - cron: '0 1,9,13,21 * * *'  # After each forecast is published
 
   # Allow manual trigger
   workflow_dispatch:
