@@ -7,9 +7,9 @@ ECMWF issues new forecasts at **00, 06, 12, and 18 UTC**, but the data is typica
 
 To align with these publication times, the pipeline is scheduled to run at:  
 
-- **08:00 UTC**  
-- **12:00 UTC**  
-- **20:00 UTC**
-- **00:00 UTC**   
+- **09:00 UTC**  
+- **13:00 UTC**  
+- **21:00 UTC**
+- **01:00 UTC**   
 
 This ensures the forecasts are available before the pipeline starts. 
