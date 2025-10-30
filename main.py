@@ -10,7 +10,7 @@ Wind forecast hours are every 6 hours from 0 to 144 hours (0, 6, 12, 18, 24, 30,
 The wind data download automatically matches:
 - The same forecast date as the TC data
 - The same run time (00Z, 06Z, 12Z, 18Z) as the TC data
-- All ensemble members (50 members)
+- All ensemble members (51 members: 50 perturbed + 1 control)
 """
 
 import os
@@ -70,7 +70,7 @@ class PipelineConfig:
 
         # Wind processing options
         self.process_wind_data = os.getenv('PROCESS_WIND_DATA', 'true').lower() == 'true'
-        self.max_ensemble_members = 50  # Fixed: All ensemble members
+        self.max_ensemble_members = 51  # Fixed: All ensemble members (50 perturbed + 1 control)
 
         # Wind forecast configuration - Every 6 hours from 0 to 144 hours
         self.wind_forecast_hours = list(range(0, 145,
