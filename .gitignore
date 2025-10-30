@@ -26,4 +26,7 @@ tc_transformed/
 tc_data_transformed/
 wind_data/
 wind_extracted/
+ecmwf_wind_data_extractor_BACKUP.py
+pipeline_demonstration_JAM.ipynb
+visualizations/
 
