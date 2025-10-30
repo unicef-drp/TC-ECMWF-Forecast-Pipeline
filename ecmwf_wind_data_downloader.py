@@ -116,46 +116,77 @@ def download_ensemble_wind(
     failed_downloads = 0
 
     for step in forecast_hours:
-        filename = f"wind_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h.grib2"
-        filepath = os.path.join(output_dir, filename)
+        # PF (perturbed) file
+        filename_pf = f"wind_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_pf.grib2"
+        filepath_pf = os.path.join(output_dir, filename_pf)
 
-        # Skip if already downloaded
-        if os.path.exists(filepath):
+        # CF (control) file
+        filename_cf = f"wind_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_cf.grib2"
+        filepath_cf = os.path.join(output_dir, filename_cf)
+
+        # Download PF if missing
+        if os.path.exists(filepath_pf):
             if verbose:
-                print(f"  [SKIP] +{step:3d}h: Already exists")
-            downloaded_files.append(filepath)
-            continue
-
-        try:
-            if verbose:
-                print(f"  [DOWN] +{step:3d}h: Downloading...", end='', flush=True)
-
-            # Download data - only perturbed ensemble members
-            result = client.retrieve(
-                date=forecast_date,
-                time=run_time,
-                stream="enfo",  # Ensemble forecast
-                type="pf",  # Perturbed forecast (members 1-50)
-                step=step,
-                param=["10u", "10v"],  # 10m u and v wind components
-                target=filepath
-            )
-
-            # Verify file was created
-            if os.path.exists(filepath):
-                file_size = os.path.getsize(filepath)
+                print(f"  [SKIP] +{step:3d}h PF: Already exists")
+            downloaded_files.append(filepath_pf)
+        else:
+            try:
                 if verbose:
-                    print(f" ✓ ({file_size / 1024 / 1024:.1f} MB)")
-                downloaded_files.append(filepath)
-            else:
+                    print(f"  [DOWN] +{step:3d}h PF: Downloading...", end='', flush=True)
+                client.retrieve(
+                    date=forecast_date,
+                    time=run_time,
+                    stream="enfo",
+                    type="pf",
+                    step=step,
+                    param=["10u", "10v"],
+                    target=filepath_pf
+                )
+                if os.path.exists(filepath_pf):
+                    file_size = os.path.getsize(filepath_pf)
+                    if verbose:
+                        print(f" ({file_size / 1024 / 1024:.1f} MB)")
+                    downloaded_files.append(filepath_pf)
+                else:
+                    if verbose:
+                        print(" File not created")
+                    failed_downloads += 1
+            except Exception as e:
                 if verbose:
-                    print(" ✗ File not created")
+                    print(f" Error: {e}")
                 failed_downloads += 1
 
-        except Exception as e:
+        # Download CF if missing
+        if os.path.exists(filepath_cf):
             if verbose:
-                print(f" ✗ Error: {e}")
-            failed_downloads += 1
+                print(f"  [SKIP] +{step:3d}h CF: Already exists")
+            downloaded_files.append(filepath_cf)
+        else:
+            try:
+                if verbose:
+                    print(f"  [DOWN] +{step:3d}h CF: Downloading...", end='', flush=True)
+                client.retrieve(
+                    date=forecast_date,
+                    time=run_time,
+                    stream="enfo",
+                    type="cf",  # Control forecast
+                    step=step,
+                    param=["10u", "10v"],
+                    target=filepath_cf
+                )
+                if os.path.exists(filepath_cf):
+                    file_size = os.path.getsize(filepath_cf)
+                    if verbose:
+                        print(f" ({file_size / 1024 / 1024:.1f} MB)")
+                    downloaded_files.append(filepath_cf)
+                else:
+                    if verbose:
+                        print(" File not created")
+                    failed_downloads += 1
+            except Exception as e:
+                if verbose:
+                    print(f" Error: {e}")
+                failed_downloads += 1
 
     # Summary
     if verbose:

@@ -155,14 +155,19 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
     # Compute wind speed
     wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
 
-    # Select specific ensemble member
+    # Select specific ensemble member, mapping control member 51 to GRIB number 0
     if 'number' in wind_speed.dims:
+        desired_number = 0 if member_number == 51 else member_number
         if verbose:
-            print(f"    Selecting wind ensemble member {member_number}")
-        wind_speed = wind_speed.sel(number=member_number)
+            print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
+        try:
+            wind_speed = wind_speed.sel(number=desired_number)
+        except Exception:
+            if verbose:
+                print("    WARNING: Desired member not found; proceeding without selection")
     else:
         if verbose:
-            print(f"    WARNING: No ensemble dimension found in wind data!")
+            print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
 
     # Subset to bounding box
     wind_region = wind_speed.sel(
@@ -172,7 +177,11 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
 
     if verbose:
         print(f"    Wind data shape: {wind_region.shape}")
-        print(f"    Max wind: {float(wind_region.max()):.1f} m/s ({float(wind_region.max()) / 0.5144:.1f} kt)")
+        try:
+            max_ms = float(wind_region.max())
+            print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
+        except Exception:
+            pass
 
     return wind_region
 
