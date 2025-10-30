@@ -233,10 +233,10 @@ def combine_polygons_across_forecast_steps(envelope_records: List[Dict]) -> List
                 
                 if combined_wkt:
                     combined_records.append({
-                        'forecast_time': f"Combined ({min([r['lead_time'] for r in envelope_records if r['ensemble_member'] == member and r['wind_threshold'] == threshold])}h-{max([r['lead_time'] for r in envelope_records if r['ensemble_member'] == member and r['wind_threshold'] == threshold])}h)",
+                        # Use the same forecast issuance used for grouping (from individual rows)
+                        'forecast_time': data['forecast_time'],
                         'track_id': data['track_id'],
                         'ensemble_member': member,
-                        'valid_time': data['valid_time'],  # Keep the first valid time
                         'lead_time': f"{min([r['lead_time'] for r in envelope_records if r['ensemble_member'] == member and r['wind_threshold'] == threshold])}-{max([r['lead_time'] for r in envelope_records if r['ensemble_member'] == member and r['wind_threshold'] == threshold])}",
                         'wind_threshold': threshold,
                         'envelope_region': combined_wkt
@@ -463,7 +463,18 @@ def process_wind_combination(
             if storm_envelope_records:
                 # Save individual forecast steps
                 individual_df = pd.DataFrame(storm_envelope_records)
-                individual_file = output_dir / f"{storm_name}_envelopes_individual.csv"
+
+                # Derive forecast issuance time for filename suffix (YYYYMMDDTHHZ)
+                try:
+                    first_ft = pd.to_datetime(individual_df['forecast_time'].iloc[0]) if 'forecast_time' in individual_df.columns else None
+                except Exception:
+                    first_ft = None
+                if first_ft is not None and not pd.isna(first_ft):
+                    ft_suffix = first_ft.strftime('%Y%m%dT%HZ')
+                    individual_file = output_dir / f"{storm_name}_{ft_suffix}_envelopes_individual.csv"
+                else:
+                    individual_file = output_dir / f"{storm_name}_envelopes_individual.csv"
+
                 individual_df.to_csv(individual_file, index=False)
                 
                 logger.info(f"  Saved individual forecast steps: {individual_file.name}")
@@ -475,7 +486,14 @@ def process_wind_combination(
                 
                 if combined_records:
                     combined_df = pd.DataFrame(combined_records)
-                    combined_file = output_dir / f"{storm_name}_envelopes_combined.csv"
+
+                    # Use same forecast issuance suffix for combined filename
+                    if first_ft is not None and not pd.isna(first_ft):
+                        ft_suffix = first_ft.strftime('%Y%m%dT%HZ')
+                        combined_file = output_dir / f"{storm_name}_{ft_suffix}_envelopes_combined.csv"
+                    else:
+                        combined_file = output_dir / f"{storm_name}_envelopes_combined.csv"
+
                     combined_df.to_csv(combined_file, index=False)
                     
                     total_envelope_records += len(combined_records)

@@ -31,4 +31,10 @@ pipeline_demonstration_JAM.ipynb
 pipeline_demonstration_TEST.ipynb
 visualizations/
 testing.ipynb
+control_cf_envelope_backfill.py
+
+TEST_tc_data/
+TEST_tc_transformed/
+TEST_wind_data/
+TEST_wind_extracted/
 

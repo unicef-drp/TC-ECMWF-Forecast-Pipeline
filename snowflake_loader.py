@@ -183,7 +183,6 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         FORECAST_TIME TIMESTAMP_NTZ,
                         TRACK_ID VARCHAR,
                         ENSEMBLE_MEMBER INTEGER,
-                        VALID_TIME TIMESTAMP_NTZ,
                         LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
                         WIND_THRESHOLD INTEGER,
                         ENVELOPE_REGION VARCHAR
@@ -291,11 +290,9 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     MERGE INTO TC_ENVELOPES_COMBINED t
                     USING (
                         SELECT 
-                            CASE 
-                                WHEN FORECAST_TIME IS NULL THEN VALID_TIME
-                                ELSE FORECAST_TIME
-                            END AS FORECAST_TIME,
-                            TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME,
+                            FORECAST_TIME,
+                            TRACK_ID,
+                            ENSEMBLE_MEMBER,
                             CASE 
                                 WHEN LEAD_TIME LIKE '%-%' THEN 
                                     CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
@@ -317,10 +314,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.WIND_THRESHOLD = s.WIND_THRESHOLD
                     WHEN NOT MATCHED THEN INSERT (
-                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME_RANGE,
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
                         WIND_THRESHOLD, ENVELOPE_REGION
                     ) VALUES (
-                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME_RANGE,
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
                         s.WIND_THRESHOLD, s.ENVELOPE_REGION
                     )
                 """
