@@ -70,7 +70,7 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_DATABASE: AOTS
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
 
           # Pipeline configuration
@@ -81,7 +81,7 @@ jobs:
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
           SKIP_EXISTING: 'false'  # Always process new data in CI
         run: |
-          python main.py
+          python github_actions/main.py
 
       - name: Upload pipeline logs
         if: always()

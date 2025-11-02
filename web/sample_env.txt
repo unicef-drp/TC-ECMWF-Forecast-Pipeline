@@ -1,0 +1,23 @@
+# Web Dashboard Environment Variables
+# Copy this file to .env for local development
+# For production deployment, set these as environment variables in your hosting platform
+
+# ==============================================================================
+# REQUIRED: Snowflake Connection
+# ==============================================================================
+SNOWFLAKE_ACCOUNT=your_account_identifier
+SNOWFLAKE_USER=your_username
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
+
+# ==============================================================================
+# NOTES
+# ==============================================================================
+# - All Snowflake variables are required for the dashboard to function
+# - The dashboard reads data from the TC_TRACKS, TC_ENVELOPES_INDIVIDUAL, 
+#   and TC_ENVELOPES_COMBINED tables in Snowflake
+# - Ensure the Snowflake user has SELECT permissions on these tables
+# - For production, never commit the .env file with real credentials
+

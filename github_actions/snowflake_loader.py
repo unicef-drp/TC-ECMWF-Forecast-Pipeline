@@ -382,7 +382,7 @@ def main():
             # Load each CSV using bulk operations
             total_loaded = 0
             for csv_file in csv_files:
-                loaded = load_csv_to_snowflake_bulk(csv_file, conn, use_staging=True)
+                loaded = load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=True)
                 total_loaded += loaded
 
             # Verify

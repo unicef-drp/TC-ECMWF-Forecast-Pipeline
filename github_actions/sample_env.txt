@@ -1,0 +1,43 @@
+# GitHub Actions Pipeline Environment Variables
+# Copy this file to .env for local testing
+# Note: In GitHub Actions, these are set as GitHub Secrets and workflow environment variables
+
+# ==============================================================================
+# REQUIRED: Snowflake Connection
+# ==============================================================================
+SNOWFLAKE_ACCOUNT=your_account_identifier
+SNOWFLAKE_USER=your_username
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
+
+# ==============================================================================
+# OPTIONAL: Directory Configuration (defaults shown)
+# ==============================================================================
+# RAW_DATA_DIR=tc_data
+# TRANSFORMED_DATA_DIR=tc_data_transformed
+# WIND_DATA_DIR=wind_data
+# WIND_EXTRACTED_DIR=wind_extracted
+
+# ==============================================================================
+# OPTIONAL: Pipeline Configuration
+# ==============================================================================
+# Process wind data (true/false)
+PROCESS_WIND_DATA=true
+
+# Clean up temporary files after successful load (true/false)
+CLEANUP_AFTER_LOAD=true
+
+# Skip already processed files (true/false)
+SKIP_EXISTING=false
+
+# Number of latest forecasts to download (default: 1)
+DOWNLOAD_LIMIT=1
+
+# Specific date to download (YYYYMMDD format, optional)
+# DOWNLOAD_DATE=20251029
+
+# Specific run time to download (00, 06, 12, or 18, optional)
+# RUN_TIME=00
+

@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import List, Optional, Dict
 import pandas as pd
 
+# Add parent directory to path to import core modules
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data
@@ -55,9 +57,9 @@ class PipelineConfig:
         self.sf_account = os.getenv('SNOWFLAKE_ACCOUNT')
         self.sf_user = os.getenv('SNOWFLAKE_USER')
         self.sf_password = os.getenv('SNOWFLAKE_PASSWORD')
-        self.sf_warehouse = os.getenv('SNOWFLAKE_WAREHOUSE', 'TC_WH')
-        self.sf_database = os.getenv('SNOWFLAKE_DATABASE', 'AOTS')
-        self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
+        self.sf_warehouse = os.getenv('SNOWFLAKE_WAREHOUSE')
+        self.sf_database = os.getenv('SNOWFLAKE_DATABASE')
+        self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA')
 
         # Pipeline options
         self.cleanup_after_load = os.getenv('CLEANUP_AFTER_LOAD', 'true').lower() == 'true'
@@ -86,6 +88,12 @@ class PipelineConfig:
             missing.append('SNOWFLAKE_USER')
         if not self.sf_password:
             missing.append('SNOWFLAKE_PASSWORD')
+        if not self.sf_warehouse:
+            missing.append('SNOWFLAKE_WAREHOUSE')
+        if not self.sf_database:
+            missing.append('SNOWFLAKE_DATABASE')
+        if not self.sf_schema:
+            missing.append('SNOWFLAKE_SCHEMA')
 
         # Validate run time when specific date is provided
         if self.download_date and not self.run_time:
@@ -622,3 +630,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

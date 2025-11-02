@@ -1,0 +1,26 @@
+# Root Sample Environment File
+# This file shows all environment variables used across the project
+# See individual directories for component-specific sample files:
+#   - github_actions/sample_env.txt (for GitHub Actions pipeline)
+#   - web/sample_env.txt (for web dashboard)
+
+# ==============================================================================
+# Core Environment Variables (used by multiple components)
+# ==============================================================================
+
+# Snowflake Connection (REQUIRED for GitHub Actions and Web App)
+SNOWFLAKE_ACCOUNT=your_account_identifier
+SNOWFLAKE_USER=your_username
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
+
+# ==============================================================================
+# Usage
+# ==============================================================================
+# 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env
+# 2. For web app development: Copy web/sample_env.txt to .env
+# 3. For GitHub Actions: Set values as GitHub Secrets in repository settings
+# 4. Never commit .env files with real credentials to version control
+
