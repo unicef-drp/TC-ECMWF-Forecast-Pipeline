@@ -1,3 +1,5 @@
+[![TC Forecast Pipeline](https://github.com/unicef-drp/TC-ECMWF-Forecast-Pipeline/actions/workflows/ecmwf-tc-pipline.yml/badge.svg?branch=main)](https://github.com/unicef-drp/TC-ECMWF-Forecast-Pipeline/actions/workflows/ecmwf-tc-pipline.yml)
+
 # TC-ECMWF-Forecast-Pipeline – Data Pipeline Setup Guide
 
 This repository contains the pipeline for processing ECMWF (European Centre for Medium-Range Weather Forecasts) tropical cyclone and wind forecast data. The pipeline downloads, extracts, transforms, and loads hurricane forecast data into Snowflake for use by downstream applications.
