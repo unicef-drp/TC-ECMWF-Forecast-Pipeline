@@ -103,13 +103,17 @@ def load_tc_track_data(track_csv: str) -> pd.DataFrame:
     # Ensure valid_time is datetime
     df['valid_time'] = pd.to_datetime(df['valid_time'])
     
+    # Ensure forecast_time is datetime if present (needed for matching wind files by run hour)
+    if 'forecast_time' in df.columns:
+        df['forecast_time'] = pd.to_datetime(df['forecast_time'])
+    
     # Sort by ensemble member and valid_time
     df = df.sort_values(['ensemble_member', 'valid_time'])
     
     return df
 
 
-def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: List[Path], ensemble_member: int) -> Optional[Path]:
+def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: List[Path], ensemble_member: int, forecast_time: Optional[datetime] = None) -> Optional[Path]:
     """
     Find the wind GRIB file that corresponds to a specific valid time and lead time.
     
@@ -117,6 +121,8 @@ def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: Li
         valid_time: Valid time from TC track data
         lead_time: Lead time in hours from TC track data
         wind_files: List of available wind GRIB files
+        ensemble_member: Ensemble member number (51 for control, others for perturbed)
+        forecast_time: Forecast issuance time (used to match run hour). If None, will calculate from valid_time and lead_time.
         
     Returns:
         Path to matching wind file or None
@@ -126,18 +132,32 @@ def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: Li
     # The wind file date is the FORECAST START DATE, not the valid time date
     
     # Calculate forecast start date from valid_time and lead_time
-    forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+    if forecast_time is None:
+        forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+        forecast_time = forecast_start_date
+    else:
+        # Ensure forecast_time is datetime
+        if isinstance(forecast_time, pd.Timestamp):
+            forecast_time = forecast_time.to_pydatetime()
+        elif isinstance(forecast_time, str):
+            forecast_time = pd.to_datetime(forecast_time).to_pydatetime()
+        forecast_start_date = forecast_time
+    
     date_str = forecast_start_date.strftime('%Y-%m-%d')
+    run_hour = f"{forecast_time.hour:02d}"
     forecast_hour = f"f{lead_time:03d}h"
     
-    # Look for wind file with matching forecast start date and forecast hour
+    # Look for wind file with matching forecast start date, run hour, and forecast hour
     for wind_file in wind_files:
         filename = wind_file.name
         # Choose PF vs CF based on ensemble member
         type_tag = "_cf" if ensemble_member == 51 else "_pf"
         # Match e.g., wind_ens_YYYY-MM-DD_rHH_fHHHh_pf.grib2 or _cf.grib2
+        # CRITICAL: Must match the run hour (r00, r06, r12, r18) to avoid matching wrong forecast
+        expected_run_tag = f"_r{run_hour}_"
         if (
-            f"wind_ens_{date_str}_r" in filename
+            f"wind_ens_{date_str}" in filename
+            and expected_run_tag in filename
             and f"_{forecast_hour}" in filename
             and filename.endswith(f"{type_tag}.grib2")
         ):
@@ -425,16 +445,26 @@ def process_wind_combination(
                     valid_time = track_point['valid_time']
                     lead_time = track_point['lead_time']
                     ensemble_member = track_point['ensemble_member']
+                    forecast_time = track_point.get('forecast_time') if 'forecast_time' in track_point else None
 
-                    # Find matching wind file
-                    wind_file = find_wind_file_for_time(valid_time, lead_time, wind_files, ensemble_member)
+                    # Find matching wind file (must pass forecast_time to match correct run hour)
+                    wind_file = find_wind_file_for_time(valid_time, lead_time, wind_files, ensemble_member, forecast_time)
 
                     if wind_file is None:
-                        forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+                        if forecast_time is not None:
+                            if isinstance(forecast_time, pd.Timestamp):
+                                forecast_time = forecast_time.to_pydatetime()
+                            elif isinstance(forecast_time, str):
+                                forecast_time = pd.to_datetime(forecast_time).to_pydatetime()
+                            run_hour = f"{forecast_time.hour:02d}"
+                            forecast_start_date = forecast_time
+                        else:
+                            forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+                            run_hour = "*"
                         date_str = forecast_start_date.strftime('%Y-%m-%d')
                         forecast_hour = f"f{lead_time:03d}h"
                         expected_pattern = (
-                            f"wind_ens_{date_str}_r*_{forecast_hour}_{'cf' if ensemble_member == 51 else 'pf'}.grib2"
+                            f"wind_ens_{date_str}_r{run_hour}_{forecast_hour}_{'cf' if ensemble_member == 51 else 'pf'}.grib2"
                         )
                         logger.warning(f"    No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}")
                         continue
