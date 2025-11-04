@@ -494,13 +494,13 @@ SELECT '✓ Stored procedure created' as status,
 -- Process all data
 CALL create_wind_envelopes(NULL::TIMESTAMP_NTZ, NULL::VARCHAR, NULL::INTEGER);
 
--- Process specific storm
-CALL create_wind_envelopes(NULL::TIMESTAMP_NTZ, '13L', NULL::INTEGER);
+-- Process specific storm (use proper storm name, not numbered identifiers like "13L" or "04S")
+-- CALL create_wind_envelopes(NULL::TIMESTAMP_NTZ, 'KALMAEGI', NULL::INTEGER);
 
 -- Process specific forecast and member
-CALL create_wind_envelopes('2025-10-24 00:00:00'::TIMESTAMP_NTZ, NULL::VARCHAR, 1);
+-- CALL create_wind_envelopes('2025-10-24 00:00:00'::TIMESTAMP_NTZ, NULL::VARCHAR, 1);
 
--- Test with one member of one storm
-CALL create_wind_envelopes(NULL::TIMESTAMP_NTZ, '04S', 1);
+-- Test with one member of one storm (use proper storm name)
+-- CALL create_wind_envelopes(NULL::TIMESTAMP_NTZ, 'MONTHA', 1);
 */
 
