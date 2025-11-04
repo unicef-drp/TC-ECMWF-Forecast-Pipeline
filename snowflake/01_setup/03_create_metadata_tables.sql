@@ -14,7 +14,7 @@ USE SCHEMA ECMWF_PIPELINE;
 -- Enables incremental loading by recording processing status
 -- Primary key: FILE_PATH (unique identifier for each file)
 
-CREATE OR REPLACE TABLE FILE_PROCESSING_LOG (
+CREATE TABLE IF NOT EXISTS FILE_PROCESSING_LOG (
     -- File identification
     FILE_PATH VARCHAR PRIMARY KEY
         COMMENT 'Full path to file in stage (e.g., @TC_BUFR_STAGE/20251015_18/filename.bin)',

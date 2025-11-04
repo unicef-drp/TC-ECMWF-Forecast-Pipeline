@@ -14,7 +14,7 @@ USE SCHEMA ECMWF_PIPELINE;
 -- Files organized by date and run time: @TC_BUFR_STAGE/YYYYMMDD_HH/filename.bin
 -- No file format needed - binary files stored as-is
 
-CREATE OR REPLACE STAGE TC_BUFR_STAGE
+CREATE STAGE IF NOT EXISTS TC_BUFR_STAGE
     DIRECTORY = (ENABLE = TRUE)
     COMMENT = 'Stage for BUFR files containing TC track forecasts from ECMWF. Files organized by forecast date and run time (00Z, 06Z, 12Z, 18Z).';
 
@@ -25,7 +25,7 @@ CREATE OR REPLACE STAGE TC_BUFR_STAGE
 -- Files organized by date and run time: @TC_WIND_STAGE/YYYYMMDD_HH/filename.grib2
 -- No file format needed - binary files stored as-is
 
-CREATE OR REPLACE STAGE TC_WIND_STAGE
+CREATE STAGE IF NOT EXISTS TC_WIND_STAGE
     DIRECTORY = (ENABLE = TRUE)
     COMMENT = 'Stage for GRIB2 files containing ensemble wind forecasts from ECMWF. Files organized by forecast date and run time.';
 

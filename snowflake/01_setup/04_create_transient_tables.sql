@@ -17,7 +17,7 @@ USE SCHEMA ECMWF_PIPELINE;
 -- Raw data extracted from BUFR files (one row per forecast point)
 -- Before transformation and unit conversion
 
-CREATE OR REPLACE TRANSIENT TABLE TC_RAW_EXTRACTED (
+CREATE TRANSIENT TABLE IF NOT EXISTS TC_RAW_EXTRACTED (
     SOURCE_FILE VARCHAR
         COMMENT 'Path to source BUFR file in stage',
     
@@ -48,19 +48,33 @@ CREATE OR REPLACE TRANSIENT TABLE TC_RAW_EXTRACTED (
     WIND_SPEED FLOAT
         COMMENT 'Maximum wind speed in m/s (raw from BUFR)',
     
-    WIND_RADII_LATITUDE FLOAT
-        COMMENT 'Latitude of wind radii point',
+    WLATITUDE FLOAT
+        COMMENT 'Latitude of maximum wind location (degrees)',
     
-    WIND_RADII_LONGITUDE FLOAT
-        COMMENT 'Longitude of wind radii point',
+    WLONGITUDE FLOAT
+        COMMENT 'Longitude of maximum wind location (degrees)',
     
-    WIND_RADII_WIND FLOAT
-        COMMENT 'Wind speed threshold for radii in m/s',
+    -- Wind radii in LONG format
+    -- One row per threshold per quadrant (3 thresholds × 4 quadrants = 12 rows per forecast point)
+    WIND_THRESHOLD INTEGER
+        COMMENT 'Wind speed threshold in m/s (18, 26, or 33 m/s = 34, 50, or 64 knots)',
+    
+    QUADRANT INTEGER
+        COMMENT 'Quadrant number (1=NE, 2=SE, 3=SW, 4=NW)',
+    
+    WIND_RADIUS_M FLOAT
+        COMMENT 'Wind radius in meters (raw from BUFR)',
+    
+    BEARING_START FLOAT
+        COMMENT 'Bearing start angle in degrees (quadrant boundary)',
+    
+    BEARING_END FLOAT
+        COMMENT 'Bearing end angle in degrees (quadrant boundary)',
     
     PROCESSING_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
         COMMENT 'When this record was inserted'
 )
-COMMENT = 'Raw BUFR data extracted from TC track files. Before unit conversion and transformation.';
+COMMENT = 'Raw BUFR data extracted from TC track files. LONG format - one row per threshold/quadrant. Before unit conversion and transformation.';
 
 -- ============================================================================
 -- Table: TC_TRANSFORMED_STAGING
@@ -68,7 +82,7 @@ COMMENT = 'Raw BUFR data extracted from TC track files. Before unit conversion a
 -- Transformed TC track data ready for loading to final table
 -- After unit conversion and wind field polygon generation
 
-CREATE OR REPLACE TRANSIENT TABLE TC_TRANSFORMED_STAGING (
+CREATE TRANSIENT TABLE IF NOT EXISTS TC_TRANSFORMED_STAGING (
     SOURCE_FILE VARCHAR
         COMMENT 'Path to source BUFR file',
     
@@ -162,7 +176,7 @@ COMMENT = 'Transformed TC track data with wind radii and polygons. Ready for fin
 -- Raw wind data extracted from GRIB2 files
 -- One row per grid point per ensemble member
 
-CREATE OR REPLACE TRANSIENT TABLE WIND_RAW_EXTRACTED (
+CREATE TRANSIENT TABLE IF NOT EXISTS WIND_RAW_EXTRACTED (
     SOURCE_FILE VARCHAR
         COMMENT 'Path to source GRIB2 file',
     
@@ -204,7 +218,7 @@ COMMENT = 'Raw wind data extracted from GRIB2 files. Grid points within TC track
 -- Wind threshold envelopes (both individual and combined)
 -- Ready for loading to final tables
 
-CREATE OR REPLACE TRANSIENT TABLE WIND_ENVELOPES_STAGING (
+CREATE TRANSIENT TABLE IF NOT EXISTS WIND_ENVELOPES_STAGING (
     SOURCE_FILES ARRAY
         COMMENT 'Array of source files used to create this envelope',
     

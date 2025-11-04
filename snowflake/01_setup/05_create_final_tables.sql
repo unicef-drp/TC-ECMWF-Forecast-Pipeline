@@ -16,7 +16,7 @@ USE SCHEMA ECMWF_PIPELINE;
 -- TC forecast tracks with wind radii and wind field polygons
 -- One row per forecast point per ensemble member
 
-CREATE OR REPLACE TABLE TC_TRACKS (
+CREATE TABLE IF NOT EXISTS TC_TRACKS (
     FORECAST_TIME TIMESTAMP_NTZ NOT NULL
         COMMENT 'Forecast initialization time',
     
@@ -113,7 +113,7 @@ ALTER TABLE TC_TRACKS CLUSTER BY (FORECAST_TIME, TRACK_ID);
 -- Wind threshold envelopes for individual timesteps
 -- One row per storm per ensemble member per timestep per wind threshold
 
-CREATE OR REPLACE TABLE TC_ENVELOPES_INDIVIDUAL (
+CREATE TABLE IF NOT EXISTS TC_ENVELOPES_INDIVIDUAL (
     FORECAST_TIME TIMESTAMP_NTZ NOT NULL
         COMMENT 'Forecast initialization time',
     
@@ -153,7 +153,7 @@ ALTER TABLE TC_ENVELOPES_INDIVIDUAL CLUSTER BY (FORECAST_TIME, TRACK_ID);
 -- Wind threshold envelopes combined across multiple timesteps
 -- One row per storm per ensemble member per wind threshold (union of all timesteps)
 
-CREATE OR REPLACE TABLE TC_ENVELOPES_COMBINED (
+CREATE TABLE IF NOT EXISTS TC_ENVELOPES_COMBINED (
     FORECAST_TIME TIMESTAMP_NTZ NOT NULL
         COMMENT 'Forecast initialization time',
     
