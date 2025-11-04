@@ -13,7 +13,7 @@
 --   - Table: FILE_PROCESSING_LOG
 -- ============================================================================
 
-USE ROLE SYSADMIN;
+USE ROLE AOTS_ROLE;
 USE WAREHOUSE AOTS_X86_WH;
 USE DATABASE AOTS;
 USE SCHEMA ECMWF_PIPELINE;
