@@ -16,20 +16,20 @@
 # UNSUPPORTED BY SNOWFLAKE - CUSTOMER SUPPORTED ONLY
 #
 # ==============================================================================
-# Dockerfile for UNICEF Snowflake TC Forecast Pipeline
+# Dockerfile for ECMWF TC Forecast Pipeline (SPCS Deployment)
 # ==============================================================================
-# This container runs the complete UNICEF TC forecast pipeline including:
+# This container runs the complete TC forecast pipeline including:
 # - TC data download from ECMWF
 # - BUFR extraction and transformation
 # - Wind data download and processing
 # - Snowflake data loading
 #
-# The container will execute UNICEF_Snowflake.py and terminate when complete.
+# The container will execute snowflake/spcs_pipeline.py and terminate when complete.
 # ==============================================================================
 
 FROM python:3.11-slim
 
-LABEL maintainer="ECMWF TC Pipeline"
+LABEL maintainer="TC Forecast Pipeline"
 LABEL description="ECMWF Tropical Cyclone Forecast Pipeline with Snowflake Integration (SPCS)"
 LABEL version="2.0"
 
