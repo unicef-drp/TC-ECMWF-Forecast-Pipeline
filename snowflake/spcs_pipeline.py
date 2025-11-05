@@ -984,7 +984,7 @@ def cleanup_files(config: PipelineConfig):
 def main():
     """Main pipeline execution with concurrent processing"""
     logger.info("=" * 70)
-    logger.info("UNICEF SNOWFLAKE PIPELINE - CONCURRENT EXECUTION")
+    logger.info("TC ECMWF Forecast Pipeline - CONCURRENT EXECUTION")
     logger.info("=" * 70)
     logger.info(f"Pipeline start time: {datetime.now().isoformat()}")
     
