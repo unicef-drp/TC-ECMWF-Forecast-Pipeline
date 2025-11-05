@@ -29,9 +29,10 @@ DEFAULT_OUTPUT_DIR = "wind_data"
 
 # Forecast step configurations - simplified to 0-144h with 6h steps for all run times
 FORECAST_STEPS = {
-    0: list(range(0, 145, 6)),   # 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144
-    6: list(range(0, 145, 6)),   # Same as 00Z
-    12: list(range(0, 145, 6)), # Same as 00Z
+    0: list(range(0, 145, 6)),
+    # 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144
+    6: list(range(0, 145, 6)),  # Same as 00Z
+    12: list(range(0, 145, 6)),  # Same as 00Z
     18: list(range(0, 145, 6))  # Same as 00Z
 }
 
@@ -59,11 +60,11 @@ def get_forecast_steps(run_time: int) -> List[int]:
     return FORECAST_STEPS[run_time]
 
 
-def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: int, 
-                              step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
+def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: int,
+                             step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
     """
     Download a single forecast step PF (perturbed) file. Helper function for concurrent downloads.
-    
+
     Args:
         client: ECMWF client instance
         forecast_date: Forecast date
@@ -71,13 +72,13 @@ def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: 
         step: Forecast step in hours
         output_dir: Output directory
         verbose: Whether to print progress
-        
+
     Returns:
         dict: Download result with 'success', 'step', 'filepath', 'file_size', 'type'
     """
     filename = f"wind_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_pf.grib2"
     filepath = os.path.join(output_dir, filename)
-    
+
     # Skip if already downloaded
     if os.path.exists(filepath):
         file_size = os.path.getsize(filepath)
@@ -91,11 +92,11 @@ def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: 
             'file_size': file_size,
             'skipped': True
         }
-    
+
     try:
         if verbose:
             print(f"  [DOWN] +{step:3d}h PF: Downloading...", end='', flush=True)
-        
+
         # Download PF (perturbed forecast) data
         client.retrieve(
             date=forecast_date,
@@ -106,7 +107,7 @@ def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: 
             param=["10u", "10v"],
             target=filepath
         )
-        
+
         # Verify file was created
         if os.path.exists(filepath):
             file_size = os.path.getsize(filepath)
@@ -131,7 +132,7 @@ def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: 
                 'error': 'File not created',
                 'skipped': False
             }
-            
+
     except Exception as e:
         if verbose:
             print(f" Error: {e}")
@@ -145,11 +146,11 @@ def _download_single_step_pf(client: Client, forecast_date: datetime, run_time: 
         }
 
 
-def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: int, 
-                              step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
+def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: int,
+                             step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
     """
     Download a single forecast step CF (control) file. Helper function for concurrent downloads.
-    
+
     Args:
         client: ECMWF client instance
         forecast_date: Forecast date
@@ -157,13 +158,13 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
         step: Forecast step in hours
         output_dir: Output directory
         verbose: Whether to print progress
-        
+
     Returns:
         dict: Download result with 'success', 'step', 'filepath', 'file_size', 'type'
     """
     filename = f"wind_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_cf.grib2"
     filepath = os.path.join(output_dir, filename)
-    
+
     # Skip if already downloaded
     if os.path.exists(filepath):
         file_size = os.path.getsize(filepath)
@@ -177,11 +178,11 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
             'file_size': file_size,
             'skipped': True
         }
-    
+
     try:
         if verbose:
             print(f"  [DOWN] +{step:3d}h CF: Downloading...", end='', flush=True)
-        
+
         # Download CF (control forecast) data for member 51
         client.retrieve(
             date=forecast_date,
@@ -192,7 +193,7 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
             param=["10u", "10v"],
             target=filepath
         )
-        
+
         # Verify file was created
         if os.path.exists(filepath):
             file_size = os.path.getsize(filepath)
@@ -217,7 +218,7 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
                 'error': 'File not created',
                 'skipped': False
             }
-            
+
     except Exception as e:
         if verbose:
             print(f" Error: {e}")
@@ -304,9 +305,13 @@ def download_ensemble_wind(
             # Submit all PF and CF download tasks
             futures = []
             for step in forecast_hours:
-                futures.append(executor.submit(_download_single_step_pf, client, forecast_date, run_time, step, output_dir, verbose))
-                futures.append(executor.submit(_download_single_step_cf, client, forecast_date, run_time, step, output_dir, verbose))
-            
+                futures.append(
+                    executor.submit(_download_single_step_pf, client, forecast_date, run_time, step, output_dir,
+                                    verbose))
+                futures.append(
+                    executor.submit(_download_single_step_cf, client, forecast_date, run_time, step, output_dir,
+                                    verbose))
+
             # Process results as they complete
             for future in as_completed(futures):
                 result = future.result()
@@ -489,5 +494,3 @@ def get_file_info(filepath: str) -> Dict[str, Union[str, int]]:
         }
 
     return {}
-
-
