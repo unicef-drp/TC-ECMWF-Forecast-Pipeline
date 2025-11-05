@@ -133,7 +133,7 @@ def get_bounding_box(polygon: Polygon, buffer: float = 2.0) -> Dict[str, float]:
 
 
 def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
-                   verbose: bool = True) -> xr.DataArray:
+                   verbose: bool = True, indexpath: Optional[str] = None) -> xr.DataArray:
     """
     Load ensemble wind data for specific member and region.
 
@@ -142,11 +142,46 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
         member_number (int): Ensemble member number
         bbox (dict): Bounding box coordinates
         verbose (bool): Whether to print progress information
+        indexpath (str, optional): Directory path for GRIB index files (.idx).
+                                   If provided, index files will be stored here instead
+                                   of alongside the GRIB file. Useful for parallel processing
+                                   to avoid concurrent index file conflicts.
 
     Returns:
         xr.DataArray: Wind speed data
     """
-    ds = xr.open_dataset(grib_file, engine='cfgrib')
+    # Open dataset with optional custom index path
+    if indexpath:
+        # Create process-specific index directory to avoid concurrent access conflicts
+        # Each process gets its own index cache, preventing race conditions
+        # while still benefiting from index file caching performance
+        import multiprocessing
+        import threading
+        
+        # Get unique identifier for this process/thread
+        pid = os.getpid()
+        thread_id = threading.get_ident()
+        
+        # Create process-specific subdirectory
+        process_index_dir = os.path.join(indexpath, f"process_{pid}_thread_{thread_id}")
+        os.makedirs(process_index_dir, exist_ok=True)
+        
+        # Build the index file path
+        import pathlib
+        grib_filename = pathlib.Path(grib_file).name
+        index_file_path = os.path.join(process_index_dir, grib_filename + '.idx')
+        
+        # Open with process-specific index path
+        ds = xr.open_dataset(
+            grib_file, 
+            engine='cfgrib',
+            backend_kwargs={
+                'indexpath': index_file_path,
+                'errors': 'ignore'
+            }
+        )
+    else:
+        ds = xr.open_dataset(grib_file, engine='cfgrib')
 
     # Extract u and v components
     u10 = ds['u10']

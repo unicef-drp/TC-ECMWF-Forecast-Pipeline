@@ -14,6 +14,8 @@ References:
 import os
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -23,13 +25,56 @@ from typing import List, Optional, Dict
 BASE_URL = "https://essential.ecmwf.int/"
 DEFAULT_OUTPUT_DIR = "tc_data"
 
+# Global session for connection pooling
+_session = None
 
-def get_available_dates(limit: Optional[int] = None) -> List[str]:
+
+def get_session(pool_size: int = 10):
+    """
+    Get or create a requests session with proper connection pooling.
+    
+    This improves performance by reusing HTTP connections and automatically
+    retrying failed requests with exponential backoff.
+    
+    Args:
+        pool_size: Maximum number of connections in the pool (default: 10)
+        
+    Returns:
+        requests.Session: Configured session with connection pooling and retry strategy
+    """
+    global _session
+    
+    if _session is None or pool_size > 10:
+        # Create new session with larger pool if needed
+        _session = requests.Session()
+        
+        # Configure retry strategy for transient failures
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],  # Retry on rate limit and server errors
+        )
+        
+        # Configure HTTP adapter with connection pooling
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=retry_strategy
+        )
+        
+        _session.mount("http://", adapter)
+        _session.mount("https://", adapter)
+    
+    return _session
+
+
+def get_available_dates(limit: Optional[int] = None, pool_size: int = 10) -> List[str]:
     """
     Get available forecast dates from ECMWF DISS system.
 
     Args:
         limit (int, optional): Maximum number of dates to return
+        pool_size (int): Connection pool size for HTTP requests (default: 10)
 
     Returns:
         List[str]: List of available forecast dates in YYYYMMDDHHMMSS format
@@ -39,7 +84,8 @@ def get_available_dates(limit: Optional[int] = None) -> List[str]:
     """
 
     try:
-        response = requests.get(BASE_URL, timeout=30)
+        session = get_session(pool_size)
+        response = session.get(BASE_URL, timeout=30)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -68,7 +114,7 @@ def get_available_dates(limit: Optional[int] = None) -> List[str]:
         return []
 
 
-def get_tc_files(forecast_time: str, storm_name: Optional[str] = None, named_storms_only: bool = True) -> List[str]:
+def get_tc_files(forecast_time: str, storm_name: Optional[str] = None, named_storms_only: bool = True, pool_size: int = 10) -> List[str]:
     """
     Get tropical cyclone track files for a specific forecast time.
 
@@ -76,6 +122,7 @@ def get_tc_files(forecast_time: str, storm_name: Optional[str] = None, named_sto
         forecast_time (str): Forecast time in YYYYMMDDHHMMSS format
         storm_name (str, optional): Specific storm name to filter
         named_storms_only (bool): Only include storms with proper names (default: True)
+        pool_size (int): Connection pool size for HTTP requests (default: 10)
 
     Returns:
         List[str]: List of tropical cyclone track filenames
@@ -88,7 +135,8 @@ def get_tc_files(forecast_time: str, storm_name: Optional[str] = None, named_sto
     forecast_url = urljoin(BASE_URL, f"/file/{forecast_time}/")
 
     try:
-        response = requests.get(forecast_url, timeout=30)
+        session = get_session(pool_size)
+        response = session.get(forecast_url, timeout=30)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -136,7 +184,7 @@ def get_tc_files(forecast_time: str, storm_name: Optional[str] = None, named_sto
         return []
 
 
-def download_file(filename: str, forecast_time: str, output_dir: str) -> bool:
+def download_file(filename: str, forecast_time: str, output_dir: str, pool_size: int = 10) -> bool:
     """
     Download a single tropical cyclone track file.
 
@@ -144,6 +192,7 @@ def download_file(filename: str, forecast_time: str, output_dir: str) -> bool:
         filename (str): Name of the file to download
         forecast_time (str): Forecast time directory
         output_dir (str): Local directory to save the file
+        pool_size (int): Connection pool size for HTTP requests (default: 10)
 
     Returns:
         bool: True if download successful, False otherwise
@@ -152,7 +201,8 @@ def download_file(filename: str, forecast_time: str, output_dir: str) -> bool:
     local_path = os.path.join(output_dir, filename)
 
     try:
-        response = requests.get(file_url, timeout=60)
+        session = get_session(pool_size)
+        response = session.get(file_url, timeout=60)
         response.raise_for_status()
 
         # Save file
@@ -213,7 +263,8 @@ def download_tc_data(limit: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None,
                      output_dir: str = DEFAULT_OUTPUT_DIR,
-                     named_storms_only: bool = True) -> Dict[str, int]:
+                     named_storms_only: bool = True,
+                     max_workers: int = 4) -> Dict[str, int]:
     """
     Download tropical cyclone track data from ECMWF DISS system.
 
@@ -226,6 +277,10 @@ def download_tc_data(limit: int = 1,
         end_date (str, optional): End date for range (YYYYMMDD format)
         output_dir (str): Output directory for downloaded files
         named_storms_only (bool): Only download storms with proper names (default: True)
+        max_workers (int): Maximum concurrent connections for connection pooling (default: 4).
+                          Used to size the HTTP connection pool. Higher values can improve
+                          performance when downloading multiple files, but may be limited by
+                          server rate limits.
 
     Returns:
         dict: Summary with 'downloaded' and 'failed' counts
@@ -245,15 +300,21 @@ def download_tc_data(limit: int = 1,
 
         # Download specific date range
         result = download_tc_data(start_date="20250909", end_date="20250910")
+        
+        # Download with optimized connection pooling
+        result = download_tc_data(max_workers=10)
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Use max_workers to size the connection pool (capped at 10 to avoid overwhelming servers)
+    pool_size = min(max_workers, 10)
 
     # Determine which dates to process
     if date:
         # Single specific date - find forecast times for that date
         target_date = date
-        all_dates = get_available_dates()
+        all_dates = get_available_dates(pool_size=pool_size)
         target_dates = [d for d in all_dates if d.startswith(target_date)]
 
         # Filter by run time if specified
@@ -271,14 +332,14 @@ def download_tc_data(limit: int = 1,
             return {'downloaded': 0, 'failed': 0}
     elif start_date and end_date:
         # Date range
-        all_dates = get_available_dates()
+        all_dates = get_available_dates(pool_size=pool_size)
         target_dates = [d for d in all_dates if start_date <= d[:8] <= end_date]
         if not target_dates:
             print(f"Error: No forecasts found in date range {start_date} to {end_date}")
             return {'downloaded': 0, 'failed': 0}
     else:
         # Latest N forecasts (default)
-        target_dates = get_available_dates(limit)
+        target_dates = get_available_dates(limit, pool_size=pool_size)
         if not target_dates:
             print("Error: No forecast dates found")
             return {'downloaded': 0, 'failed': 0}
@@ -293,7 +354,7 @@ def download_tc_data(limit: int = 1,
     total_failed = 0
 
     for forecast_time in target_dates:
-        tc_files = get_tc_files(forecast_time, storm_name, named_storms_only)
+        tc_files = get_tc_files(forecast_time, storm_name, named_storms_only, pool_size=pool_size)
 
         if not tc_files:
             print(f"   Warning: No tropical cyclone files found for {forecast_time}")
@@ -310,7 +371,7 @@ def download_tc_data(limit: int = 1,
 
         # Download files
         for filename in tc_files:
-            if download_file(filename, forecast_time, output_dir):
+            if download_file(filename, forecast_time, output_dir, pool_size=pool_size):
                 total_downloaded += 1
             else:
                 total_failed += 1

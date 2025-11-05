@@ -27,8 +27,9 @@ import os
 import logging
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon, 
@@ -169,7 +170,8 @@ def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: Li
 def extract_wind_polygons_for_time_step(
     wind_file: Path,
     bbox: Dict[str, float],
-    ensemble_member: int
+    ensemble_member: int,
+    indexpath: Optional[str] = None
 ) -> Dict[int, Optional[str]]:
     """
     Extract wind polygons for a specific time step and ensemble member.
@@ -178,13 +180,17 @@ def extract_wind_polygons_for_time_step(
         wind_file: Path to wind GRIB file
         bbox: Bounding box for wind extraction
         ensemble_member: Ensemble member number
+        indexpath: Optional directory path for GRIB index files (.idx).
+                   If provided, index files will be stored here instead
+                   of alongside the GRIB file. Useful for parallel processing
+                   to avoid concurrent index file conflicts.
         
     Returns:
         Dictionary mapping wind thresholds to WKT polygons
     """
     try:
-        # Load wind data for this member and region
-        wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False)
+        # Load wind data for this member and region with optional index path
+        wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
         
         # Create contours for all thresholds
         contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
@@ -281,7 +287,10 @@ def find_wind_data_files(wind_data_dir: Path) -> List[Path]:
     Returns:
         List of wind GRIB file paths
     """
-    wind_files = list(wind_data_dir.glob("*.grib2"))
+    # Check for multiple extensions (.grib2, .grb2, and .bin files with 'grib' in name)
+    wind_files = list(wind_data_dir.glob("*.grib2")) + \
+                 list(wind_data_dir.glob("*.grb2")) + \
+                 [f for f in wind_data_dir.glob("*.bin") if 'grib' in f.name.lower()]
     
     if not wind_files:
         logger.warning(f"No wind GRIB files found in {wind_data_dir}")
@@ -292,6 +301,114 @@ def find_wind_data_files(wind_data_dir: Path) -> List[Path]:
         logger.info(f"  - {wind_file.name}")
     
     return wind_files
+
+
+def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
+    """
+    Worker function to process a single track point (wind file extraction) in parallel.
+    Must be top-level function for pickling.
+    
+    Args:
+        args: Tuple of (track_point_dict, wind_files, bbox, storm_name, index_dir)
+    
+    Returns:
+        Tuple of (list of envelope records, log message)
+    """
+    import pandas as pd
+    from pathlib import Path
+    from datetime import datetime
+    
+    # Import required functions (in worker process)
+    from ecmwf_wind_data_extractor import (
+        load_wind_data,
+        create_wind_threshold_contours,
+        polygon_to_wkt,
+        WIND_THRESHOLDS
+    )
+    
+    track_point_dict, wind_files, bbox, storm_name, index_dir = args
+    
+    try:
+        valid_time = track_point_dict['valid_time']
+        lead_time = track_point_dict['lead_time']
+        ensemble_member = track_point_dict['ensemble_member']
+        forecast_time = track_point_dict.get('forecast_time')
+        
+        # Convert valid_time to datetime if needed
+        if isinstance(valid_time, pd.Timestamp):
+            valid_time = valid_time.to_pydatetime()
+        elif isinstance(valid_time, str):
+            valid_time = pd.to_datetime(valid_time).to_pydatetime()
+        
+        # Calculate forecast start date from valid_time and lead_time
+        if forecast_time is not None:
+            if isinstance(forecast_time, pd.Timestamp):
+                forecast_time = forecast_time.to_pydatetime()
+            elif isinstance(forecast_time, str):
+                forecast_time = pd.to_datetime(forecast_time).to_pydatetime()
+            forecast_start_date = forecast_time
+            run_hour = f"{forecast_time.hour:02d}"
+        else:
+            forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+            run_hour = "*"
+        
+        date_str = forecast_start_date.strftime('%Y-%m-%d')
+        forecast_hour = f"f{lead_time:03d}h"
+        type_tag = "_cf" if ensemble_member == 51 else "_pf"
+        expected_run_tag = f"_r{run_hour}_"
+        
+        # Find matching wind file (preserve main version's logic with forecast_time)
+        wind_file = None
+        for wind_file_path in wind_files:
+            filename = wind_file_path.name
+            if (
+                f"wind_ens_{date_str}" in filename
+                and (run_hour == "*" or expected_run_tag in filename)
+                and f"_{forecast_hour}" in filename
+                and filename.endswith(f"{type_tag}.grib2")
+            ):
+                wind_file = wind_file_path
+                break
+        
+        if wind_file is None:
+            expected_pattern = f"wind_ens_{date_str}_r{run_hour}_{forecast_hour}_{type_tag}.grib2"
+            return [], f"No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}"
+        
+        log_msg = f"Processing {valid_time} (lead {lead_time}h) - {wind_file.name}"
+        
+        # Extract wind polygons for this time step with storm-specific index directory
+        try:
+            # Load wind data for this member and region with optional index path
+            wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=index_dir)
+            
+            # Create contours for all thresholds
+            contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
+            
+            # Convert to WKT format
+            wkt_polygons = {}
+            for threshold, polygon in contours.items():
+                wkt_polygons[threshold] = polygon_to_wkt(polygon)
+        except Exception as e:
+            return [], f"Error extracting wind polygons: {str(e)}"
+        
+        # Create envelope records for this time step
+        envelope_records = []
+        for threshold, wkt_polygon in wkt_polygons.items():
+            if wkt_polygon is not None:
+                envelope_records.append({
+                    'forecast_time': track_point_dict['forecast_time'],
+                    'track_id': storm_name,
+                    'ensemble_member': ensemble_member,
+                    'valid_time': valid_time,
+                    'lead_time': lead_time,
+                    'wind_threshold': threshold,
+                    'envelope_region': wkt_polygon
+                })
+        
+        return envelope_records, log_msg
+        
+    except Exception as e:
+        return [], f"Error processing track point: {str(e)}"
 
 
 def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> int:
@@ -361,7 +478,9 @@ def process_wind_combination(
     output_dir: Path,
     buffer_radius_km: int = 500,
     max_ensemble_members: int = 3,
-    verbose: bool = True
+    verbose: bool = True,
+    use_process_pool: bool = False,
+    max_workers: int = 4
 ) -> Dict[str, int]:
     """
     Process wind combination for all TC storms, producing both individual and combined outputs.
@@ -372,6 +491,8 @@ def process_wind_combination(
     3. Combines polygons of the same wind threshold across all forecast steps
     4. Saves combined polygons to {storm}_envelopes_combined.csv
     
+    Can process track points sequentially or concurrently using ProcessPoolExecutor.
+    
     Args:
         tc_data_dir: Directory containing transformed TC CSV files
         wind_data_dir: Directory containing wind GRIB files
@@ -379,12 +500,16 @@ def process_wind_combination(
         buffer_radius_km: Buffer radius around TC tracks in km
         max_ensemble_members: Maximum number of ensemble members to process (for testing)
         verbose: Whether to print detailed progress
+        use_process_pool: If True, use ProcessPoolExecutor for concurrent track point processing.
+                         Default: False (sequential processing for backward compatibility)
+        max_workers: Number of concurrent workers (only used if use_process_pool=True)
         
     Returns:
         Dictionary with processing statistics
     """
+    pool_type = "ProcessPool" if use_process_pool else "Sequential"
     logger.info("=" * 70)
-    logger.info("ECMWF TC WIND COMBINATION PROCESSING")
+    logger.info(f"ECMWF TC WIND COMBINATION PROCESSING ({pool_type})")
     logger.info("=" * 70)
     
     # Find input files
@@ -430,64 +555,111 @@ def process_wind_combination(
 
             # Limit ensemble members for faster processing
             unique_members = list(tc_data['ensemble_member'].unique())[:max_ensemble_members]
+            filtered_tc_data = tc_data[tc_data['ensemble_member'].isin(unique_members)]
 
             if verbose:
                 logger.info(f"  Processing {len(unique_members)} ensemble members: {list(unique_members)}")
 
-            total_members = len(unique_members)
+            # Create storm-specific index directory to avoid concurrent .idx file conflicts
+            index_dir = str(wind_data_dir / '.idx_cache' / storm_name)
+            os.makedirs(index_dir, exist_ok=True)
 
-            for idx, member in enumerate(unique_members, start=1):
-                logger.info(f"  → Member {member} ({idx}/{total_members})")
+            # Process track points in parallel if enabled
+            if use_process_pool and len(filtered_tc_data) > 1:
+                logger.info(f"  Processing {len(filtered_tc_data)} track points in parallel with {max_workers} workers")
+                
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    # Prepare arguments for each track point
+                    track_point_args = []
+                    for _, track_point in filtered_tc_data.iterrows():
+                        track_point_dict = {
+                            'valid_time': track_point['valid_time'],
+                            'lead_time': track_point['lead_time'],
+                            'ensemble_member': track_point['ensemble_member'],
+                            'forecast_time': track_point.get('forecast_time') if 'forecast_time' in track_point else None
+                        }
+                        track_point_args.append((track_point_dict, wind_files, bbox, storm_name, index_dir))
+                    
+                    # Submit all track points for processing
+                    futures = {
+                        executor.submit(_process_track_point_worker, args): i
+                        for i, args in enumerate(track_point_args)
+                    }
+                    
+                    # Collect results as they complete
+                    for future in as_completed(futures):
+                        try:
+                            envelope_records, log_msg = future.result()
+                            if log_msg and verbose:
+                                logger.info(f"    {log_msg}")
+                            storm_envelope_records.extend(envelope_records)
+                        except Exception as e:
+                            logger.warning(f"    Error processing track point: {e}")
+            else:
+                # Sequential processing (original behavior)
+                if len(filtered_tc_data) <= 1:
+                    if verbose:
+                        logger.info(f"  Only {len(filtered_tc_data)} track point(s) - using sequential processing")
+                else:
+                    if verbose:
+                        logger.info(f"  Processing {len(filtered_tc_data)} track points sequentially")
 
-                member_tc_data = tc_data[tc_data['ensemble_member'] == member]
+                total_members = len(unique_members)
 
-                for _, track_point in member_tc_data.iterrows():
-                    valid_time = track_point['valid_time']
-                    lead_time = track_point['lead_time']
-                    ensemble_member = track_point['ensemble_member']
-                    forecast_time = track_point.get('forecast_time') if 'forecast_time' in track_point else None
+                for idx, member in enumerate(unique_members, start=1):
+                    if verbose:
+                        logger.info(f"  → Member {member} ({idx}/{total_members})")
 
-                    # Find matching wind file (must pass forecast_time to match correct run hour)
-                    wind_file = find_wind_file_for_time(valid_time, lead_time, wind_files, ensemble_member, forecast_time)
+                    member_tc_data = filtered_tc_data[filtered_tc_data['ensemble_member'] == member]
 
-                    if wind_file is None:
-                        if forecast_time is not None:
-                            if isinstance(forecast_time, pd.Timestamp):
-                                forecast_time = forecast_time.to_pydatetime()
-                            elif isinstance(forecast_time, str):
-                                forecast_time = pd.to_datetime(forecast_time).to_pydatetime()
-                            run_hour = f"{forecast_time.hour:02d}"
-                            forecast_start_date = forecast_time
-                        else:
-                            forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
-                            run_hour = "*"
-                        date_str = forecast_start_date.strftime('%Y-%m-%d')
-                        forecast_hour = f"f{lead_time:03d}h"
-                        expected_pattern = (
-                            f"wind_ens_{date_str}_r{run_hour}_{forecast_hour}_{'cf' if ensemble_member == 51 else 'pf'}.grib2"
+                    for _, track_point in member_tc_data.iterrows():
+                        valid_time = track_point['valid_time']
+                        lead_time = track_point['lead_time']
+                        ensemble_member = track_point['ensemble_member']
+                        forecast_time = track_point.get('forecast_time') if 'forecast_time' in track_point else None
+
+                        # Find matching wind file (must pass forecast_time to match correct run hour)
+                        wind_file = find_wind_file_for_time(valid_time, lead_time, wind_files, ensemble_member, forecast_time)
+
+                        if wind_file is None:
+                            if forecast_time is not None:
+                                if isinstance(forecast_time, pd.Timestamp):
+                                    forecast_time = forecast_time.to_pydatetime()
+                                elif isinstance(forecast_time, str):
+                                    forecast_time = pd.to_datetime(forecast_time).to_pydatetime()
+                                run_hour = f"{forecast_time.hour:02d}"
+                                forecast_start_date = forecast_time
+                            else:
+                                forecast_start_date = valid_time - pd.Timedelta(hours=lead_time)
+                                run_hour = "*"
+                            date_str = forecast_start_date.strftime('%Y-%m-%d')
+                            forecast_hour = f"f{lead_time:03d}h"
+                            expected_pattern = (
+                                f"wind_ens_{date_str}_r{run_hour}_{forecast_hour}_{'cf' if ensemble_member == 51 else 'pf'}.grib2"
+                            )
+                            logger.warning(f"    No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}")
+                            continue
+
+                        if verbose:
+                            logger.info(f"    Processing {valid_time} (lead {lead_time}h) - {wind_file.name}")
+
+                        # Extract wind polygons for this time step with storm-specific index directory
+                        wkt_polygons = extract_wind_polygons_for_time_step(
+                            wind_file, bbox, ensemble_member, indexpath=index_dir
                         )
-                        logger.warning(f"    No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}")
-                        continue
 
-                    logger.info(f"    Processing {valid_time} (lead {lead_time}h) - {wind_file.name}")
-
-                    # Extract wind polygons for this time step
-                    wkt_polygons = extract_wind_polygons_for_time_step(
-                        wind_file, bbox, ensemble_member
-                    )
-
-                    # Create envelope records for this time step
-                    for threshold, wkt_polygon in wkt_polygons.items():
-                        if wkt_polygon is not None:
-                            storm_envelope_records.append({
-                                'forecast_time': track_point['forecast_time'],
-                                'track_id': storm_name,
-                                'ensemble_member': ensemble_member,
-                                'valid_time': valid_time,
-                                'lead_time': lead_time,
-                                'wind_threshold': threshold,
-                                'envelope_region': wkt_polygon
-                            })
+                        # Create envelope records for this time step
+                        for threshold, wkt_polygon in wkt_polygons.items():
+                            if wkt_polygon is not None:
+                                storm_envelope_records.append({
+                                    'forecast_time': track_point['forecast_time'],
+                                    'track_id': storm_name,
+                                    'ensemble_member': ensemble_member,
+                                    'valid_time': valid_time,
+                                    'lead_time': lead_time,
+                                    'wind_threshold': threshold,
+                                    'envelope_region': wkt_polygon
+                                })
             
             # Save both individual and combined outputs
             if storm_envelope_records:
