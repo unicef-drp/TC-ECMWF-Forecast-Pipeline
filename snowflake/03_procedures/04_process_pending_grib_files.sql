@@ -1,8 +1,9 @@
 -- ============================================================================
 -- Stored Procedure: process_pending_grib_files
 -- ============================================================================
--- Processes all GRIB2 files with PROCESSING_STATUS = 'PENDING'
--- Extracts wind data and loads into WIND_RAW_EXTRACTED table
+-- Marks GRIB2 files as COMPLETED (ready for on-demand processing)
+-- Wind data is now processed on-demand in create_wind_envelopes procedure
+-- No raw wind data is stored - matching Python approach
 -- Designed to be called by Snowflake Tasks for automated processing
 -- ============================================================================
 
@@ -22,7 +23,10 @@ AS
 $$
 def process_pending_grib_files(session):
     """
-    Process all PENDING GRIB2 files from FILE_PROCESSING_LOG.
+    Mark PENDING GRIB2 files as COMPLETED (ready for on-demand processing).
+    
+    Wind data is now processed on-demand in create_wind_envelopes procedure.
+    No raw wind data is stored - matching Python approach.
     
     Returns:
         Summary string with processing results
@@ -37,7 +41,7 @@ def process_pending_grib_files(session):
             FORECAST_DATE,
             RUN_TIME,
             CREATED_AT
-        FROM FILE_PROCESSING_LOG
+        FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
         WHERE FILE_TYPE = 'GRIB2'
           AND PROCESSING_STATUS = 'PENDING'
         ORDER BY FORECAST_DATE, RUN_TIME, FILE_PATH
@@ -47,118 +51,41 @@ def process_pending_grib_files(session):
         return "No unprocessed GRIB2 files found"
     
     processed_count = 0
-    failed_count = 0
-    total_records = 0
-    errors = []
     
     for file_info in unprocessed_files:
         file_path = file_info['FILE_PATH']
-        forecast_date = file_info['FORECAST_DATE']
-        run_time = file_info['RUN_TIME']
-        
-        filename = file_path.split('/')[-1]
         
         try:
-            # Update status to PROCESSING
+            # Mark file as COMPLETED (ready for on-demand processing in create_wind_envelopes)
+            # No extraction needed - wind data will be loaded on-demand when creating envelopes
             session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
-                SET PROCESSING_STATUS = 'PROCESSING',
-                    PROCESSING_START_TIME = CURRENT_TIMESTAMP(),
-                    UPDATED_AT = CURRENT_TIMESTAMP()
-                WHERE FILE_PATH = '{file_path}'
-            """).collect()
-            
-            # Extract GRIB2 wind data
-            extract_sql = f"""
-                SELECT 
-                    SOURCE_FILE,
-                    FORECAST_TIME,
-                    VALID_TIME,
-                    LEAD_TIME,
-                    ENSEMBLE_MEMBER,
-                    LATITUDE,
-                    LONGITUDE,
-                    WIND_U_COMPONENT,
-                    WIND_V_COMPONENT,
-                    WIND_SPEED_10M
-                FROM TABLE(extract_wind_grib_file('{file_path}'))
-            """
-            
-            extracted_data = session.sql(extract_sql).collect()
-            
-            # Check for errors in extraction
-            if extracted_data and extracted_data[0]['FORECAST_TIME'] is None:
-                raise Exception("Extraction failed - no valid data")
-            
-            if not extracted_data:
-                raise Exception("No data extracted from file")
-            
-            record_count = len(extracted_data)
-            
-            # Insert into staging table (WIND_RAW_EXTRACTED)
-            insert_sql = f"""
-                INSERT INTO WIND_RAW_EXTRACTED (
-                    SOURCE_FILE,
-                    FORECAST_TIME,
-                    VALID_TIME,
-                    LEAD_TIME,
-                    ENSEMBLE_MEMBER,
-                    LATITUDE,
-                    LONGITUDE,
-                    WIND_SPEED_10M,
-                    WIND_U_COMPONENT,
-                    WIND_V_COMPONENT
-                )
-                SELECT 
-                    SOURCE_FILE,
-                    FORECAST_TIME,
-                    VALID_TIME,
-                    LEAD_TIME,
-                    ENSEMBLE_MEMBER,
-                    LATITUDE,
-                    LONGITUDE,
-                    WIND_SPEED_10M,
-                    WIND_U_COMPONENT,
-                    WIND_V_COMPONENT
-                FROM TABLE(extract_wind_grib_file('{file_path}'))
-            """
-            
-            session.sql(insert_sql).collect()
-            
-            # Update status to COMPLETED
-            session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
+                UPDATE AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
                 SET PROCESSING_STATUS = 'COMPLETED',
+                    PROCESSING_START_TIME = CURRENT_TIMESTAMP(),
                     PROCESSING_END_TIME = CURRENT_TIMESTAMP(),
                     UPDATED_AT = CURRENT_TIMESTAMP(),
-                    RECORDS_EXTRACTED = {record_count},
+                    RECORDS_EXTRACTED = NULL,
                     ERROR_MESSAGE = NULL
                 WHERE FILE_PATH = '{file_path}'
             """).collect()
             
             processed_count += 1
-            total_records += record_count
             
         except Exception as e:
             error_msg = str(e)[:500]
-            errors.append(f"{filename}: {error_msg}")
             
             # Update status to FAILED
             session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
+                UPDATE AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
                 SET PROCESSING_STATUS = 'FAILED',
                     PROCESSING_END_TIME = CURRENT_TIMESTAMP(),
                     UPDATED_AT = CURRENT_TIMESTAMP(),
-                    ERROR_MESSAGE = '{error_msg.replace("'", "''")}'
+                    ERROR_MESSAGE = 'Error marking file as ready: {error_msg.replace("'", "''")}'
                 WHERE FILE_PATH = '{file_path}'
             """).collect()
-            
-            failed_count += 1
     
     # Build summary
-    summary = f"Processed {processed_count}/{len(unprocessed_files)} files, {total_records} records extracted"
-    if failed_count > 0:
-        summary += f" ({failed_count} failed)"
+    summary = f"Marked {processed_count}/{len(unprocessed_files)} GRIB2 files as ready for on-demand processing"
     
     return summary
 $$;

@@ -93,94 +93,220 @@ def download_wind_grib_files(session: Session, forecast_date, run_time, forecast
         # Initialize ECMWF client
         client = Client(source="ecmwf")
         
-        # Download each forecast hour
+        # Download each forecast hour - download both PF and CF files (matching Python)
         for step in forecast_hours:
-            filename = f"wind_ens_{dt.strftime('%Y-%m-%d')}_r{run_hour:02d}_f{step:03d}h.grib2"
+            # PF (perturbed) file - members 1-50
+            filename_pf = f"wind_ens_{dt.strftime('%Y-%m-%d')}_r{run_hour:02d}_f{step:03d}h_pf.grib2"
+            stage_file_path_pf = f"{stage_dir}/{filename_pf}"
             
+            # CF (control) file - member 51
+            filename_cf = f"wind_ens_{dt.strftime('%Y-%m-%d')}_r{run_hour:02d}_f{step:03d}h_cf.grib2"
+            stage_file_path_cf = f"{stage_dir}/{filename_cf}"
+            
+            # ========================================================================
+            # Download PF file (perturbed members 1-50)
+            # ========================================================================
             try:
-                # Create temporary file with correct filename
-                # Create temp directory and write file with original name
-                temp_dir = tempfile.mkdtemp()
-                temp_path = os.path.join(temp_dir, filename)
+                # Check if file already exists in FILE_PROCESSING_LOG
+                existing_file_pf = session.sql(f"""
+                    SELECT FILE_PATH 
+                    FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG 
+                    WHERE FILE_PATH = '{stage_file_path_pf}'
+                      AND FILE_TYPE = 'GRIB2'
+                      AND PROCESSING_STATUS = 'COMPLETED'
+                    LIMIT 1
+                """).collect()
                 
-                try:
-                    # Download wind data (u10 and v10 components, perturbed members only)
-                    client.retrieve(
-                        date=dt,
-                        time=run_hour,
-                        stream="enfo",  # Ensemble forecast
-                        type="pf",      # Perturbed forecast (members 1-50)
-                        step=step,
-                        param=["10u", "10v"],  # 10m u and v wind components
-                        target=temp_path
-                    )
-                    
-                    # Verify file was created
-                    if not os.path.exists(temp_path):
-                        results.append((
-                            None,
-                            0,
-                            'ERROR',
-                            f'Step +{step}h: File not created by ECMWF client'
-                        ))
-                        continue
-                    
-                    file_size = os.path.getsize(temp_path)
-                    
-                    # PUT file to stage (will use the filename from temp_path)
-                    put_result = session.file.put(
-                        local_file_name=temp_path,
-                        stage_location=stage_dir,
-                        auto_compress=False,
-                        overwrite=True
-                    )
-                    
-                    # Build stage file path
-                    stage_file_path = f"{stage_dir}/{filename}"
-                    
-                    # Insert into FILE_PROCESSING_LOG
-                    session.sql(f"""
-                        INSERT INTO FILE_PROCESSING_LOG (
-                            FILE_PATH,
-                            FILE_TYPE,
-                            FORECAST_DATE,
-                            RUN_TIME,
-                            FILE_SIZE_BYTES,
-                            PROCESSING_STATUS,
-                            CREATED_AT,
-                            UPDATED_AT
-                        ) VALUES (
-                            '{stage_file_path}',
-                            'GRIB2',
-                            '{forecast_date}',
-                            '{run_time.zfill(2)}',
-                            {file_size},
-                            'PENDING',
-                            CURRENT_TIMESTAMP(),
-                            CURRENT_TIMESTAMP()
-                        )
-                    """).collect()
-                    
+                if existing_file_pf:
+                    # File already exists and was processed - skip download
                     results.append((
-                        stage_file_path,
-                        file_size,
-                        'SUCCESS',
-                        f'Downloaded step +{step}h ({file_size / 1024 / 1024:.1f} MB)'
+                        stage_file_path_pf,
+                        0,
+                        'SKIPPED',
+                        f'Step +{step}h PF: Already exists and processed'
                     ))
+                else:
+                    # Create temporary file with correct filename
+                    temp_dir = tempfile.mkdtemp()
+                    temp_path_pf = os.path.join(temp_dir, filename_pf)
                     
-                finally:
-                    # Clean up temp file and directory
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                    if os.path.exists(temp_dir):
-                        os.rmdir(temp_dir)
+                    try:
+                        # Download PF wind data (u10 and v10 components, perturbed members 1-50)
+                        client.retrieve(
+                            date=dt,
+                            time=run_hour,
+                            stream="enfo",  # Ensemble forecast
+                            type="pf",      # Perturbed forecast (members 1-50)
+                            step=step,
+                            param=["10u", "10v"],  # 10m u and v wind components
+                            target=temp_path_pf
+                        )
+                        
+                        # Verify file was created
+                        if not os.path.exists(temp_path_pf):
+                            results.append((
+                                None,
+                                0,
+                                'ERROR',
+                                f'Step +{step}h PF: File not created by ECMWF client'
+                            ))
+                        else:
+                            file_size_pf = os.path.getsize(temp_path_pf)
+                            
+                            # PUT file to stage
+                            put_result = session.file.put(
+                                local_file_name=temp_path_pf,
+                                stage_location=stage_dir,
+                                auto_compress=False,
+                                overwrite=True
+                            )
+                            
+                            # Insert into FILE_PROCESSING_LOG
+                            session.sql(f"""
+                                INSERT INTO AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG (
+                                    FILE_PATH,
+                                    FILE_TYPE,
+                                    FORECAST_DATE,
+                                    RUN_TIME,
+                                    FILE_SIZE_BYTES,
+                                    PROCESSING_STATUS,
+                                    CREATED_AT,
+                                    UPDATED_AT
+                                ) VALUES (
+                                    '{stage_file_path_pf}',
+                                    'GRIB2',
+                                    '{forecast_date}',
+                                    '{run_time.zfill(2)}',
+                                    {file_size_pf},
+                                    'PENDING',
+                                    CURRENT_TIMESTAMP(),
+                                    CURRENT_TIMESTAMP()
+                                )
+                            """).collect()
+                            
+                            results.append((
+                                stage_file_path_pf,
+                                file_size_pf,
+                                'SUCCESS',
+                                f'Downloaded step +{step}h PF ({file_size_pf / 1024 / 1024:.1f} MB)'
+                            ))
+                        
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(temp_path_pf):
+                            os.unlink(temp_path_pf)
+                        if os.path.exists(temp_dir):
+                            os.rmdir(temp_dir)
                 
             except Exception as e:
                 results.append((
                     None,
                     0,
                     'ERROR',
-                    f'Step +{step}h: {str(e)}'
+                    f'Step +{step}h PF: {str(e)}'
+                ))
+            
+            # ========================================================================
+            # Download CF file (control forecast, member 51)
+            # ========================================================================
+            try:
+                # Check if file already exists in FILE_PROCESSING_LOG
+                existing_file_cf = session.sql(f"""
+                    SELECT FILE_PATH 
+                    FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG 
+                    WHERE FILE_PATH = '{stage_file_path_cf}'
+                      AND FILE_TYPE = 'GRIB2'
+                      AND PROCESSING_STATUS = 'COMPLETED'
+                    LIMIT 1
+                """).collect()
+                
+                if existing_file_cf:
+                    # File already exists and was processed - skip download
+                    results.append((
+                        stage_file_path_cf,
+                        0,
+                        'SKIPPED',
+                        f'Step +{step}h CF: Already exists and processed'
+                    ))
+                else:
+                    # Create temporary file with correct filename
+                    temp_dir = tempfile.mkdtemp()
+                    temp_path_cf = os.path.join(temp_dir, filename_cf)
+                    
+                    try:
+                        # Download CF wind data (u10 and v10 components, control forecast)
+                        client.retrieve(
+                            date=dt,
+                            time=run_hour,
+                            stream="enfo",  # Ensemble forecast
+                            type="cf",      # Control forecast (member 51)
+                            step=step,
+                            param=["10u", "10v"],  # 10m u and v wind components
+                            target=temp_path_cf
+                        )
+                        
+                        # Verify file was created
+                        if not os.path.exists(temp_path_cf):
+                            results.append((
+                                None,
+                                0,
+                                'ERROR',
+                                f'Step +{step}h CF: File not created by ECMWF client'
+                            ))
+                        else:
+                            file_size_cf = os.path.getsize(temp_path_cf)
+                            
+                            # PUT file to stage
+                            put_result = session.file.put(
+                                local_file_name=temp_path_cf,
+                                stage_location=stage_dir,
+                                auto_compress=False,
+                                overwrite=True
+                            )
+                            
+                            # Insert into FILE_PROCESSING_LOG
+                            session.sql(f"""
+                                INSERT INTO AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG (
+                                    FILE_PATH,
+                                    FILE_TYPE,
+                                    FORECAST_DATE,
+                                    RUN_TIME,
+                                    FILE_SIZE_BYTES,
+                                    PROCESSING_STATUS,
+                                    CREATED_AT,
+                                    UPDATED_AT
+                                ) VALUES (
+                                    '{stage_file_path_cf}',
+                                    'GRIB2',
+                                    '{forecast_date}',
+                                    '{run_time.zfill(2)}',
+                                    {file_size_cf},
+                                    'PENDING',
+                                    CURRENT_TIMESTAMP(),
+                                    CURRENT_TIMESTAMP()
+                                )
+                            """).collect()
+                            
+                            results.append((
+                                stage_file_path_cf,
+                                file_size_cf,
+                                'SUCCESS',
+                                f'Downloaded step +{step}h CF ({file_size_cf / 1024 / 1024:.1f} MB)'
+                            ))
+                        
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(temp_path_cf):
+                            os.unlink(temp_path_cf)
+                        if os.path.exists(temp_dir):
+                            os.rmdir(temp_dir)
+                
+            except Exception as e:
+                results.append((
+                    None,
+                    0,
+                    'ERROR',
+                    f'Step +{step}h CF: {str(e)}'
                 ))
         
         # Convert results to Snowpark DataFrame

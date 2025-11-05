@@ -118,6 +118,29 @@ def download_tc_bufr_files(session: Session, forecast_date, run_time):
         # Download each file
         for filename in tc_files:
             try:
+                # Check if file already exists in stage and FILE_PROCESSING_LOG
+                stage_file_path = f"{stage_dir}/{filename}"
+                
+                # Check if file already exists in FILE_PROCESSING_LOG
+                existing_file = session.sql(f"""
+                    SELECT FILE_PATH 
+                    FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG 
+                    WHERE FILE_PATH = '{stage_file_path}'
+                      AND FILE_TYPE = 'BUFR'
+                      AND PROCESSING_STATUS = 'COMPLETED'
+                    LIMIT 1
+                """).collect()
+                
+                if existing_file:
+                    # File already exists and was processed - skip download
+                    results.append((
+                        stage_file_path,
+                        0,
+                        'SKIPPED',
+                        f'{filename}: Already exists and processed'
+                    ))
+                    continue
+                
                 file_url = f"{BASE_URL}/file/{forecast_time}/{filename}"
                 file_response = requests.get(file_url, timeout=60)
                 file_response.raise_for_status()

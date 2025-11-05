@@ -7,7 +7,7 @@
 -- 1. Join TC tracks with wind data (by forecast_time, valid_time, member)
 -- 2. Buffer TC tracks (500km radius)
 -- 3. Filter wind grid points within buffer
--- 4. Create contour polygons for wind thresholds (34, 50, 64 knots)
+-- 4. Create contour polygons for wind thresholds (34, 40, 50, 64, 83, 96, 113, 137 knots)
 -- 5. Generate individual envelopes (per timestep)
 -- 6. Generate combined envelopes (union across timesteps)
 --
@@ -29,7 +29,7 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = 3.11
 RESOURCE_CONSTRAINT = (architecture='x86')
 ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
-PACKAGES = ('snowflake-snowpark-python', 'pandas', 'numpy', 'matplotlib', 'shapely', 'scipy', 'pyarrow')
+PACKAGES = ('snowflake-snowpark-python', 'pandas', 'numpy', 'matplotlib', 'shapely', 'scipy', 'pyarrow', 'xarray', 'cfgrib')
 HANDLER = 'create_wind_envelopes'
 AS
 $$
@@ -39,6 +39,11 @@ import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union
 from scipy.spatial import ConvexHull
+import xarray as xr
+import tempfile
+import os
+from datetime import datetime, timedelta
+from snowflake.snowpark.files import SnowflakeFile
 
 def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=None, ensemble_member_filter=None):
     """
@@ -127,18 +132,31 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
             contours = ax.contour(lon_mesh, lat_mesh, wind_grid, levels=[threshold_ms])
             plt.close(fig)
             
-            # Extract contour polygons
+            # Extract contour polygons (matching Python: use contours.allsegs[0])
             polygons = []
-            for collection in contours.collections:
-                for path in collection.get_paths():
-                    vertices = path.vertices
-                    if len(vertices) >= 3:
-                        try:
-                            poly = Polygon(vertices)
-                            if poly.is_valid and poly.area > 0:
-                                polygons.append(poly)
-                        except:
-                            continue
+            try:
+                # Python approach: if len(cs.allsegs) > 0 and len(cs.allsegs[0]) > 0:
+                if len(contours.allsegs) > 0 and len(contours.allsegs[0]) > 0:
+                    for segment in contours.allsegs[0]:
+                        if len(segment) > 3:  # Python requires > 3 points
+                            try:
+                                poly = Polygon(segment)
+                                if poly.is_valid and poly.area > 0:  # Python checks validity and area
+                                    polygons.append(poly)
+                            except:
+                                continue
+            except Exception:
+                # Fallback: try collections approach if allsegs doesn't work
+                for collection in contours.collections:
+                    for path in collection.get_paths():
+                        vertices = path.vertices
+                        if len(vertices) > 3:  # Changed from >= 3 to > 3 to match Python
+                            try:
+                                poly = Polygon(vertices)
+                                if poly.is_valid and poly.area > 0:
+                                    polygons.append(poly)
+                            except:
+                                continue
             
             if not polygons:
                 return None
@@ -206,7 +224,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
             LEAD_TIME,
             LATITUDE,
             LONGITUDE
-        FROM TC_TRANSFORMED_STAGING
+        FROM AOTS.ECMWF_PIPELINE.TC_TRANSFORMED_STAGING
         WHERE 1=1 {where_sql}
         ORDER BY FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME
     """
@@ -216,11 +234,16 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
     if tracks_df.empty:
         return "No TC track data found for specified filters"
     
-    # Wind thresholds (knots to m/s conversion)
+    # Wind thresholds (knots to m/s conversion) - matching Python WIND_THRESHOLDS
     wind_thresholds = {
-        34: 17.49,   # Tropical storm
-        50: 25.72,   # Strong tropical storm
-        64: 32.92    # Hurricane
+        34: 17.49,   # Tropical storm force
+        40: 20.58,   # Strong tropical storm
+        50: 25.72,   # Very strong tropical storm
+        64: 32.92,   # Category 1 hurricane
+        83: 42.70,   # Category 2 hurricane
+        96: 49.39,   # Category 3 hurricane
+        113: 58.12,  # Category 4 hurricane
+        137: 70.48   # Category 5 hurricane
     }
     
     # ========================================================================
@@ -231,120 +254,168 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
     processed_count = 0
     error_count = 0
     
-    # Group by forecast/storm/member for combined envelopes
-    track_groups = tracks_df.groupby(['FORECAST_TIME', 'TRACK_ID', 'ENSEMBLE_MEMBER'])
+    # Group by storm (TRACK_ID) first to calculate ONE bbox per storm (from all members, all time steps)
+    # This matches Python: create_buffered_track_polygon(tc_data, buffer_radius_km) - uses ALL track points
+    storm_groups = tracks_df.groupby('TRACK_ID')
     
-    for (forecast_time, track_id, member), track_group in track_groups:
+    for track_id, storm_tracks in storm_groups:
         
-        # Get wind data for this forecast/member
-        wind_query = f"""
-            SELECT 
-                VALID_TIME,
-                LATITUDE,
-                LONGITUDE,
-                WIND_SPEED_10M
-            FROM WIND_RAW_EXTRACTED
-            WHERE FORECAST_TIME = '{forecast_time}'
-              AND ENSEMBLE_MEMBER = {member}
-        """
+        # Calculate ONE bounding box from ALL track points for this storm (all members, all time steps)
+        # This matches Python: one bbox per storm, reused for all time steps and members
+        track_lat_min = storm_tracks['LATITUDE'].min()
+        track_lat_max = storm_tracks['LATITUDE'].max()
+        track_lon_min = storm_tracks['LONGITUDE'].min()
+        track_lon_max = storm_tracks['LONGITUDE'].max()
         
-        wind_df = session.sql(wind_query).to_pandas()
+        # Add buffer (500km ≈ 4.5 degrees, plus 2.0 degree extra buffer like Python)
+        buffer_deg = 5.0 + 2.0  # 500km buffer + 2 degree extra (matching Python's get_bounding_box(buffer=2.0))
+        bbox_lat_min = track_lat_min - buffer_deg
+        bbox_lat_max = track_lat_max + buffer_deg
+        bbox_lon_min = track_lon_min - buffer_deg
+        bbox_lon_max = track_lon_max + buffer_deg
         
-        if wind_df.empty:
-            error_count += 1
-            continue
+        # Handle longitude wrap-around (if track crosses 180/-180)
+        if bbox_lon_min < -180:
+            bbox_lon_min = -180
+        if bbox_lon_max > 180:
+            bbox_lon_max = 180
         
-        # Convert wind speed to knots for comparison
-        wind_df['WIND_SPEED_KNOTS'] = wind_df['WIND_SPEED_10M'] * 1.944
+        # Now process each (forecast_time, member) combination for this storm
+        # Use the SAME bbox for all time steps and members (matching Python)
+        member_groups = storm_tracks.groupby(['FORECAST_TIME', 'ENSEMBLE_MEMBER'])
         
-        # Store polygons for combined envelope
-        combined_polys_by_threshold = {34: [], 50: [], 64: []}
-        
-        # Process each time step
-        for _, track_point in track_group.iterrows():
+        for (forecast_time, member), track_group in member_groups:
             
-            valid_time = track_point['VALID_TIME']
-            center_lat = track_point['LATITUDE']
-            center_lon = track_point['LONGITUDE']
-            lead_time = track_point['LEAD_TIME']
+            # Store polygons for combined envelope (per member)
+            # Initialize for all thresholds (matching Python)
+            combined_polys_by_threshold = {threshold: [] for threshold in wind_thresholds.keys()}
             
-            # Filter wind data for this valid time and within buffer
-            wind_at_time = wind_df[wind_df['VALID_TIME'] == valid_time].copy()
-            
-            if wind_at_time.empty:
-                continue
-            
-            # Apply buffer filter (500km)
-            lat_min, lat_max, lon_min, lon_max = create_buffer_bounds(center_lat, center_lon, 500)
-            wind_buffered = wind_at_time[
-                (wind_at_time['LATITUDE'] >= lat_min) &
-                (wind_at_time['LATITUDE'] <= lat_max) &
-                (wind_at_time['LONGITUDE'] >= lon_min) &
-                (wind_at_time['LONGITUDE'] <= lon_max)
-            ].copy()
-            
-            if wind_buffered.empty or len(wind_buffered) < 4:
-                continue
-            
-            # Create envelope for each threshold
-            for threshold_knots, threshold_ms in wind_thresholds.items():
+            # Process each time step (matching Python approach: load wind data on-demand per time step)
+            for _, track_point in track_group.iterrows():
                 
-                # Filter points exceeding threshold
-                wind_above_threshold = wind_buffered[
-                    wind_buffered['WIND_SPEED_10M'] >= threshold_ms
-                ]
+                valid_time = track_point['VALID_TIME']
+                center_lat = track_point['LATITUDE']
+                center_lon = track_point['LONGITUDE']
+                lead_time = track_point['LEAD_TIME']
                 
-                if len(wind_above_threshold) < 3:
+                # Find matching wind GRIB file for this time step (like Python's find_wind_file_for_time)
+                # Format: wind_ens_YYYY-MM-DD_rHH_fHHHh_pf.grib2 or _cf.grib2
+                # Note: Must use new format with _pf/_cf suffix (old format without suffix not supported)
+                forecast_date_str = forecast_time.strftime('%Y-%m-%d')
+                run_hour = f"{forecast_time.hour:02d}"
+                forecast_hour = f"f{lead_time:03d}h"
+                
+                # Choose PF vs CF based on ensemble member (matching Python logic)
+                # Member 51 uses CF file, members 1-50 use PF file
+                file_type = "_cf" if member == 51 else "_pf"
+                
+                # Find wind file in FILE_PROCESSING_LOG
+                # Must use new format with _pf/_cf suffix (matching Python downloads)
+                wind_file_query = f"""
+                    SELECT FILE_PATH
+                    FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
+                    WHERE FILE_TYPE = 'GRIB2'
+                      AND FILE_PATH LIKE '%wind_ens_{forecast_date_str}_r{run_hour}_f{lead_time:03d}h{file_type}.grib2%'
+                      AND PROCESSING_STATUS = 'COMPLETED'
+                    LIMIT 1
+                """
+                
+                wind_file_result = session.sql(wind_file_query).collect()
+                
+                if not wind_file_result or len(wind_file_result) == 0:
+                    # No wind file found for this time step - skip
                     continue
                 
-                # Create polygon from contour
-                lats = wind_above_threshold['LATITUDE'].values
-                lons = wind_above_threshold['LONGITUDE'].values
-                speeds = wind_above_threshold['WIND_SPEED_10M'].values
+                wind_file_path = wind_file_result[0]['FILE_PATH']
                 
-                polygon = create_wind_contour_polygon(lats, lons, speeds, threshold_ms)
+                # Load wind data directly from GRIB file using UDF (on-demand, matching Python approach)
+                # Extract only the bbox region (not all grid points) - uses the SAME bbox for all time steps
+                wind_extract_query = f"""
+                    SELECT 
+                        VALID_TIME,
+                        LATITUDE,
+                        LONGITUDE,
+                        WIND_SPEED_10M
+                    FROM TABLE(AOTS.ECMWF_PIPELINE.extract_wind_grib_file(
+                        '{wind_file_path}',
+                        {bbox_lat_min}::FLOAT,
+                        {bbox_lat_max}::FLOAT,
+                        {bbox_lon_min}::FLOAT,
+                        {bbox_lon_max}::FLOAT
+                    ))
+                    WHERE ENSEMBLE_MEMBER = {member}
+                """
                 
-                # Fallback to convex hull if contour fails
-                if polygon is None:
-                    polygon = create_convex_hull_polygon(lats, lons)
+                wind_df = session.sql(wind_extract_query).to_pandas()
                 
-                if polygon is not None:
-                    # Individual envelope
-                    envelopes.append({
-                        'ENVELOPE_TYPE': 'INDIVIDUAL',
-                        'FORECAST_TIME': forecast_time,
-                        'TRACK_ID': track_id,
-                        'ENSEMBLE_MEMBER': member,
-                        'VALID_TIME': valid_time,
-                        'LEAD_TIME': lead_time,
-                        'WIND_THRESHOLD': threshold_knots,
-                        'ENVELOPE_REGION': polygon_to_wkt(polygon)
-                    })
+                if wind_df.empty:
+                    continue
+                
+                # Wind data is already filtered by storm-level bbox, but we need to filter by local buffer around this track point
+                # Apply additional buffer filter (500km) around this specific track point
+                lat_min, lat_max, lon_min, lon_max = create_buffer_bounds(center_lat, center_lon, 500)
+                wind_buffered = wind_df[
+                    (wind_df['LATITUDE'] >= lat_min) &
+                    (wind_df['LATITUDE'] <= lat_max) &
+                    (wind_df['LONGITUDE'] >= lon_min) &
+                    (wind_df['LONGITUDE'] <= lon_max)
+                ].copy()
+                
+                if wind_buffered.empty or len(wind_buffered) < 4:
+                    continue
+                
+                # Match Python approach: Use ALL wind points to create grid, then contour (not filter by threshold first)
+                # This allows contours even when sparse points exceed threshold
+                all_lats = wind_buffered['LATITUDE'].values
+                all_lons = wind_buffered['LONGITUDE'].values
+                all_speeds = wind_buffered['WIND_SPEED_10M'].values
+                
+                # Create envelope for each threshold
+                for threshold_knots, threshold_ms in wind_thresholds.items():
                     
-                    # Store for combined envelope
-                    combined_polys_by_threshold[threshold_knots].append(polygon)
-        
-        # Create combined envelopes (union of all timesteps)
-        for threshold_knots in wind_thresholds.keys():
-            polys = combined_polys_by_threshold[threshold_knots]
-            if polys:
-                try:
-                    combined_poly = unary_union(polys)
-                    if combined_poly is not None and not combined_poly.is_empty:
+                    # Create polygon from ALL wind data (matches Python: contours on grid, not filtered points)
+                    # The contour will naturally find the threshold boundary
+                    polygon = create_wind_contour_polygon(all_lats, all_lons, all_speeds, threshold_ms)
+                    
+                    # Only create envelope if polygon exists (contour found threshold boundary)
+                    # Python only creates envelope if polygon is not None (no fallback)
+                    if polygon is not None:
+                        # Individual envelope
                         envelopes.append({
-                            'ENVELOPE_TYPE': 'COMBINED',
+                            'ENVELOPE_TYPE': 'INDIVIDUAL',
                             'FORECAST_TIME': forecast_time,
                             'TRACK_ID': track_id,
                             'ENSEMBLE_MEMBER': member,
-                            'VALID_TIME': track_group['VALID_TIME'].max(),  # Latest time
-                            'LEAD_TIME': None,
+                            'VALID_TIME': valid_time,
+                            'LEAD_TIME': lead_time,
                             'WIND_THRESHOLD': threshold_knots,
-                            'ENVELOPE_REGION': polygon_to_wkt(combined_poly)
+                            'ENVELOPE_REGION': polygon_to_wkt(polygon)
                         })
-                except:
-                    pass
-        
-        processed_count += 1
+                        
+                        # Store for combined envelope (per member)
+                        combined_polys_by_threshold[threshold_knots].append(polygon)
+            
+            # Create combined envelopes for this member (union of all timesteps for this member)
+            for threshold_knots in wind_thresholds.keys():
+                polys = combined_polys_by_threshold[threshold_knots]
+                if polys:
+                    try:
+                        combined_poly = unary_union(polys)
+                        if combined_poly is not None and not combined_poly.is_empty:
+                            envelopes.append({
+                                'ENVELOPE_TYPE': 'COMBINED',
+                                'FORECAST_TIME': forecast_time,
+                                'TRACK_ID': track_id,
+                                'ENSEMBLE_MEMBER': member,
+                                'VALID_TIME': track_group['VALID_TIME'].max(),  # Latest time
+                                'LEAD_TIME': None,
+                                'WIND_THRESHOLD': threshold_knots,
+                                'ENVELOPE_REGION': polygon_to_wkt(combined_poly)
+                            })
+                    except:
+                        pass
+            
+            processed_count += 1
     
     # ========================================================================
     # Load to Final Tables (TC_ENVELOPES_INDIVIDUAL and TC_ENVELOPES_COMBINED)
@@ -370,11 +441,11 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
         individual_sdf = session.create_dataframe(individual_df)
         
         # Use MERGE to handle duplicates
-        individual_sdf.write.mode('overwrite').save_as_table('WIND_ENVELOPES_STAGING_INDIVIDUAL')
+        individual_sdf.write.mode('overwrite').save_as_table('AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_INDIVIDUAL')
         
         # Merge into final table
         session.sql("""
-            MERGE INTO TC_ENVELOPES_INDIVIDUAL t
+            MERGE INTO AOTS.ECMWF_PIPELINE.TC_ENVELOPES_INDIVIDUAL t
             USING (
                 SELECT 
                     FORECAST_TIME,
@@ -391,7 +462,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
                         THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
                         ELSE NULL
                     END AS ENVELOPE_REGION
-                FROM WIND_ENVELOPES_STAGING_INDIVIDUAL
+                FROM AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_INDIVIDUAL
             ) s
             ON t.TRACK_ID = s.TRACK_ID 
                 AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
@@ -408,7 +479,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
         """).collect()
         
         # Clean up staging table
-        session.sql("DROP TABLE IF EXISTS WIND_ENVELOPES_STAGING_INDIVIDUAL").collect()
+        session.sql("DROP TABLE IF EXISTS AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_INDIVIDUAL").collect()
     
     # Load combined envelopes
     if combined_envelopes:
@@ -422,11 +493,11 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
         
         # Convert to Snowpark DataFrame and merge into final table
         combined_sdf = session.create_dataframe(combined_df)
-        combined_sdf.write.mode('overwrite').save_as_table('WIND_ENVELOPES_STAGING_COMBINED')
+        combined_sdf.write.mode('overwrite').save_as_table('AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_COMBINED')
         
         # Merge into final table (use MIN(LEAD_TIME) from individual envelopes for this forecast/track/member)
         session.sql("""
-            MERGE INTO TC_ENVELOPES_COMBINED t
+            MERGE INTO AOTS.ECMWF_PIPELINE.TC_ENVELOPES_COMBINED t
             USING (
                 SELECT 
                     c.FORECAST_TIME,
@@ -434,7 +505,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
                     c.ENSEMBLE_MEMBER,
                     COALESCE(
                         (SELECT MIN(LEAD_TIME) 
-                         FROM TC_ENVELOPES_INDIVIDUAL i
+                         FROM AOTS.ECMWF_PIPELINE.TC_ENVELOPES_INDIVIDUAL i
                          WHERE i.FORECAST_TIME = c.FORECAST_TIME
                            AND i.TRACK_ID = c.TRACK_ID
                            AND i.ENSEMBLE_MEMBER = c.ENSEMBLE_MEMBER
@@ -450,7 +521,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
                         THEN TRY_TO_GEOGRAPHY(c.ENVELOPE_REGION)
                         ELSE NULL
                     END AS ENVELOPE_REGION
-                FROM WIND_ENVELOPES_STAGING_COMBINED c
+                FROM AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_COMBINED c
             ) s
             ON t.TRACK_ID = s.TRACK_ID 
                 AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
@@ -466,7 +537,7 @@ def create_wind_envelopes(session, forecast_time_filter=None, track_id_filter=No
         """).collect()
         
         # Clean up staging table
-        session.sql("DROP TABLE IF EXISTS WIND_ENVELOPES_STAGING_COMBINED").collect()
+        session.sql("DROP TABLE IF EXISTS AOTS.ECMWF_PIPELINE.WIND_ENVELOPES_STAGING_COMBINED").collect()
     
     # ========================================================================
     # Summary

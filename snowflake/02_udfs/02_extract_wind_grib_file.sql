@@ -21,7 +21,11 @@ USE DATABASE AOTS;
 USE SCHEMA ECMWF_PIPELINE;
 
 CREATE OR REPLACE FUNCTION extract_wind_grib_file(
-    file_path VARCHAR
+    file_path VARCHAR,
+    bbox_lat_min FLOAT DEFAULT NULL,
+    bbox_lat_max FLOAT DEFAULT NULL,
+    bbox_lon_min FLOAT DEFAULT NULL,
+    bbox_lon_max FLOAT DEFAULT NULL
 )
 RETURNS TABLE(
     SOURCE_FILE VARCHAR,
@@ -60,15 +64,19 @@ class WindGribExtractor:
     def __init__(self):
         self.results = []
     
-    def process(self, file_path):
+    def process(self, file_path, bbox_lat_min=None, bbox_lat_max=None, bbox_lon_min=None, bbox_lon_max=None):
         """
         Process a single GRIB2 file and extract wind data.
         
         Args:
             file_path: Path to GRIB2 file in Snowflake stage
+            bbox_lat_min: Optional minimum latitude for bounding box filtering
+            bbox_lat_max: Optional maximum latitude for bounding box filtering
+            bbox_lon_min: Optional minimum longitude for bounding box filtering
+            bbox_lon_max: Optional maximum longitude for bounding box filtering
             
         Yields:
-            tuple: Wind data records (one per grid point per ensemble member)
+            tuple: Wind data records (one per grid point per ensemble member within bounding box)
         """
         try:
             from snowflake.snowpark.files import SnowflakeFile
@@ -77,8 +85,8 @@ class WindGribExtractor:
             with SnowflakeFile.open(file_path, 'rb', require_scoped_url=False) as f:
                 file_content = f.read()
             
-            # Process GRIB2 data
-            results = self._extract_wind_data(file_content, file_path)
+            # Process GRIB2 data with optional bounding box
+            results = self._extract_wind_data(file_content, file_path, bbox_lat_min, bbox_lat_max, bbox_lon_min, bbox_lon_max)
             
             # Yield each result row
             for row in results:
@@ -89,16 +97,20 @@ class WindGribExtractor:
             # Return error record
             yield (file_path, None, None, None, None, None, None, None, None, None)
     
-    def _extract_wind_data(self, file_content, file_path):
+    def _extract_wind_data(self, file_content, file_path, bbox_lat_min=None, bbox_lat_max=None, bbox_lon_min=None, bbox_lon_max=None):
         """
-        Extract wind data from GRIB2 file content.
+        Extract wind data from GRIB2 file content, optionally filtered by bounding box.
         
         Args:
             file_content: Binary content of GRIB2 file
             file_path: Original file path (for metadata)
+            bbox_lat_min: Optional minimum latitude for filtering
+            bbox_lat_max: Optional maximum latitude for filtering
+            bbox_lon_min: Optional minimum longitude for filtering
+            bbox_lon_max: Optional maximum longitude for filtering
             
         Returns:
-            list: List of tuples with wind data
+            list: List of tuples with wind data (filtered to bounding box if provided)
         """
         results = []
         
@@ -157,12 +169,32 @@ class WindGribExtractor:
             if u10 is None or v10 is None:
                 raise ValueError("Could not find u10/v10 wind components in GRIB2 file")
             
-            # Get grid coordinates
+            # Get grid coordinates (before subsetting)
+            # Note: xarray coordinates may be in 0-360 format for longitude
             lats = ds['latitude'].values
-            lons = ds['longitude'].values
+            lons_orig = ds['longitude'].values
             
-            # Adjust longitudes to -180 to 180 range
-            lons = np.where(lons > 180, lons - 360, lons)
+            # Check if longitudes are in 0-360 format (ECMWF default)
+            # We'll convert bbox to match the coordinate system
+            lons_are_0_360 = np.any(lons_orig > 180)
+            
+            # For display/output, convert to -180 to 180 range
+            lons = np.where(lons_orig > 180, lons_orig - 360, lons_orig)
+            
+            # Ensure we have a proper 2D grid structure
+            if len(lats.shape) == 1 and len(lons.shape) == 1:
+                # Create 2D meshgrid if we have 1D arrays
+                lon_grid, lat_grid = np.meshgrid(lons, lats)
+                lats = lat_grid
+                lons = lon_grid
+                # Also create 0-360 version for xarray subsetting
+                if lons_are_0_360:
+                    lon_grid_0_360, _ = np.meshgrid(lons_orig, lats)
+                    lons_0_360 = lon_grid_0_360
+                else:
+                    lons_0_360 = lons
+            else:
+                lons_0_360 = lons_orig if lons_are_0_360 else lons
             
             # Process ensemble members
             # Note: ECMWF downloads two separate file types:
@@ -192,37 +224,114 @@ class WindGribExtractor:
                         # Unexpected GRIB number - skip
                         continue
                     
-                    # Flatten arrays and create records
-                    # Sample subset of grid points to reduce data volume
-                    # (we'll filter to TC buffer zones in a later step)
-                    lat_flat = lats.flatten()
-                    lon_flat = lons.flatten()
-                    u_flat = u_member.flatten()
-                    v_flat = v_member.flatten()
-                    speed_flat = wind_speed.flatten()
+                    # Get array dimensions
+                    if len(u_member.shape) == 2:
+                        n_lat, n_lon = u_member.shape
+                    else:
+                        # Fallback: flatten if shape is unexpected
+                        n_lat = len(lats) if len(lats.shape) == 1 else lats.shape[0]
+                        n_lon = len(lons) if len(lons.shape) == 1 else lons.shape[-1] if len(lons.shape) > 1 else len(lons)
                     
-                    # Sample every Nth point to reduce volume
-                    # (full resolution is very large)
-                    sample_rate = 4  # Take every 4th point
-                    indices = np.arange(0, len(lat_flat), sample_rate)
+                    # Sample every Nth point in both dimensions to reduce volume
+                    # This preserves spatial coverage across the entire globe
+                    sample_rate = 4  # Take every 4th point in both dimensions
                     
-                    for idx in indices:
-                        # Skip NaN values
-                        if np.isnan(u_flat[idx]) or np.isnan(v_flat[idx]):
-                            continue
+                    # Use xarray's .sel() to subset by bounding box if provided (more efficient)
+                    # This matches the Python extractor approach
+                    if bbox_lat_min is not None and bbox_lat_max is not None and bbox_lon_min is not None and bbox_lon_max is not None:
+                        # Convert bbox to match coordinate system (0-360 vs -180 to 180)
+                        # If dataset uses 0-360, convert bbox longitudes
+                        if lons_are_0_360:
+                            # Convert bbox from -180/180 to 0/360
+                            bbox_lon_min_sel = bbox_lon_min if bbox_lon_min >= 0 else bbox_lon_min + 360
+                            bbox_lon_max_sel = bbox_lon_max if bbox_lon_max >= 0 else bbox_lon_max + 360
+                        else:
+                            bbox_lon_min_sel = bbox_lon_min
+                            bbox_lon_max_sel = bbox_lon_max
                         
-                        results.append((
-                            file_path,
-                            forecast_time,
-                            valid_time,
-                            lead_time_hours,
-                            tc_member_num,  # Use TC member number (1-51) instead of GRIB number (0-50)
-                            float(lat_flat[idx]),
-                            float(lon_flat[idx]),
-                            float(u_flat[idx]),
-                            float(v_flat[idx]),
-                            float(speed_flat[idx])
-                        ))
+                        # Subset to bounding box using xarray (like Python extractor)
+                        # Note: xarray uses (max, min) for latitude slice (descending order)
+                        try:
+                            u_subset = u10.sel(
+                                number=grib_member_num,
+                                latitude=slice(bbox_lat_max, bbox_lat_min),
+                                longitude=slice(bbox_lon_min_sel, bbox_lon_max_sel)
+                            )
+                            v_subset = v10.sel(
+                                number=grib_member_num,
+                                latitude=slice(bbox_lat_max, bbox_lat_min),
+                                longitude=slice(bbox_lon_min_sel, bbox_lon_max_sel)
+                            )
+                            u_member = u_subset.values
+                            v_member = v_subset.values
+                            wind_speed = np.sqrt(u_member**2 + v_member**2)
+                            
+                            # Get subset coordinates
+                            if hasattr(u_subset, 'latitude'):
+                                lats_subset = u_subset.latitude.values
+                                lons_subset = u_subset.longitude.values
+                                if len(lats_subset.shape) == 1 and len(lons_subset.shape) == 1:
+                                    lon_grid, lat_grid = np.meshgrid(lons_subset, lats_subset)
+                                    lats = lat_grid
+                                    lons = lon_grid
+                                else:
+                                    lats = lats_subset
+                                    lons = lons_subset
+                            else:
+                                # Fallback: use original coordinates and filter after
+                                pass
+                        except Exception as e:
+                            # If subsetting fails, fall back to full grid with filtering
+                            pass
+                    
+                    # Get array dimensions after possible subsetting
+                    if len(u_member.shape) == 2:
+                        n_lat, n_lon = u_member.shape
+                    else:
+                        n_lat = len(lats) if len(lats.shape) == 1 else lats.shape[0]
+                        n_lon = len(lons) if len(lons.shape) == 1 else lons.shape[-1] if len(lons.shape) > 1 else len(lons)
+                    
+                    # Iterate over grid with sampling
+                    for i in range(0, n_lat, sample_rate):
+                        for j in range(0, n_lon, sample_rate):
+                            # Get lat/lon values
+                            if len(lats.shape) == 2:
+                                lat_val = float(lats[i, j])
+                                lon_val = float(lons[i, j])
+                            elif len(lats.shape) == 1:
+                                lat_val = float(lats[i])
+                                lon_val = float(lons[j])
+                            else:
+                                # Fallback: use flattened arrays
+                                lat_val = float(lats.flatten()[i * n_lon + j])
+                                lon_val = float(lons.flatten()[i * n_lon + j])
+                            
+                            # Apply bounding box filter if not already done by xarray
+                            if bbox_lat_min is not None and bbox_lat_max is not None and bbox_lon_min is not None and bbox_lon_max is not None:
+                                if not (bbox_lat_min <= lat_val <= bbox_lat_max and bbox_lon_min <= lon_val <= bbox_lon_max):
+                                    continue
+                            
+                            # Get wind values
+                            u_val = float(u_member[i, j])
+                            v_val = float(v_member[i, j])
+                            speed_val = float(wind_speed[i, j])
+                            
+                            # Skip NaN values
+                            if np.isnan(u_val) or np.isnan(v_val) or np.isnan(speed_val):
+                                continue
+                            
+                            results.append((
+                                file_path,
+                                forecast_time,
+                                valid_time,
+                                lead_time_hours,
+                                tc_member_num,  # Use TC member number (1-51) instead of GRIB number (0-50)
+                                lat_val,
+                                lon_val,
+                                u_val,
+                                v_val,
+                                speed_val
+                            ))
             else:
                 # No ensemble dimension - this is a deterministic/control forecast
                 # Typically from CF files that don't have an ensemble dimension
@@ -231,32 +340,48 @@ class WindGribExtractor:
                 v_data = v10.values
                 wind_speed = np.sqrt(u_data**2 + v_data**2)
                 
-                # Flatten and sample
-                lat_flat = lats.flatten()
-                lon_flat = lons.flatten()
-                u_flat = u_data.flatten()
-                v_flat = v_data.flatten()
-                speed_flat = wind_speed.flatten()
+                # Get array dimensions and sample
+                if len(u_data.shape) == 2:
+                    n_lat, n_lon = u_data.shape
+                else:
+                    n_lat = len(lats) if len(lats.shape) == 1 else lats.shape[0]
+                    n_lon = len(lons) if len(lons.shape) == 1 else lons.shape[-1] if len(lons.shape) > 1 else len(lons)
                 
                 sample_rate = 4
-                indices = np.arange(0, len(lat_flat), sample_rate)
                 
-                for idx in indices:
-                    if np.isnan(u_flat[idx]) or np.isnan(v_flat[idx]):
-                        continue
-                    
-                    results.append((
-                        file_path,
-                        forecast_time,
-                        valid_time,
-                        lead_time_hours,
-                        51,  # Control forecast member 51 (from CF file without ensemble dimension)
-                        float(lat_flat[idx]),
-                        float(lon_flat[idx]),
-                        float(u_flat[idx]),
-                        float(v_flat[idx]),
-                        float(speed_flat[idx])
-                    ))
+                for i in range(0, n_lat, sample_rate):
+                    for j in range(0, n_lon, sample_rate):
+                        # Get lat/lon values
+                        if len(lats.shape) == 2:
+                            lat_val = float(lats[i, j])
+                            lon_val = float(lons[i, j])
+                        elif len(lats.shape) == 1:
+                            lat_val = float(lats[i])
+                            lon_val = float(lons[j])
+                        else:
+                            lat_val = float(lats.flatten()[i * n_lon + j])
+                            lon_val = float(lons.flatten()[i * n_lon + j])
+                        
+                        # Get wind values
+                        u_val = float(u_data[i, j])
+                        v_val = float(v_data[i, j])
+                        speed_val = float(wind_speed[i, j])
+                        
+                        if np.isnan(u_val) or np.isnan(v_val) or np.isnan(speed_val):
+                            continue
+                        
+                        results.append((
+                            file_path,
+                            forecast_time,
+                            valid_time,
+                            lead_time_hours,
+                            51,  # Control forecast member 51 (from CF file without ensemble dimension)
+                            lat_val,
+                            lon_val,
+                            u_val,
+                            v_val,
+                            speed_val
+                        ))
             
             ds.close()
             

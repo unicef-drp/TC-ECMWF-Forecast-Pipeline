@@ -78,6 +78,16 @@ class BUFRExtractor:
         try:
             # Import SnowflakeFile for reading from stage
             from snowflake.snowpark.files import SnowflakeFile
+            import re
+            
+            # Extract storm name from filename (matching Python transformer logic)
+            # Format: ...tropical_cyclone_track_{STORM}_{LON}_{LAT}_bufr4.bin
+            # Example: A_JSXX01ECEP030000_C_ECMP_20251103000000_tropical_cyclone_track_KALMAEGI_128p6degE_10p3degN_bufr4.bin
+            storm_name_from_filename = None
+            filename = file_path.split('/')[-1]  # Get just the filename
+            match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', filename)
+            if match:
+                storm_name_from_filename = match.group(1)
             
             # Open BUFR file from stage
             # Note: require_scoped_url=False is needed for UDFs to access stage files
@@ -85,7 +95,7 @@ class BUFRExtractor:
                 file_content = f.read()
             
             # Process BUFR messages
-            results = self._extract_bufr_data(file_content, file_path)
+            results = self._extract_bufr_data(file_content, file_path, storm_name_from_filename)
             
             # Yield each result row
             for row in results:
@@ -114,13 +124,14 @@ class BUFRExtractor:
                 None                # BEARING_END
             )
     
-    def _extract_bufr_data(self, file_content, file_path):
+    def _extract_bufr_data(self, file_content, file_path, storm_name_from_filename=None):
         """
         Extract data from BUFR file content.
         
         Args:
             file_content (bytes): BUFR file content
             file_path (str): Original file path (for metadata)
+            storm_name_from_filename (str, optional): Storm name extracted from filename
         
         Returns:
             list: List of tuples with extracted data
@@ -160,8 +171,10 @@ class BUFRExtractor:
                     # Create forecast time
                     forecast_time = datetime(year, month, day, hour, minute)
                 
-                    # Get storm identifier
-                    storm_id = codes_get(bufr, "stormIdentifier")
+                    # Get storm identifier from BUFR (but use filename name if available)
+                    storm_id_bufr = codes_get(bufr, "stormIdentifier")
+                    # Use storm name from filename if available, otherwise use BUFR identifier
+                    storm_id = storm_name_from_filename if storm_name_from_filename else storm_id_bufr
                 
                     # Get ensemble member numbers
                     member_numbers = codes_get_array(bufr, "ensembleMemberNumber")

@@ -161,10 +161,10 @@ def transform_tc_tracks(session):
             WIND_RADIUS_M,
             BEARING_START,
             BEARING_END
-        FROM TC_RAW_EXTRACTED
+        FROM AOTS.ECMWF_PIPELINE.TC_RAW_EXTRACTED
         WHERE SOURCE_FILE NOT IN (
             SELECT DISTINCT SOURCE_FILE 
-            FROM TC_TRANSFORMED_STAGING
+            FROM AOTS.ECMWF_PIPELINE.TC_TRANSFORMED_STAGING
         )
         ORDER BY FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME, WIND_THRESHOLD, QUADRANT
     """).to_pandas()
@@ -337,8 +337,8 @@ def transform_tc_tracks(session):
     # Convert pandas DataFrame to Snowpark DataFrame
     staging_df = session.create_dataframe(result_df)
     
-    # Write to staging table
-    staging_df.write.mode('append').save_as_table('TC_TRANSFORMED_STAGING')
+    # Write to staging table (using fully qualified name)
+    staging_df.write.mode('append').save_as_table('AOTS.ECMWF_PIPELINE.TC_TRANSFORMED_STAGING')
     
     # ========================================================================
     # Summary

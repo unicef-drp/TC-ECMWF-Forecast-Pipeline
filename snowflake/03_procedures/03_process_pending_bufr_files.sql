@@ -29,7 +29,7 @@ def process_pending_bufr_files(session):
     """
     from datetime import datetime
     
-    # Find unprocessed BUFR files
+    # Find unprocessed BUFR files (using fully qualified names)
     unprocessed_files = session.sql("""
         SELECT 
             FILE_PATH,
@@ -37,7 +37,7 @@ def process_pending_bufr_files(session):
             FORECAST_DATE,
             RUN_TIME,
             CREATED_AT
-        FROM FILE_PROCESSING_LOG
+        FROM AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
         WHERE FILE_TYPE = 'BUFR'
           AND PROCESSING_STATUS = 'PENDING'
         ORDER BY FORECAST_DATE, RUN_TIME, FILE_PATH
@@ -61,7 +61,7 @@ def process_pending_bufr_files(session):
         try:
             # Update status to PROCESSING
             session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
+                UPDATE AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
                 SET PROCESSING_STATUS = 'PROCESSING',
                     PROCESSING_START_TIME = CURRENT_TIMESTAMP(),
                     UPDATED_AT = CURRENT_TIMESTAMP()
@@ -88,7 +88,7 @@ def process_pending_bufr_files(session):
                     WIND_RADIUS_M,
                     BEARING_START,
                     BEARING_END
-                FROM TABLE(extract_bufr_file('{file_path}'))
+                FROM TABLE(AOTS.ECMWF_PIPELINE.extract_bufr_file('{file_path}'))
             """
             
             extracted_data = session.sql(extract_sql).collect()
@@ -105,7 +105,7 @@ def process_pending_bufr_files(session):
             
             # Insert into staging table (TC_RAW_EXTRACTED in LONG format)
             insert_sql = f"""
-                INSERT INTO TC_RAW_EXTRACTED (
+                INSERT INTO AOTS.ECMWF_PIPELINE.TC_RAW_EXTRACTED (
                     SOURCE_FILE,
                     FORECAST_TIME,
                     STORM_IDENTIFIER,
@@ -142,14 +142,14 @@ def process_pending_bufr_files(session):
                     WIND_RADIUS_M,
                     BEARING_START,
                     BEARING_END
-                FROM TABLE(extract_bufr_file('{file_path}'))
+                FROM TABLE(AOTS.ECMWF_PIPELINE.extract_bufr_file('{file_path}'))
             """
             
             session.sql(insert_sql).collect()
             
             # Update status to COMPLETED
             session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
+                UPDATE AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
                 SET PROCESSING_STATUS = 'COMPLETED',
                     PROCESSING_END_TIME = CURRENT_TIMESTAMP(),
                     UPDATED_AT = CURRENT_TIMESTAMP(),
@@ -167,7 +167,7 @@ def process_pending_bufr_files(session):
             
             # Update status to FAILED
             session.sql(f"""
-                UPDATE FILE_PROCESSING_LOG
+                UPDATE AOTS.ECMWF_PIPELINE.FILE_PROCESSING_LOG
                 SET PROCESSING_STATUS = 'FAILED',
                     PROCESSING_END_TIME = CURRENT_TIMESTAMP(),
                     UPDATED_AT = CURRENT_TIMESTAMP(),
