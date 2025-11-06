@@ -9,7 +9,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, State
 import snowflake.connector
-import numpy as np
 from shapely import wkt
 
 
