@@ -1,0 +1,19 @@
+# Web application dependencies
+
+# Dash web framework
+dash>=2.14.0
+
+# Plotting and visualization
+plotly>=5.15.0
+
+# Data processing
+pandas>=2.0.0
+
+# Geospatial processing (for WKT parsing)
+shapely>=2.0.0
+
+# Snowflake database connector
+snowflake-connector-python[pandas]>=3.0.0
+
+
+
