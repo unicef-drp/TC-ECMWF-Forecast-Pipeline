@@ -13,4 +13,3 @@ shapely>=2.0.0
 
 # Snowflake database connector
 snowflake-connector-python[pandas]>=3.0.0
-

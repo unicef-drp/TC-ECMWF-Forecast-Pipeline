@@ -727,7 +727,7 @@ def transform_tc_data_from_file(filename: str,
     base_path = os.path.join(output_dir, base_name)
 
     # Try to extract storm name from filename
-    match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', base_name)
+    match = re.search(r'tropical_cyclone_track_([A-Z0-9-]+)', base_name)
     storm_name = match.group(1) if match else None
 
     # Transform data

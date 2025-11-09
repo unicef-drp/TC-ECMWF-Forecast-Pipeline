@@ -308,7 +308,7 @@ def step3_transform(config: PipelineConfig, stats: PipelineStats, csv_files: Lis
 
             # Extract storm name from filename if possible
             import re
-            match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', csv_file.stem)
+            match = re.search(r'tropical_cyclone_track_([A-Z0-9-]+)', csv_file.stem)
             storm_name = match.group(1) if match else None
 
             # Transform data

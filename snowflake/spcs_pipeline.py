@@ -281,7 +281,7 @@ def extract_storm_name_from_filename(filename: str) -> Optional[str]:
     Returns: "MELISSA"
     """
     import re
-    match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', filename)
+    match = re.search(r'tropical_cyclone_track_([A-Z0-9-]+)', filename)
     return match.group(1) if match else None
 
 
@@ -493,7 +493,7 @@ def _extract_and_transform_worker(args: Tuple[str, str, str, bool]) -> Tuple[boo
         log_messages.append(f"Transforming: {csv_file.name}")
         
         # Extract storm name from filename
-        match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', csv_file.stem)
+        match = re.search(r'tropical_cyclone_track_([A-Z0-9-]+)', csv_file.stem)
         storm_name = match.group(1) if match else None
         
         # Transform data
@@ -549,7 +549,7 @@ def extract_and_transform_tc_file(bufr_file: Path, config: PipelineConfig) -> Tu
         
         # Extract storm name from filename
         import re
-        match = re.search(r'tropical_cyclone_track_([A-Z0-9]+)', csv_file.stem)
+        match = re.search(r'tropical_cyclone_track_([A-Z0-9-]+)', csv_file.stem)
         storm_name = match.group(1) if match else None
         
         # Transform data
