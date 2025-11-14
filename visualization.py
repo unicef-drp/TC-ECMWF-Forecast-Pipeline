@@ -324,7 +324,7 @@ def visualize_tracks_with_wind_polygons(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
 
 
 def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
-                                        show_plot=True, save_plot=False):
+                                        show_plot=True, save_plot=False, member=1):
     """
     Visualize individual wind envelopes for one member across multiple time steps.
 
@@ -357,9 +357,8 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     storm_name = df_polygons['track_id'].iloc[0]
     forecast_time = df_polygons['forecast_time'].iloc[0]
 
-    # Select first member
-    first_member = sorted(df_polygons['ensemble_member'].unique())[0]
-    member_df = df_polygons[df_polygons['ensemble_member'] == first_member]
+    # Select member
+    member_df = df_polygons[df_polygons['ensemble_member'] == member]
 
     # Get unique forecast steps - check for different possible column names
     if 'forecast_step' in member_df.columns:
@@ -375,7 +374,7 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
 
     print(f"Storm: {storm_name}")
     print(f"Forecast: {forecast_time}")
-    print(f"Member: {first_member}")
+    print(f"Member: {member}")
     print(f"Forecast steps: {len(forecast_steps)}")
 
     # Calculate grid size for time steps
@@ -395,17 +394,8 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     else:
         axes = axes.flatten()
 
-    # Get overall bounds
-    all_polygons = []
-    for _, row in member_df.iterrows():
-        try:
-            polygon = wkt.loads(row['envelope_region'])
-            if polygon and not polygon.is_empty:
-                all_polygons.append(polygon)
-        except:
-            continue
-
-    bounds = get_bounds_from_data(all_polygons)
+    # Set fixed bounding box: lon 129-138°E, lat 9-14°N
+    bounds = (129, 138, 9, 14)  # (lon_min, lon_max, lat_min, lat_max)
 
     # Plot each forecast step
     for i, step in enumerate(forecast_steps):
@@ -444,7 +434,7 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
         axes[i].set_visible(False)
 
     # Add overall title
-    fig.suptitle(f"Storm: {storm_name} - Member {first_member} Wind Envelopes\nForecast: {forecast_time}",
+    fig.suptitle(f"Storm: {storm_name} - Member {member} Wind Envelopes\nForecast: {forecast_time}",
                  fontsize=14, fontweight='bold')
 
     # Add legend (only on the first subplot, outside the map)
@@ -626,9 +616,9 @@ def show_tracks_with_polygons(csv_file, output_dir=DEFAULT_OUTPUT_DIR):
     return visualize_tracks_with_wind_polygons(csv_file, output_dir, show_plot=True, save_plot=False)
 
 
-def show_individual_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR):
+def show_individual_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR, member=1):
     """Quick function to show individual wind envelopes."""
-    return visualize_individual_wind_envelopes(csv_file, output_dir, show_plot=True, save_plot=False)
+    return visualize_individual_wind_envelopes(csv_file, output_dir, show_plot=True, save_plot=False, member=member)
 
 
 def show_combined_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR):

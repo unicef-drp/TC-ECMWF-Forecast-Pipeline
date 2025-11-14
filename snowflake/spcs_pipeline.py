@@ -102,7 +102,7 @@ class PipelineConfig:
         
         # Wind processing options
         self.process_wind_data = os.getenv('PROCESS_WIND_DATA', 'true').lower() == 'true'
-        self.max_ensemble_members = 50
+        self.max_ensemble_members = 51  # All ensemble members (50 perturbed + 1 control)
         
         # Storm filtering options
         self.named_storms_only = os.getenv('NAMED_STORMS_ONLY', 'true').lower() == 'true'
