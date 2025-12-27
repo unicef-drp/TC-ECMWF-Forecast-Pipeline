@@ -6,7 +6,7 @@ This module provides functions to download ensemble wind forecast GRIB files
 from ECMWF's Open Data service.
 
 The downloader processes:
-- Ensemble forecasts (50 perturbed members: 1-50)
+- Ensemble forecasts (50 perturbed members: 1-50, + control member 51)
 - 10m wind components (u10 and v10)
 - Multiple forecast lead times (every 3-6 hours up to 360 hours)
 - Different forecast run times (00Z, 06Z, 12Z, 18Z)
