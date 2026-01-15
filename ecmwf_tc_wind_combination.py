@@ -637,16 +637,39 @@ def process_wind_combination(
                             expected_pattern = (
                                 f"wind_ens_{date_str}_r{run_hour}_{forecast_hour}_{'cf' if ensemble_member == 51 else 'pf'}.grib2"
                             )
-                            logger.warning(f"    No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}")
+                            # Enhanced logging for member 51 to help diagnose issues
+                            if ensemble_member == 51:
+                                available_cf_files = [f.name for f in wind_files if f.name.endswith('_cf.grib2')]
+                                logger.warning(f"Member 51: No CF wind file found for {valid_time} (lead {lead_time}h)")
+                                logger.warning(f"Expected: {expected_pattern}")
+                                if available_cf_files:
+                                    logger.warning(f"Available CF files: {len(available_cf_files)} (showing first 5)")
+                                    for cf_file in available_cf_files[:5]:
+                                        logger.warning(f"         - {cf_file}")
+                                else:
+                                    logger.warning(f"No CF files found in wind_data_dir at all!")
+                            else:
+                                logger.warning(f"No wind file found for member {ensemble_member}, {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}")
                             continue
 
                         if verbose:
                             logger.info(f"    Processing {valid_time} (lead {lead_time}h) - {wind_file.name}")
 
                         # Extract wind polygons for this time step with storm-specific index directory
-                        wkt_polygons = extract_wind_polygons_for_time_step(
-                            wind_file, bbox, ensemble_member, indexpath=index_dir
-                        )
+                        try:
+                            wkt_polygons = extract_wind_polygons_for_time_step(
+                                wind_file, bbox, ensemble_member, indexpath=index_dir
+                            )
+                            # Log if member 51 extraction returns no polygons
+                            if ensemble_member == 51 and not wkt_polygons:
+                                logger.warning(f"Member 51: Wind extraction returned no polygons for {valid_time} (lead {lead_time}h)")
+                                logger.warning(f"       File: {wind_file.name}")
+                                logger.warning(f"       This might indicate wind speeds below thresholds or extraction error")
+                        except Exception as e:
+                            logger.error(f"    Error extracting wind polygons for member {ensemble_member}, {valid_time}: {e}")
+                            if ensemble_member == 51:
+                                logger.error(f"       Member 51 extraction failed - this is a control member issue!")
+                            wkt_polygons = {}
 
                         # Create envelope records for this time step
                         for threshold, wkt_polygon in wkt_polygons.items():
