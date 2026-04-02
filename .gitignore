@@ -19,6 +19,7 @@ __pycache__/
 *.log
 .DS_Store
 .idea/
+CLAUDE.md
 
 tc_data/
 tc_extracted/

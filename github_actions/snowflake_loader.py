@@ -228,7 +228,8 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         RADIUS_50_KNOT_WINDS_SW_KM, RADIUS_50_KNOT_WINDS_NW_KM,
                         RADIUS_64_KNOT_WINDS_NE_KM, RADIUS_64_KNOT_WINDS_SE_KM,
                         RADIUS_64_KNOT_WINDS_SW_KM, RADIUS_64_KNOT_WINDS_NW_KM,
-                        WIND_FIELD_POLYGON_34KT, WIND_FIELD_POLYGON_50KT, WIND_FIELD_POLYGON_64KT
+                        WIND_FIELD_POLYGON_34KT, WIND_FIELD_POLYGON_50KT, WIND_FIELD_POLYGON_64KT,
+                        WIND_FIELD_POLYGON_34KT_GEO, WIND_FIELD_POLYGON_50KT_GEO, WIND_FIELD_POLYGON_64KT_GEO
                     ) VALUES (
                         s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
                         s.LATITUDE, s.LONGITUDE, s.PRESSURE_HPA, s.WIND_SPEED_KNOTS,
@@ -239,7 +240,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         s.RADIUS_50_KNOT_WINDS_SW_KM, s.RADIUS_50_KNOT_WINDS_NW_KM,
                         s.RADIUS_64_KNOT_WINDS_NE_KM, s.RADIUS_64_KNOT_WINDS_SE_KM,
                         s.RADIUS_64_KNOT_WINDS_SW_KM, s.RADIUS_64_KNOT_WINDS_NW_KM,
-                        s.WIND_FIELD_POLYGON_34KT, s.WIND_FIELD_POLYGON_50KT, s.WIND_FIELD_POLYGON_64KT
+                        s.WIND_FIELD_POLYGON_34KT, s.WIND_FIELD_POLYGON_50KT, s.WIND_FIELD_POLYGON_64KT,
+                        TRY_TO_GEOGRAPHY(NULLIF(NULLIF(TRIM(s.WIND_FIELD_POLYGON_34KT), ''), 'None')),
+                        TRY_TO_GEOGRAPHY(NULLIF(NULLIF(TRIM(s.WIND_FIELD_POLYGON_50KT), ''), 'None')),
+                        TRY_TO_GEOGRAPHY(NULLIF(NULLIF(TRIM(s.WIND_FIELD_POLYGON_64KT), ''), 'None'))
                     )
                 """
 
