@@ -75,8 +75,9 @@ WORKDIR /app
 # Copy application code
 # ==============================================================================
 
-# Copy all ecmwf_* modules from repo root
+# Copy all pipeline modules from repo root
 COPY ecmwf_*.py /app/
+COPY pipeline_core.py /app/
 
 # Copy snowflake directory (contains spcs_pipeline.py and snowflake_loader.py)
 COPY snowflake/ /app/snowflake/
