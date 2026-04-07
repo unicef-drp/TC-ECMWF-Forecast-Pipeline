@@ -65,11 +65,11 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
             - wlongitude: Longitude of maximum wind location (degrees)
             - wind: Maximum 10m wind speed (m/s)
     """
+    cnt = 0
+    unpacked_data = []
+
     # Open BUFR file
     f = open(filename, 'rb')
-    data = collections.defaultdict(dict)
-    cnt = 0
-
     # Loop for the messages in the file
     while 1:
         # Get handle for message
@@ -80,6 +80,10 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
         # Instruct ecCodes to expand all the descriptors (unpack the data values)
         codes_set(bufr, 'unpack', 1)
 
+        # Per-message data dict — reset here to prevent cross-message contamination
+        # (important for combined files that contain multiple storms in separate messages)
+        data = collections.defaultdict(dict)
+
         # Extract basic message metadata
         numObs = codes_get(bufr, "numberOfSubsets")
         year = codes_get(bufr, "year")
@@ -88,11 +92,16 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
         hour = codes_get(bufr, "hour")
         minute = codes_get(bufr, "minute")
         stormIdentifier = codes_get(bufr, "stormIdentifier")
+        try:
+            long_name = codes_get(bufr, "longStormName").strip()
+        except Exception:
+            long_name = ''
+        storm_id = long_name if long_name else stormIdentifier
 
         if verbose:
             print('**************** MESSAGE: ', cnt + 1, '  *****************')
             print('Date and time: ', day, '.', month, '.', year, '  ', hour, ':', minute)
-            print('Storm identifier: ', stormIdentifier)
+            print('Storm identifier: ', stormIdentifier, '  Storm name: ', storm_id)
 
         # Determine how many forecast time periods are in this message
         # Each period represents a different forecast lead time
@@ -292,8 +301,6 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
 
         # *************************************************************************************************
         # Convert nested dictionary to unpacked format for DataFrame creation
-        unpacked_data = []
-
         # Flatten the data structure and filter out missing values
         for m in range(len(memberNumber)):
             if verbose:
@@ -327,7 +334,7 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
 
                     # Base row data
                     base_row = {
-                        'storm_id': stormIdentifier,
+                        'storm_id': storm_id,
                         'ensemble_member': memberNumber[m],
                         'step': timePeriod[s],
                         'datetime': datetime_str,
@@ -384,6 +391,86 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
             print(f"Filtered out HRES member (52): {original_count} -> {filtered_count} records")
 
     return df
+
+
+def filter_tc_data(
+    df: pd.DataFrame,
+    named_storms_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Filter extracted TC data by storm name criteria.
+
+    The API returns all storms in a single file, including numbered disturbances
+    (e.g. "70U", "73E") alongside named storms (e.g. "MILTON", "BERYL").
+
+    Named-storm heuristic: storm_id length > 2 and does NOT match the pattern
+    of two leading digits followed by a single letter (e.g. "70U").
+
+    Args:
+        df: DataFrame from extract_tc_data(), must contain 'storm_id' column.
+        named_storms_only: If True, keep only named storms (default: True).
+
+    Returns:
+        Filtered DataFrame.
+    """
+    if df.empty or not named_storms_only:
+        return df
+
+    s = df['storm_id'].astype(str).str.strip()
+    # Numbered disturbances: exactly 3 chars, first 2 are digits, third is alpha (e.g. "70U", "93E")
+    is_numbered = (
+        (s.str.len() == 3)
+        & s.str.slice(0, 2).str.match(r'^\d{2}$')
+        & s.str.slice(2, 3).str.match(r'^[A-Za-z]$')
+    )
+    # Short IDs (1–2 chars) are also unnumbered
+    is_short = s.str.len() <= 2
+    mask = ~is_numbered & ~is_short
+    filtered = df[mask]
+
+    n_removed = len(df) - len(filtered)
+    if n_removed > 0:
+        removed_ids = df.loc[~mask, 'storm_id'].unique().tolist()
+        print(f"  Filtered out {n_removed} records for unnamed storms: {removed_ids}")
+
+    return filtered
+
+
+def save_per_storm_csvs(
+    df: pd.DataFrame,
+    output_dir: str,
+    bufr_filename: str,
+    verbose: bool = True,
+) -> List[str]:
+    """
+    Split a multi-storm DataFrame (from the combined API file) into per-storm CSVs.
+
+    The API returns all storms in one BUFR file. Downstream code (transformer,
+    wind combination) expects one CSV per storm, named to match the DISS-era
+    convention so that storm names can be extracted from the filename.
+
+    Args:
+        df: Full extracted DataFrame with 'storm_id' column.
+        output_dir: Directory to write CSVs into.
+        bufr_filename: Base name of the source BUFR file (used in output name).
+        verbose: Whether to print progress.
+
+    Returns:
+        List of CSV file paths written.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(bufr_filename))[0]
+    csv_files = []
+
+    for storm_id, storm_df in df.groupby('storm_id'):
+        csv_name = f"{base}_storm_{storm_id}{DEFAULT_CSV_SUFFIX}"
+        csv_path = os.path.join(output_dir, csv_name)
+        storm_df.to_csv(csv_path, index=False)
+        csv_files.append(csv_path)
+        if verbose:
+            print(f"  Saved {len(storm_df)} records for storm {storm_id} → {csv_name}")
+
+    return csv_files
 
 
 def extract_tc_data_from_file(filename: str,

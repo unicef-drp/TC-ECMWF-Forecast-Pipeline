@@ -90,26 +90,20 @@ def create_buffered_track_polygon(track_data: pd.DataFrame, buffer_radius_km: fl
     Returns:
         Polygon: Buffered track polygon
     """
-    buffered_polygons = []
+    lats = track_data['latitude'].values
+    lons = track_data['longitude'].values
 
-    for _, row in track_data.iterrows():
-        lat = row['latitude']
-        lon = row['longitude']
+    # Vectorized: compute per-point buffer radius in degrees
+    radius_deg_lat = buffer_radius_km / 111.0
+    radius_deg_lon = buffer_radius_km / (111.0 * np.cos(np.radians(lats)))
+    radius_degs = (radius_deg_lat + radius_deg_lon) / 2.0  # numpy array
 
-        # Convert km to approximate degrees
-        radius_deg_lat = buffer_radius_km / 111.0
-        radius_deg_lon = buffer_radius_km / (111.0 * np.cos(np.radians(lat)))
-        radius_deg = (radius_deg_lat + radius_deg_lon) / 2
+    buffered_polygons = [
+        Point(lon, lat).buffer(r)
+        for lat, lon, r in zip(lats, lons, radius_degs)
+    ]
 
-        # Create circular buffer
-        point = Point(lon, lat)
-        buffer_poly = point.buffer(radius_deg)
-        buffered_polygons.append(buffer_poly)
-
-    # Union all buffered polygons
-    combined_polygon = unary_union(buffered_polygons)
-
-    return combined_polygon
+    return unary_union(buffered_polygons)
 
 
 def get_bounding_box(polygon: Polygon, buffer: float = 2.0) -> Dict[str, float]:
@@ -221,6 +215,36 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
     return wind_region
 
 
+def load_wind_data_all_members(
+    grib_file: str,
+    bbox: Dict[str, float],
+    indexpath: Optional[str] = None,
+) -> xr.DataArray:
+    """
+    Load wind speed for ALL ensemble members from a GRIB file in a single open.
+
+    Returns a DataArray with dims (number, latitude, longitude) for PF files,
+    or (latitude, longitude) for CF files (control forecast, no number dim).
+    Clipped to the given bounding box.
+    """
+    if indexpath:
+        import pathlib
+        index_file_path = os.path.join(indexpath, pathlib.Path(grib_file).name + '.idx')
+        ds = xr.open_dataset(
+            grib_file, engine='cfgrib',
+            backend_kwargs={'indexpath': index_file_path, 'errors': 'ignore'},
+        )
+    else:
+        ds = xr.open_dataset(grib_file, engine='cfgrib')
+
+    wind_speed = np.sqrt(ds['u10'] ** 2 + ds['v10'] ** 2)
+
+    return wind_speed.sel(
+        latitude=slice(bbox['lat_max'], bbox['lat_min']),
+        longitude=slice(bbox['lon_min'], bbox['lon_max']),
+    )
+
+
 def create_wind_threshold_contours(wind_data: xr.DataArray,
                                    thresholds: Dict[int, float],
                                    verbose: bool = True) -> Dict[int, Optional[Polygon]]:
@@ -244,26 +268,35 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
     # Create meshgrid
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-    for threshold_kt, threshold_ms in thresholds.items():
-        if verbose:
-            print(f"    Creating contour for {threshold_kt} kt ({threshold_ms:.2f} m/s)...", end='', flush=True)
+    # Sort thresholds by m/s value so matplotlib assigns allsegs[i] to levels[i]
+    sorted_thresholds = sorted(thresholds.items(), key=lambda x: x[1])
+    levels_ms = [ms for _, ms in sorted_thresholds]
 
-        # Create contour
-        fig, ax = plt.subplots()
-        cs = ax.contour(lon_grid, lat_grid, winds, levels=[threshold_ms])
+    # One figure, one contour call for all thresholds
+    fig, ax = plt.subplots()
+    try:
+        cs = ax.contour(lon_grid, lat_grid, winds, levels=levels_ms)
+    except Exception as e:
         plt.close(fig)
+        if verbose:
+            print(f"  Error creating contours: {e}")
+        return {kt: None for kt, _ in sorted_thresholds}
+    plt.close(fig)
 
-        # Extract contour polygons
+    for i, (threshold_kt, threshold_ms) in enumerate(sorted_thresholds):
+        if verbose:
+            print(f"    {threshold_kt} kt ({threshold_ms:.2f} m/s)...", end='', flush=True)
+
         polygons = []
         try:
-            if len(cs.allsegs) > 0 and len(cs.allsegs[0]) > 0:
-                for segment in cs.allsegs[0]:
+            if i < len(cs.allsegs) and len(cs.allsegs[i]) > 0:
+                for segment in cs.allsegs[i]:
                     if len(segment) > 3:
                         try:
                             poly = Polygon(segment)
                             if poly.is_valid and poly.area > 0:
                                 polygons.append(poly)
-                        except:
+                        except Exception:
                             continue
         except Exception as e:
             if verbose:
@@ -274,13 +307,9 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
         if polygons:
             combined = unary_union(polygons)
             contour_polygons[threshold_kt] = combined
-
-            # Calculate area
-            area_deg2 = combined.area
-            area_km2 = area_deg2 * 111 * 104  # Approximate
-
             if verbose:
-                print(f" ✓ {len(polygons)} contour(s), {area_km2:,.0f} km²")
+                area_km2 = combined.area * 111 * 104
+                print(f" {len(polygons)} contour(s), {area_km2:,.0f} km²")
         else:
             contour_polygons[threshold_kt] = None
             if verbose:

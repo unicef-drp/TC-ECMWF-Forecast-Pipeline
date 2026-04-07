@@ -25,6 +25,7 @@ tc_data/
 tc_extracted/
 tc_transformed/
 tc_data_transformed/
+tc_data_transformed_jan2026/
 wind_data/
 wind_extracted/
 ecmwf_wind_data_extractor_BACKUP.py
@@ -39,3 +40,4 @@ TEST_tc_transformed/
 TEST_wind_data/
 TEST_wind_extracted/
 SPCS_initial_files.RenameMe/
+testing/

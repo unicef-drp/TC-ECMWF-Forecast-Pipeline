@@ -25,6 +25,7 @@ References:
 - Tropical Cyclone Data: https://essential.ecmwf.int
 """
 
+import math
 import os
 import warnings
 from pathlib import Path
@@ -35,7 +36,6 @@ import re
 import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon, Point
-import geopandas as gpd
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -219,14 +219,15 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
     if not any([r_ne, r_se, r_sw, r_nw]):
         return None
 
-    # Convert km to degrees (approximate: 1 degree ≈ 111 km)
-    deg_per_km = 1.0 / 111.0
+    # Convert km to degrees — latitude scaling is constant; longitude shrinks with cos(lat)
+    lat_deg_per_km = 1.0 / 111.0
+    lon_deg_per_km = 1.0 / (111.0 * math.cos(math.radians(lat))) if lat != 90.0 else lat_deg_per_km
 
     # Calculate polygon bounds
-    lat_min = lat - max(r_sw, r_se) * deg_per_km
-    lat_max = lat + max(r_ne, r_nw) * deg_per_km
-    lon_min = lon - max(r_sw, r_nw) * deg_per_km
-    lon_max = lon + max(r_ne, r_se) * deg_per_km
+    lat_min = lat - max(r_sw, r_se) * lat_deg_per_km
+    lat_max = lat + max(r_ne, r_nw) * lat_deg_per_km
+    lon_min = lon - max(r_sw, r_nw) * lon_deg_per_km
+    lon_max = lon + max(r_ne, r_se) * lon_deg_per_km
 
     # Create rectangular polygon (ensure it's properly closed)
     polygon_coords = [
@@ -275,27 +276,17 @@ def create_wind_field_polygons(forecasts_df: pd.DataFrame, wind_threshold: int =
         df[f'wind_field_polygon_{wind_threshold}kt'] = None
         return df
 
-    # Create wind field polygons
-    polygons = []
-    for _, row in df.iterrows():
-        lat = row['latitude']
-        lon = row['longitude']
-
-        # Get wind radii
-        r_ne = row.get(radius_cols[0], 0) or 0
-        r_se = row.get(radius_cols[1], 0) or 0
-        r_sw = row.get(radius_cols[2], 0) or 0
-        r_nw = row.get(radius_cols[3], 0) or 0
-
-        # Create polygon
+    # Create wind field polygons using apply (avoids iterrows overhead)
+    def _make_polygon(row):
+        r_ne = row[radius_cols[0]] or 0
+        r_se = row[radius_cols[1]] or 0
+        r_sw = row[radius_cols[2]] or 0
+        r_nw = row[radius_cols[3]] or 0
         if any([r_ne, r_se, r_sw, r_nw]):
-            poly = wind_quadrant_polygon(lat, lon, r_ne, r_se, r_sw, r_nw)
-            polygons.append(poly)
-        else:
-            polygons.append(None)
+            return wind_quadrant_polygon(row['latitude'], row['longitude'], r_ne, r_se, r_sw, r_nw)
+        return None
 
-    # Add polygon column
-    df[f'wind_field_polygon_{wind_threshold}kt'] = polygons
+    df[f'wind_field_polygon_{wind_threshold}kt'] = df.apply(_make_polygon, axis=1)
 
     return df
 
@@ -349,7 +340,7 @@ def calculate_rmw(forecasts_df: pd.DataFrame) -> pd.Series:
     """
     Calculate radius of maximum winds from storm center to max wind location.
 
-    Uses Haversine formula to calculate great circle distance between:
+    Uses vectorized Haversine formula to calculate great circle distance between:
     - Storm center: (latitude, longitude)
     - Maximum wind location: (wlatitude, wlongitude)
 
@@ -359,41 +350,26 @@ def calculate_rmw(forecasts_df: pd.DataFrame) -> pd.Series:
     Returns:
         pd.Series: Radius of maximum winds in kilometers
     """
-    from math import radians, sin, cos, sqrt, atan2
+    R = 6371.0
 
-    def haversine_distance(lat1, lon1, lat2, lon2):
-        """
-        Calculate distance between two points on Earth using Haversine formula.
-        Returns distance in kilometers.
-        """
-        if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
-            return np.nan
+    lat1 = np.radians(forecasts_df['latitude'].values.astype(float))
+    lon1 = np.radians(forecasts_df['longitude'].values.astype(float))
+    lat2 = np.radians(forecasts_df['wlatitude'].values.astype(float))
+    lon2 = np.radians(forecasts_df['wlongitude'].values.astype(float))
 
-        # Earth radius in kilometers
-        R = 6371.0
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    distances = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-        # Convert to radians
-        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    # Propagate NaN for any row where inputs were NaN
+    nan_mask = (
+        forecasts_df['latitude'].isna() | forecasts_df['longitude'].isna() |
+        forecasts_df['wlatitude'].isna() | forecasts_df['wlongitude'].isna()
+    )
+    distances = np.where(nan_mask, np.nan, distances)
 
-        # Haversine formula
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-        c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        distance = R * c
-
-        return distance
-
-    # Calculate RMW for each row
-    rmw = []
-    for _, row in forecasts_df.iterrows():
-        dist = haversine_distance(
-            row['latitude'], row['longitude'],
-            row.get('wlatitude'), row.get('wlongitude')
-        )
-        rmw.append(dist)
-
-    return pd.Series(rmw, index=forecasts_df.index)
+    return pd.Series(distances, index=forecasts_df.index)
 
 
 def transform_tc_data(raw_csv_path: str,

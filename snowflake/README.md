@@ -1,22 +1,31 @@
 # Snowflake Container Services (SPCS) Pipeline
 
-This directory contains the Snowflake Container Services (SPCS) optimized implementation of the ECMWF TC Forecast Pipeline.
+This directory contains the SPCS entry point for the ECMWF TC Forecast Pipeline.
 
 ## Overview
 
-The SPCS pipeline (`spcs_pipeline.py`) is a concurrent execution pipeline optimized for deployment in Snowflake Container Services. It provides:
+`spcs_pipeline.py` is a concurrent execution wrapper around `pipeline_core.py`.  It adds:
 
-- **Concurrent Downloads**: Parallel TC and wind data downloads using ThreadPoolExecutor
-- **Parallel Processing**: CPU-intensive extraction and transformation using ProcessPoolExecutor
-- **SPCS Integration**: Native support for Snowflake Container Services OAuth authentication
-- **Flexible Authentication**: Supports SPCS OAuth, private key, and password authentication
-- **Performance Optimized**: Designed for maximum throughput with configurable concurrency
+- **Concurrent Transformation**: per-storm CSVs transformed in parallel via `ProcessPoolExecutor` (controlled by `USE_PROCESS_POOL`)
+- **SPCS Integration**: Native Snowflake Container Services OAuth authentication
+- **Flexible Authentication**: SPCS OAuth, private key, or password
+- **Phase-level Timing**: per-phase timing logged to `unicef_pipeline.log`
+
+All data processing steps (1–5) are shared with the GitHub Actions pipeline via `pipeline_core.py`.  This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
+
+Execution sequence:
+1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
+2. **Phase 2**: Transform per-storm CSVs (concurrently if `USE_PROCESS_POOL=true`)
+3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
+4. **Phase 4**: Load all results to Snowflake (SPCS OAuth / private key / password)
 
 ## Files
 
-- `spcs_pipeline.py`: Main concurrent pipeline orchestrator
-- `snowflake_loader.py`: Enhanced Snowflake data loader with SPCS support
-- `Dockerfile`: Container image for SPCS deployment
+| File | Purpose |
+|------|---------|
+| `spcs_pipeline.py` | Concurrent pipeline entry point |
+| `snowflake_loader.py` | Snowflake loader with SPCS OAuth + private key support |
+| `Dockerfile` | Container image for SPCS deployment |
 
 ## Prerequisites
 
@@ -50,8 +59,7 @@ The SPCS pipeline (`spcs_pipeline.py`) is a concurrent execution pipeline optimi
    ```
    
    **Note:** The network rule allows outbound HTTP (port 80) and HTTPS (port 443) to any destination (0.0.0.0). This is required for accessing ECMWF's services:
-   - `https://essential.ecmwf.int/` (ECMWF DISS system for TC data)
-   - `https://data.ecmwf.int/` (ECMWF Open Data for wind forecasts)
+   - `https://data.ecmwf.int/` (ECMWF Open Data — TC tracks and wind forecasts)
 
 5. **Compute Pool**
    
@@ -162,7 +170,7 @@ docker run --rm \
   tc-ecmwf-pipeline:latest
 ```
 
-### 3. Running in SPCS
+### 2. Running in SPCS
 
 Execute the pipeline as a SPCS job using `EXECUTE JOB SERVICE`:
 
@@ -202,18 +210,13 @@ EXECUTE JOB SERVICE
 
 ## Configuration Options
 
-### Key Concept: Forecast Runs vs. Files
+### Key Concept: One File Per Forecast Run
 
-**Important Distinction**: The download parameters control **forecast runs** (date/time combinations), not individual files.
+The `ecmwf-opendata` client downloads a **single combined BUFR4 file per forecast run** containing all active storms and all 51 ensemble members.  The extractor then splits this into one CSV per named storm for downstream processing.
 
-- **One forecast run** = One specific date and time (e.g., `20251102120000` = Nov 2, 2025 at 12:00 UTC)
-- **Each forecast run** can contain **multiple files** (one file per active tropical cyclone/storm)
-- For example, if there are 5 active named storms, a single forecast run will download 5 files
-
-**Examples**:
-- `DOWNLOAD_LIMIT=1` → Downloads 1 forecast run → Could be 1 file or 10+ files (depending on active storms)
-- `DOWNLOAD_DATE=20251102 RUN_TIME=12` → Downloads 1 forecast run (12Z on Nov 2) → Could be 1 file or 10+ files
-- `DOWNLOAD_DATE=20251102` (no RUN_TIME) → Downloads 4 forecast runs (00Z, 06Z, 12Z, 18Z) → Could be 4 files or 40+ files
+- `DOWNLOAD_LIMIT=1` → 1 combined BUFR4 file → N per-storm CSVs (one per active named storm)
+- `DOWNLOAD_DATE=20251102 RUN_TIME=12` → 1 combined BUFR4 file for 12Z on Nov 2
+- `DOWNLOAD_DATE=20251102` (no `RUN_TIME`) → not supported; `RUN_TIME` is required when `DOWNLOAD_DATE` is set
 
 ### Download Parameters
 
@@ -235,7 +238,7 @@ EXECUTE JOB SERVICE
 - **Required**: No
 - **Default**: `1`
 - **Description**: Number of latest **forecast runs** to download (only used when `DOWNLOAD_DATE` is not set)
-- **Important**: This refers to forecast runs (date/time combinations), not individual files. Each forecast run can contain multiple files (one per storm). For example, `DOWNLOAD_LIMIT=1` downloads all TC track files for the most recent forecast run, which could be 1 file or 10+ files depending on how many storms are active.
+- **Important**: `DOWNLOAD_LIMIT=1` downloads **one combined BUFR4 file** containing all active named storms for that run. The extractor then splits it into one CSV per storm. Increasing the limit downloads multiple consecutive forecast runs (e.g. `DOWNLOAD_LIMIT=2` downloads the two most recent runs).
 
 ### Processing Parameters
 
@@ -278,65 +281,25 @@ EXECUTE JOB SERVICE
 - **Default**: `true`
 - **Description**: Use ProcessPoolExecutor (better for CPU tasks) vs ThreadPoolExecutor (better for I/O)
 
-### Parameter Handling Logic
+### Download Scenarios
 
-#### Scenario 1: No `DOWNLOAD_DATE` and No `RUN_TIME`
-
-**Behavior**: Downloads the **latest N forecast runs** (where N = `DOWNLOAD_LIMIT`, default: 1)
-
-**Process**:
-1. Scrapes ECMWF DISS system for the most recent N forecast dates (sorted newest first)
-2. For each forecast date/time, lists ALL TC track files available
-3. Filters by `NAMED_STORMS_ONLY` if enabled
-4. Downloads ALL TC track files for each of those forecast times
-
-**Example**:
+#### Latest forecast (default)
 ```bash
-# Downloads latest 1 forecast run (could be 1 file or 10+ files depending on active storms)
 docker run ... tc-ecmwf-pipeline:latest
-
-# Downloads latest 3 forecast runs
-docker run -e DOWNLOAD_LIMIT=3 ... tc-ecmwf-pipeline:latest
+# Downloads the most recent combined BUFR4 file (DOWNLOAD_LIMIT=1)
 ```
 
-#### Scenario 2: `DOWNLOAD_DATE` Set, No `RUN_TIME`
-
-**Behavior**: Downloads **all run times (00Z, 06Z, 12Z, 18Z)** for the specified date
-
-**Important**: Each run time can contain multiple files (one per storm). So this could download 4 forecast runs × N storms = potentially many files.
-
-**Process**:
-1. Finds all available forecast dates matching the date (e.g., `20251102`)
-2. This matches all run times for that date: `20251102000000`, `20251102060000`, `20251102120000`, `20251102180000`
-3. For each matching forecast time, downloads ALL TC track files (one per storm)
-
-**Example**:
+#### Specific date and run time
 ```bash
-# Downloads all run times for November 2, 2025
-docker run -e DOWNLOAD_DATE=20251102 ... tc-ecmwf-pipeline:latest
-```
-
-#### Scenario 3: Both `DOWNLOAD_DATE` and `RUN_TIME` Set
-
-**Behavior**: Downloads **only the specific forecast run** for that date and run time
-
-**Important**: Even though it's a single forecast run, it can still contain multiple files (one per active storm).
-
-**Process**:
-1. Finds forecast dates matching `DOWNLOAD_DATE`
-2. Further filters to dates where the hour matches `RUN_TIME`
-3. Downloads ALL TC track files for that specific forecast time (one file per storm)
-
-**Example**:
-```bash
-# Downloads only the 12Z forecast for November 2, 2025
 docker run -e DOWNLOAD_DATE=20251102 -e RUN_TIME=12 ... tc-ecmwf-pipeline:latest
+# Downloads the 12Z forecast for November 2, 2025
 ```
 
-**Note**: 
-- `RUN_TIME` can be specified as `12` or `12Z` - the code normalizes it to 2 digits
-- Date format must be `YYYYMMDD` (8 digits, no dashes)
-- If no forecasts are found for the specified date/time, the pipeline will log an error and exit
+**Notes**:
+- `DOWNLOAD_DATE` requires `RUN_TIME` — the API retrieves a specific run, not a full day
+- `RUN_TIME` must be `00`, `06`, `12`, or `18` (no `Z` suffix)
+- Date format: `YYYYMMDD` (8 digits, no dashes)
+- If data is unavailable for the requested date/time, the pipeline logs an error and exits
 
 ### Wind Data Download Logic
 
@@ -353,10 +316,10 @@ Wind data download depends on TC data:
 
 ## Pipeline Phases
 
-1. **Phase 1**: Concurrent TC and wind data downloads
-2. **Phase 2**: Concurrent extraction and transformation of TC data
-3. **Phase 3**: Wind combination processing (creates envelope files)
-4. **Phase 4**: Load all data to Snowflake tables
+1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
+2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`)
+3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
+4. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED` to Snowflake
 
 
 ---
