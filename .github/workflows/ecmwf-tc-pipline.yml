@@ -1,9 +1,9 @@
 name: TC Forecast Pipeline
 
 on:
-  # Run automatically every 12 hours (ECMWF releases forecasts 4 times daily)
-  #schedule:
-  #   - cron: '0 1,9,13,21 * * *'  # After each forecast is published
+  # Run 4x daily, 1h20m after ECMWF EPS TC track data is available (~7h40m after each run)
+  schedule:
+    - cron: '0 3,9,15,21 * * *'  # 03/09/15/21 UTC — aligned to 18Z/00Z/06Z/12Z releases
 
   # Allow manual trigger
   workflow_dispatch:

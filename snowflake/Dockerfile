@@ -75,8 +75,9 @@ WORKDIR /app
 # Copy application code
 # ==============================================================================
 
-# Copy all ecmwf_* modules from repo root
+# Copy all pipeline modules from repo root
 COPY ecmwf_*.py /app/
+COPY pipeline_core.py /app/
 
 # Copy snowflake directory (contains spcs_pipeline.py and snowflake_loader.py)
 COPY snowflake/ /app/snowflake/
@@ -124,7 +125,7 @@ ENV WIND_EXTRACTED_DIR=/app/wind_extracted
 ENV DOWNLOAD_LIMIT=1
 ENV MAX_WORKERS=4
 ENV PROCESS_WIND_DATA=true
-ENV NAMED_STORMS_ONLY=false
+ENV NAMED_STORMS_ONLY=true
 ENV CLEANUP_AFTER_LOAD=true
 ENV USE_PROCESS_POOL=false
 

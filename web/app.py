@@ -5,6 +5,18 @@ Using Plotly's built-in animation features
 """
 
 import os
+from pathlib import Path
+
+# Load .env from repo root if present
+_env_path = Path(__file__).parent.parent / '.env'
+if _env_path.is_file():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            _line = _line.removeprefix('export').strip()
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, State
@@ -99,6 +111,38 @@ def get_combined_envelopes(track_id, forecast_time):
     WHERE TRACK_ID = '{track_id}'
       AND FORECAST_TIME = '{forecast_time}'
     ORDER BY ENSEMBLE_MEMBER, LEAD_TIME_RANGE, WIND_THRESHOLD
+    """
+
+    cursor = conn.cursor()
+    cursor.execute(query)
+    df = cursor.fetch_pandas_all()
+    cursor.close()
+    conn.close()
+
+    return df
+
+
+def get_individual_envelopes(track_id, forecast_time):
+    """Get per-timestep individual wind envelopes for a specific storm and forecast time"""
+    conn = snowflake.connector.connect(
+        account=os.getenv('SNOWFLAKE_ACCOUNT'),
+        user=os.getenv('SNOWFLAKE_USER'),
+        password=os.getenv('SNOWFLAKE_PASSWORD'),
+        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
+        database=os.getenv('SNOWFLAKE_DATABASE'),
+        schema=os.getenv('SNOWFLAKE_SCHEMA')
+    )
+
+    query = f"""
+    SELECT
+        ENSEMBLE_MEMBER,
+        LEAD_TIME,
+        WIND_THRESHOLD,
+        ST_ASWKT(ENVELOPE_REGION) AS ENVELOPE_REGION
+    FROM TC_ENVELOPES_INDIVIDUAL
+    WHERE TRACK_ID = '{track_id}'
+      AND FORECAST_TIME = '{forecast_time}'
+    ORDER BY ENSEMBLE_MEMBER, LEAD_TIME, WIND_THRESHOLD
     """
 
     cursor = conn.cursor()
@@ -234,23 +278,49 @@ app.layout = html.Div([
                         id='threshold-filter',
                         options=[
                             {'label': html.Span(
-                                ['34kt ', html.Span('●', style={'color': '#FFD700', 'fontSize': '16px'})]),
+                                ['34kt ', html.Span('●', style={'color': '#FFFF00', 'fontSize': '16px'})]),
                              'value': 34},
                             {'label': html.Span(
-                                ['40kt ', html.Span('●', style={'color': '#FFA500', 'fontSize': '16px'})]),
+                                ['40kt ', html.Span('●', style={'color': '#FFD700', 'fontSize': '16px'})]),
                              'value': 40},
                             {'label': html.Span(
-                                ['50kt ', html.Span('●', style={'color': '#FF8C00', 'fontSize': '16px'})]),
+                                ['50kt ', html.Span('●', style={'color': '#FFA500', 'fontSize': '16px'})]),
                              'value': 50},
                             {'label': html.Span(
-                                ['64kt ', html.Span('●', style={'color': '#FF0000', 'fontSize': '16px'})]), 'value': 64}
+                                ['64kt ', html.Span('●', style={'color': '#FF4500', 'fontSize': '16px'})]),
+                             'value': 64},
+                            {'label': html.Span(
+                                ['83kt ', html.Span('●', style={'color': '#CC0000', 'fontSize': '16px'})]),
+                             'value': 83},
+                            {'label': html.Span(
+                                ['96kt ', html.Span('●', style={'color': '#990000', 'fontSize': '16px'})]),
+                             'value': 96},
+                            {'label': html.Span(
+                                ['113kt ', html.Span('●', style={'color': '#660000', 'fontSize': '16px'})]),
+                             'value': 113},
                         ],
                         value=[],  # Empty by default - will be populated by callback
-                        style={'fontSize': '14px'},
-                        inputStyle={'marginRight': '8px'}
+                        style={'fontSize': '14px', 'columnCount': '2'},
+                        inputStyle={'marginRight': '6px'}
                     ),
                     html.Div(id='threshold-note', style={'fontSize': '12px', 'color': '#666', 'marginTop': '6px'}),
                 ], style={'flex': '1', 'minWidth': '250px'}),
+
+                html.Div([
+                    html.Label("Ensemble Members",
+                               style={'fontSize': '13px', 'fontWeight': '500', 'color': '#444', 'marginBottom': '8px'}),
+                    dcc.Dropdown(
+                        id='member-filter',
+                        options=[],
+                        value=[],
+                        multi=True,
+                        placeholder='All members',
+                        style={'fontSize': '13px'}
+                    ),
+                    html.Div(id='member-note',
+                             style={'fontSize': '12px', 'color': '#666', 'marginTop': '6px'}),
+                ], style={'flex': '1', 'minWidth': '250px'}),
+
             ], style={
                 'display': 'flex',
                 'gap': '20px',
@@ -265,7 +335,7 @@ app.layout = html.Div([
             # Map with built-in animation
             dcc.Graph(
                 id='tc-map',
-                style={'height': 'calc(100vh - 220px)', 'width': '100%'},
+                style={'flex': '1', 'minHeight': '0', 'width': '100%'},
                 config={
                     'displayModeBar': True,
                     'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
@@ -457,14 +527,16 @@ def load_forecast_data(selected_date, selected_time, storm_id, metadata):
     # Get the forecast data
     forecast_df = get_forecast_data(storm_id, forecast_time)
 
-    # Get combined envelope data
+    # Get envelope data
     combined_envelopes_df = get_combined_envelopes(storm_id, forecast_time)
+    individual_envelopes_df = get_individual_envelopes(storm_id, forecast_time)
 
     return {
         'track_id': storm_id,
         'forecast_time': forecast_time,
         'data': forecast_df.to_dict('records'),
-        'combined_envelopes': combined_envelopes_df.to_dict('records')
+        'combined_envelopes': combined_envelopes_df.to_dict('records'),
+        'individual_envelopes': individual_envelopes_df.to_dict('records')
     }
 
 
@@ -496,7 +568,8 @@ def update_threshold_options(stored_data):
         note_text = "No wind envelopes available for the current selection."
         envelope_options = [
             {'label': 'None', 'value': 'none'},
-            {'label': 'Combined (Not Available)', 'value': 'combined', 'disabled': True}
+            {'label': 'Individual (Not Available)', 'value': 'individual', 'disabled': True},
+            {'label': 'Combined (Not Available)', 'value': 'combined', 'disabled': True},
         ]
         return [], [], note_text, envelope_options, 'none'
 
@@ -507,13 +580,13 @@ def update_threshold_options(stored_data):
 
     # Color mapping for visual indicators
     color_map = {
-        34: '#FFD700',  # Gold/Yellow
-        40: '#FFA500',  # Orange
-        50: '#FF8C00',  # Dark Orange
-        64: '#FF0000',  # Red
-        74: '#CC0000',  # Dark Red (Category 3)
-        96: '#990000',  # Darker Red (Category 4)
-        113: '#660000'  # Darkest Red (Category 5)
+        34:  '#FFFF00',  # Yellow
+        40:  '#FFD700',  # Gold
+        50:  '#FFA500',  # Orange
+        64:  '#FF4500',  # Orange-Red
+        83:  '#CC0000',  # Dark Red
+        96:  '#990000',  # Darker Red
+        113: '#660000',  # Darkest Red
     }
 
     # Create options for available thresholds
@@ -530,10 +603,28 @@ def update_threshold_options(stored_data):
     # When envelopes are available, show normal options
     envelope_options = [
         {'label': 'None', 'value': 'none'},
-        {'label': 'Combined', 'value': 'combined'}
+        {'label': 'Individual', 'value': 'individual'},
+        {'label': 'Combined', 'value': 'combined'},
     ]
 
     return options, selected_values, None, envelope_options, 'none'
+
+
+@app.callback(
+    [Output('member-filter', 'options'),
+     Output('member-filter', 'value'),
+     Output('member-note', 'children')],
+    Input('forecast-data-store', 'data')
+)
+def update_member_options(stored_data):
+    """Populate member dropdown from available data."""
+    if not stored_data or not stored_data.get('data'):
+        return [], [], ''
+    df = pd.DataFrame(stored_data['data'])
+    members = sorted(df['ENSEMBLE_MEMBER'].unique())
+    options = [{'label': f'Member {m}', 'value': m} for m in members]
+    note = f'{len(members)} members available'
+    return options, [], note  # empty value = all members shown
 
 
 @app.callback(
@@ -541,9 +632,10 @@ def update_threshold_options(stored_data):
     Input('forecast-data-store', 'data'),
     Input('opacity-slider', 'value'),
     Input('envelope-toggle', 'value'),
-    Input('threshold-filter', 'value')
+    Input('threshold-filter', 'value'),
+    Input('member-filter', 'value')
 )
-def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
+def update_map(stored_data, opacity, envelope_mode, selected_thresholds, selected_members):
     """Update map with TC tracks and wind envelopes using Plotly animation frames and Mapbox"""
     if not stored_data or not stored_data.get('data'):
         return go.Figure()
@@ -551,8 +643,20 @@ def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
     df = pd.DataFrame(stored_data['data'])
     track_id = stored_data['track_id']
 
-    # Get combined envelope data
-    combined_envelopes = stored_data.get('combined_envelopes', [])
+    # Apply member filter (empty list = show all)
+    all_members = sorted(df['ENSEMBLE_MEMBER'].unique())
+    active_members = selected_members if selected_members else all_members
+    df = df[df['ENSEMBLE_MEMBER'].isin(active_members)]
+
+    # Get envelope data filtered to active members
+    combined_envelopes = [
+        e for e in stored_data.get('combined_envelopes', [])
+        if e.get('ENSEMBLE_MEMBER') in active_members
+    ]
+    individual_envelopes = [
+        e for e in stored_data.get('individual_envelopes', [])
+        if e.get('ENSEMBLE_MEMBER') in active_members
+    ]
 
     # Get all unique time steps
     time_steps = sorted(df['LEAD_TIME'].unique())
@@ -625,8 +729,10 @@ def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
         if envelope_mode == 'combined' and combined_envelopes:
             # Add combined envelopes - these represent the TOTAL area across ALL forecast steps
             # Show them for all time steps since they represent the total possible impact
+            # Sort by threshold ascending so 34kt is drawn first (bottom), 64kt last (top)
+            sorted_envelopes = sorted(combined_envelopes, key=lambda e: (e['WIND_THRESHOLD'], e.get('ENSEMBLE_MEMBER', 0)))
 
-            for envelope in combined_envelopes:
+            for envelope in sorted_envelopes:
                 # Filter by selected thresholds
                 threshold = envelope['WIND_THRESHOLD']
                 if threshold not in selected_thresholds:
@@ -659,14 +765,16 @@ def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
                                 if polygon.is_valid:
                                     # Handle both POLYGON and MULTIPOLYGON
                                     if hasattr(polygon, 'geoms'):  # MULTIPOLYGON
-                                        # For MULTIPOLYGON, use the first polygon
-                                        first_polygon = polygon.geoms[0]
-                                        exterior_coords = list(first_polygon.exterior.coords)
-                                    else:  # POLYGON
-                                        exterior_coords = list(polygon.exterior.coords)
+                                        sub_polys = list(polygon.geoms)
+                                    else:
+                                        sub_polys = [polygon]
 
-                                    lons_env = [coord[0] for coord in exterior_coords]
-                                    lats_env = [coord[1] for coord in exterior_coords]
+                                    # Concatenate all sub-polygons separated by None (breaks line)
+                                    lons_env, lats_env = [], []
+                                    for sp in sub_polys:
+                                        coords = list(sp.exterior.coords)
+                                        lons_env += [c[0] for c in coords] + [None]
+                                        lats_env += [c[1] for c in coords] + [None]
                                 else:
                                     continue
                             except Exception:
@@ -681,13 +789,13 @@ def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
 
                     # Color mapping matching the UI indicators (expanded for all thresholds)
                     color_map = {
-                        34: 'rgba(255, 215, 0, 0.3)',  # Gold/Yellow (#FFD700)
-                        40: 'rgba(255, 165, 0, 0.3)',  # Orange (#FFA500)
-                        50: 'rgba(255, 140, 0, 0.3)',  # Dark Orange (#FF8C00)
-                        64: 'rgba(255, 0, 0, 0.3)',  # Red (#FF0000)
-                        74: 'rgba(204, 0, 0, 0.3)',  # Dark Red (Category 3)
-                        96: 'rgba(153, 0, 0, 0.3)',  # Darker Red (Category 4)
-                        113: 'rgba(102, 0, 0, 0.3)'  # Darkest Red (Category 5)
+                        34:  'rgba(255, 255,   0, 0.3)',  # Yellow
+                        40:  'rgba(255, 215,   0, 0.3)',  # Gold
+                        50:  'rgba(255, 165,   0, 0.3)',  # Orange
+                        64:  'rgba(255,  69,   0, 0.3)',  # Orange-Red
+                        83:  'rgba(204,   0,   0, 0.3)',  # Dark Red
+                        96:  'rgba(153,   0,   0, 0.3)',  # Darker Red
+                        113: 'rgba(102,   0,   0, 0.3)',  # Darkest Red
                     }
                     env_color = color_map.get(threshold, 'rgba(128, 128, 128, 0.3)')  # Gray for others
 
@@ -703,6 +811,57 @@ def update_map(stored_data, opacity, envelope_mode, selected_thresholds):
                         hovertemplate=f"<b>Combined Envelope</b><br>Member: {member}<br>{threshold}kt Wind Field<br>Total Forecast Period<extra></extra>"
                     ))
 
+                except Exception:
+                    continue
+
+        # Add individual wind envelopes for this specific timestep
+        if envelope_mode == 'individual' and individual_envelopes:
+            color_map = {
+                34:  'rgba(255, 255,   0, 0.3)',
+                40:  'rgba(255, 215,   0, 0.3)',
+                50:  'rgba(255, 165,   0, 0.3)',
+                64:  'rgba(255,  69,   0, 0.3)',
+                83:  'rgba(204,   0,   0, 0.3)',
+                96:  'rgba(153,   0,   0, 0.3)',
+                113: 'rgba(102,   0,   0, 0.3)',
+            }
+            # Show envelopes for this exact lead_time, sorted threshold ascending
+            step_envelopes = sorted(
+                [e for e in individual_envelopes if e.get('LEAD_TIME') == time_step],
+                key=lambda e: (e['WIND_THRESHOLD'], e.get('ENSEMBLE_MEMBER', 0))
+            )
+            for envelope in step_envelopes:
+                threshold = envelope['WIND_THRESHOLD']
+                if threshold not in selected_thresholds:
+                    continue
+                try:
+                    envelope_data = envelope['ENVELOPE_REGION']
+                    if not envelope_data or not isinstance(envelope_data, str):
+                        continue
+                    if not envelope_data.startswith(('POLYGON', 'MULTIPOLYGON')):
+                        continue
+                    polygon = wkt.loads(envelope_data)
+                    if not polygon.is_valid:
+                        continue
+                    sub_polys = list(polygon.geoms) if hasattr(polygon, 'geoms') else [polygon]
+                    lons_env, lats_env = [], []
+                    for sp in sub_polys:
+                        coords = list(sp.exterior.coords)
+                        lons_env += [c[0] for c in coords] + [None]
+                        lats_env += [c[1] for c in coords] + [None]
+                    member = envelope.get('ENSEMBLE_MEMBER', 'Unknown')
+                    env_color = color_map.get(threshold, 'rgba(128, 128, 128, 0.3)')
+                    frame_data.append(go.Scattermap(
+                        lon=lons_env,
+                        lat=lats_env,
+                        mode='lines',
+                        line=dict(width=1, color=env_color),
+                        fill='toself',
+                        fillcolor=env_color,
+                        showlegend=False,
+                        name=f"Individual - {threshold}kt - M{member}",
+                        hovertemplate=f"<b>Individual Envelope</b><br>Member: {member}<br>{threshold}kt Wind Field<br>Lead time: {time_step}h<extra></extra>"
+                    ))
                 except Exception:
                     continue
 

@@ -394,8 +394,16 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     else:
         axes = axes.flatten()
 
-    # Set fixed bounding box: lon 129-138°E, lat 9-14°N
-    bounds = (129, 138, 9, 14)  # (lon_min, lon_max, lat_min, lat_max)
+    # Compute bounding box from the actual polygons for this member
+    _polys = []
+    for s in member_df['envelope_region'].dropna():
+        try:
+            p = wkt.loads(s)
+            if p and not p.is_empty:
+                _polys.append(p)
+        except Exception:
+            pass
+    bounds = get_bounds_from_data(_polys) if _polys else get_bounds_from_data(member_df)
 
     # Plot each forecast step
     for i, step in enumerate(forecast_steps):
