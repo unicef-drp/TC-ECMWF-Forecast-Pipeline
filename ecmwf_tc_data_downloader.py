@@ -131,7 +131,7 @@ def _resolve_targets(
     Return a list of (forecast_date: datetime, run_time: int) pairs to download.
 
     If date is given, returns that specific date + run_time.
-    Otherwise tries the most recent runs working backwards from yesterday.
+    Otherwise returns the most recently available run(s) based on current UTC time.
     """
     if date:
         if not run_time:
@@ -141,16 +141,29 @@ def _resolve_targets(
         return [(forecast_date, rt)]
 
     # "Latest N" mode: try recent dates/runs in reverse order
-    # ECMWF data is typically available 4–9 hours after the model run time.
-    # Probe the last 3 days × 4 run times and return the first `limit` hits.
+    # ECMWF data is typically available ~7h40m after each model run time.
+    # Determine the most recently expected available run based on current UTC
+    # time, then walk backwards so candidates are newest-first.
+    #
+    # Availability windows (UTC):
+    #   18Z (prev day) → ready by ~01:40Z
+    #   00Z            → ready by ~07:40Z
+    #   06Z            → ready by ~13:40Z
+    #   12Z            → ready by ~19:40Z
+    DATA_READY_OFFSET_HOURS = 8  # conservative: available within 8h of run
+    now_utc = datetime.now(timezone.utc)
+    # Walk back through run times until we find one whose data should be ready
     run_times_desc = [18, 12, 6, 0]
     candidates = []
-    check_date = datetime.now(timezone.utc).date() - timedelta(days=1)
 
-    for _ in range(3):
+    # Generate candidates for the past 3 days, newest-first
+    for day_offset in range(3):
+        check_date = (now_utc - timedelta(days=day_offset)).date()
         for rt in run_times_desc:
-            candidates.append((datetime.combine(check_date, datetime.min.time()), rt))
-        check_date -= timedelta(days=1)
+            run_utc = datetime(check_date.year, check_date.month, check_date.day,
+                               rt, 0, 0, tzinfo=timezone.utc)
+            if now_utc >= run_utc + timedelta(hours=DATA_READY_OFFSET_HOURS):
+                candidates.append((datetime.combine(check_date, datetime.min.time()), rt))
 
     # If run_time is specified without a date, filter to that run time only
     if run_time:
