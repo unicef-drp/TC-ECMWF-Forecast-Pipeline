@@ -452,10 +452,13 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                             END AS ENVELOPE_REGION
                         FROM {staging_table}
                     ) s
-                    ON t.TRACK_ID = s.TRACK_ID 
+                    ON t.TRACK_ID = s.TRACK_ID
                         AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.WIND_THRESHOLD = s.WIND_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        LEAD_TIME_RANGE = s.LEAD_TIME_RANGE
                     WHEN NOT MATCHED THEN INSERT (
                         FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
                         WIND_THRESHOLD, ENVELOPE_REGION

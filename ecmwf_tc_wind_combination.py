@@ -350,10 +350,11 @@ def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
     Returns:
         Tuple of (list of envelope records, log message)
     """
+    import traceback
     import pandas as pd
     from pathlib import Path
     from datetime import datetime
-    
+
     # Import required functions (in worker process)
     from ecmwf_wind_data_extractor import (
         load_wind_data,
@@ -407,8 +408,8 @@ def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
             for threshold, polygon in contours.items():
                 wkt_polygons[threshold] = polygon_to_wkt(polygon)
         except Exception as e:
-            return [], f"Error extracting wind polygons: {str(e)}"
-        
+            return [], f"Error extracting wind polygons for member {ensemble_member} at lead {lead_time}h: {e}\n{traceback.format_exc()}"
+
         # Create envelope records for this time step
         envelope_records = []
         for threshold, wkt_polygon in wkt_polygons.items():
@@ -426,7 +427,7 @@ def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
         return envelope_records, log_msg
         
     except Exception as e:
-        return [], f"Error processing track point: {str(e)}"
+        return [], f"Error processing track point: {e}\n{traceback.format_exc()}"
 
 
 def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> int:
@@ -570,8 +571,9 @@ def process_wind_combination(
             # Process each time step
             storm_envelope_records = []
 
-            # Limit ensemble members for faster processing
-            unique_members = list(tc_data['ensemble_member'].unique())[:max_ensemble_members]
+            # Limit ensemble members for faster processing — sort before slicing so
+            # the slice is deterministic regardless of CSV row order
+            unique_members = sorted(tc_data['ensemble_member'].unique())[:max_ensemble_members]
             filtered_tc_data = tc_data[tc_data['ensemble_member'].isin(unique_members)]
 
             if verbose:
@@ -727,12 +729,23 @@ def process_wind_combination(
                         combined_file = output_dir / f"{storm_name}_envelopes_combined.csv"
 
                     combined_df.to_csv(combined_file, index=False)
-                    
+
+                    # Validate member count: warn if any threshold has fewer members than expected
+                    actual_members = combined_df['ensemble_member'].nunique()
+                    if actual_members < max_ensemble_members:
+                        missing = max_ensemble_members - actual_members
+                        logger.warning(
+                            f"  Member count mismatch for {storm_name}: "
+                            f"expected {max_ensemble_members}, got {actual_members} "
+                            f"({missing} member(s) missing — check GRIB files)"
+                        )
+
                     total_envelope_records += len(combined_records)
                     processed_storms += 1
-                    
+
                     logger.info(f"✓ Successfully processed {storm_name}")
                     logger.info(f"  - Combined records: {len(combined_records)}")
+                    logger.info(f"  - Members in output: {actual_members}/{max_ensemble_members}")
                     logger.info(f"  - Combined file: {combined_file.name}")
                 else:
                     logger.warning(f"  No combined polygons created for {storm_name}")

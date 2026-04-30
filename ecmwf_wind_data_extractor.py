@@ -21,6 +21,7 @@ References:
 """
 
 import os
+import logging
 import warnings
 from typing import Dict, List, Optional, Union
 
@@ -34,9 +35,11 @@ from shapely.ops import unary_union
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
+logger = logging.getLogger(__name__)
+
 # Configuration
 DEFAULT_OUTPUT_DIR = "wind_extracted"
-BUFFER_RADIUS_KM = 500  # Fixed buffer radius around tracks
+BUFFER_RADIUS_KM = 500  # Fixed buffer radius around tracks in km
 
 # Wind thresholds in knots and m/s
 WIND_THRESHOLDS = {
@@ -191,9 +194,8 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
             print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
         try:
             wind_speed = wind_speed.sel(number=desired_number)
-        except Exception:
-            if verbose:
-                print("    WARNING: Desired member not found; proceeding without selection")
+        except Exception as e:
+            logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data; proceeding without selection: {e}")
     else:
         if verbose:
             print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
@@ -296,7 +298,8 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
                             poly = Polygon(segment)
                             if poly.is_valid and poly.area > 0:
                                 polygons.append(poly)
-                        except Exception:
+                        except Exception as e:
+                            logger.debug(f"Skipping invalid polygon segment at {threshold_kt}kt: {e}")
                             continue
         except Exception as e:
             if verbose:
@@ -333,7 +336,8 @@ def polygon_to_wkt(polygon: Optional[Polygon]) -> Optional[str]:
 
     try:
         return polygon.wkt
-    except:
+    except Exception as e:
+        logger.warning(f"Could not convert polygon to WKT: {e}")
         return None
 
 
