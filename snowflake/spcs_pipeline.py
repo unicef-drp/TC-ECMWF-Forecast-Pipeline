@@ -106,6 +106,10 @@ class PipelineConfig(BasePipelineConfig):
 
     def validate(self) -> bool:
         """Validate required configuration (supports SPCS OAuth, private key, or password auth)."""
+        if self.data_pipeline_db == 'LOCAL':
+            logger.info("DATA_PIPELINE_DB=LOCAL — Snowflake credentials not required")
+            return self._validate_run_time()
+
         if not self.sf_account:
             logger.error("Missing required environment variable: SNOWFLAKE_ACCOUNT")
             return False
@@ -181,11 +185,21 @@ class PipelineStats(_BasePipelineStats):
 def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                               transformed_files: List[Path],
                               envelope_files: List[Path]):
-    """Phase 4: Load all results to Snowflake (supports SPCS OAuth, private key, password)."""
+    """Phase 4: Load all results to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
     logger.info("=" * 70)
     logger.info("PHASE 4: SNOWFLAKE LOADING")
     logger.info("=" * 70)
     phase_start = datetime.now()
+
+    if config.data_pipeline_db == 'LOCAL':
+        logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
+        logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
+        logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        stats.files_loaded = len(transformed_files) + len(envelope_files)
+        stats.rows_loaded = 0
+        duration = (datetime.now() - phase_start).total_seconds()
+        stats.log_phase_time("Phase 4: Skip (LOCAL mode)", duration)
+        return
 
     try:
         os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account

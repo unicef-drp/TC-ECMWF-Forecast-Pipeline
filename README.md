@@ -18,7 +18,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 3. **Transform TC Data**: Standardises units, computes wind radii, creates WKT polygons for Snowflake
 4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files matching the TC forecast run time
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
-6. **Load to Snowflake**: Loads processed data into Snowflake using a staging table → MERGE pattern
+6. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
 
 ### Output Data
 
@@ -47,7 +47,13 @@ pip install -r requirements.txt
 
 ### Required Environment Variables
 
-#### Snowflake Configuration (required for GitHub Actions pipeline)
+#### Storage Backend
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATA_PIPELINE_DB` | `SNOWFLAKE` | `SNOWFLAKE` — push to Snowflake after processing; `LOCAL` — skip load, keep output files in `tc_data_transformed/` and `wind_extracted/` |
+
+#### Snowflake Configuration (required when `DATA_PIPELINE_DB=SNOWFLAKE`)
 
 | Variable | Purpose |
 |----------|---------|

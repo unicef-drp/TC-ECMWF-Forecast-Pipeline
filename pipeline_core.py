@@ -54,6 +54,9 @@ class BasePipelineConfig:
         self.sf_database = os.getenv('SNOWFLAKE_DATABASE')
         self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA')
 
+        # Storage backend: SNOWFLAKE (default) or LOCAL (skip Snowflake load, keep files)
+        self.data_pipeline_db = os.getenv('DATA_PIPELINE_DB', 'SNOWFLAKE').upper()
+
         # Pipeline options
         self.cleanup_after_load = os.getenv('CLEANUP_AFTER_LOAD', 'true').lower() == 'true'
         self.skip_existing = os.getenv('SKIP_EXISTING', 'true').lower() == 'true'
@@ -85,6 +88,10 @@ class BasePipelineConfig:
         Returns True if valid, False otherwise (errors are logged).
         Subclasses with different auth requirements should override this.
         """
+        if self.data_pipeline_db == 'LOCAL':
+            logger.info("DATA_PIPELINE_DB=LOCAL — Snowflake credentials not required")
+            return self._validate_run_time()
+
         missing = []
         for var in ('sf_account', 'sf_user', 'sf_password',
                     'sf_warehouse', 'sf_database', 'sf_schema'):

@@ -8,7 +8,11 @@
 # Core Environment Variables (used by multiple components)
 # ==============================================================================
 
-# Snowflake Connection (REQUIRED for GitHub Actions and Web App)
+# Storage backend: SNOWFLAKE (push to Snowflake, default) or LOCAL (keep files locally, skip load)
+# When LOCAL, Snowflake credentials below are not required.
+DATA_PIPELINE_DB=SNOWFLAKE
+
+# Snowflake Connection (required when DATA_PIPELINE_DB=SNOWFLAKE)
 SNOWFLAKE_ACCOUNT=your_account_identifier
 SNOWFLAKE_USER=your_username
 SNOWFLAKE_PASSWORD=your_password
@@ -20,6 +24,7 @@ SNOWFLAKE_SCHEMA=your_schema
 # Usage
 # ==============================================================================
 # 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env
+#    Set DATA_PIPELINE_DB=LOCAL to skip Snowflake load and keep files locally.
 # 2. For web app development: Copy web/sample_env.txt to .env
 # 3. For GitHub Actions: Set values as GitHub Secrets in repository settings
 # 4. Never commit .env files with real credentials to version control

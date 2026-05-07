@@ -47,10 +47,19 @@ class PipelineConfig(BasePipelineConfig):
 
 def step6_load(config: PipelineConfig, stats: PipelineStats,
                transformed_files: List[Path], envelope_files: List[Path]):
-    """Step 6: Load transformed data to Snowflake via password auth."""
+    """Step 6: Load transformed data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
     logger.info("=" * 70)
-    logger.info("STEP 6: Loading data to Snowflake...")
+    logger.info("STEP 6: Loading data...")
     logger.info("=" * 70)
+
+    if config.data_pipeline_db == 'LOCAL':
+        logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
+        logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
+        logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        stats.files_loaded = len(transformed_files) + len(envelope_files)
+        stats.rows_loaded = 0
+        return
+
     try:
         os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
         os.environ['SNOWFLAKE_USER'] = config.sf_user
