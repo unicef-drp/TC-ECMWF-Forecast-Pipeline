@@ -197,6 +197,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
+        stats._local_mode = True
         duration = (datetime.now() - phase_start).total_seconds()
         stats.log_phase_time("Phase 4: Skip (LOCAL mode)", duration)
         return

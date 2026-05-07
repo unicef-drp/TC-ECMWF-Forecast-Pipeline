@@ -58,6 +58,7 @@ def step6_load(config: PipelineConfig, stats: PipelineStats,
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
+        stats._local_mode = True
         return
 
     try:

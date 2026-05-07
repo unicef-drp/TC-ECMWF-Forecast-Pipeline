@@ -145,7 +145,8 @@ class PipelineStats:
         logger.info(f"Files Transformed:          {self.files_transformed}")
         logger.info(f"Wind Files Downloaded:      {self.files_wind_downloaded}")
         logger.info(f"Wind Files Processed:       {self.files_wind_processed}")
-        logger.info(f"Files Loaded to Snowflake:  {self.files_loaded}")
+        load_label = "Files Processed (local):   " if getattr(self, '_local_mode', False) else "Files Loaded to Snowflake: "
+        logger.info(f"{load_label} {self.files_loaded}")
         logger.info(f"Total Rows Loaded:          {self.rows_loaded:,}")
         if self.errors:
             logger.error(f"Errors encountered: {len(self.errors)}")
