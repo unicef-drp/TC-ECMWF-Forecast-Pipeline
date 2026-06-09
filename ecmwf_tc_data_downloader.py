@@ -2,11 +2,10 @@
 """
 ECMWF Tropical Cyclone Track Data Downloader
 
-Downloads TC track BUFR files from ECMWF's Open Data service using the
-official ecmwf-opendata Python client (type="tf", stream="enfo").
-
-Each downloaded file contains tracks for ALL active storms and ALL ensemble
-members (50 perturbed + 1 control) in BUFR4 format — one file per forecast run.
+Primary: ecmwf-opendata client (data.ecmwf.int, type="tf", stream="enfo").
+Fallback: ECMWF DISS/Essential portal (essential.ecmwf.int) — used when the
+  primary endpoint returns 404. DISS publishes per-storm BUFR4 files which are
+  concatenated into a single output file so the extractor sees the same format.
 
 Max forecast horizons by run time (per ECMWF documentation):
     00Z / 12Z → step=240 (10-day track)
@@ -14,16 +13,18 @@ Max forecast horizons by run time (per ECMWF documentation):
 
 References:
     - ecmwf-opendata: https://github.com/ecmwf/ecmwf-opendata
-    - ECMWF Open Data: https://www.ecmwf.int/en/forecasts/datasets/open-data
-    - TC tracks product: https://pypi.org/project/ecmwf-opendata/ (type="tf")
+    - ECMWF DISS: https://essential.ecmwf.int/
 """
 
 import os
+import re
 import logging
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+import requests
 from ecmwf.opendata import Client
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,84 @@ def _step_for_run_time(run_time: int) -> int:
 def _output_filename(forecast_date: datetime, run_time: int) -> str:
     """Canonical filename for a TC track BUFR file."""
     return f"tc_tracks_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}.bufr4"
+
+
+_DISS_BASE = "https://essential.ecmwf.int"
+_TC_TRACK_RE = re.compile(r'tropical_cyclone_track.*bufr4\.bin$', re.IGNORECASE)
+
+
+def _diss_dt_str(forecast_date: datetime, run_time: int) -> str:
+    return forecast_date.strftime('%Y%m%d') + f'{run_time:02d}0000'
+
+
+def _list_diss_tc_files(forecast_date: datetime, run_time: int) -> List[str]:
+    """Return a list of TC track file URLs from essential.ecmwf.int for this run."""
+    dt_str = _diss_dt_str(forecast_date, run_time)
+    listing_url = f"{_DISS_BASE}/file/{dt_str}/"
+    try:
+        r = requests.get(listing_url, timeout=30)
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+    except Exception as e:
+        logger.debug(f"DISS listing failed ({listing_url}): {e}")
+        return []
+
+    urls = []
+    for match in re.finditer(r'href="(/file/[^"]+)"', r.text):
+        path = match.group(1)
+        if _TC_TRACK_RE.search(path):
+            urls.append(f"{_DISS_BASE}{path}")
+    return urls
+
+
+def _download_diss_and_combine(
+    forecast_date: datetime, run_time: int, filepath: str
+) -> bool:
+    """
+    Download all TC track BUFR4 files for this run from essential.ecmwf.int and
+    concatenate them into a single output file. BUFR is a sequential record format
+    so binary concatenation produces a valid multi-message BUFR4 file.
+    Returns True if at least one file was downloaded successfully.
+    """
+    tc_urls = _list_diss_tc_files(forecast_date, run_time)
+    if not tc_urls:
+        logger.info("DISS: no TC track files found for this run (no active named storms)")
+        return False
+
+    logger.info(f"DISS: found {len(tc_urls)} TC track file(s) — downloading and combining")
+
+    total_bytes = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        part_files = []
+        for i, url in enumerate(tc_urls):
+            fname = os.path.basename(url)
+            part_path = os.path.join(tmpdir, fname)
+            try:
+                r = requests.get(url, stream=True, timeout=120)
+                r.raise_for_status()
+                with open(part_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                if os.path.getsize(part_path) > 0:
+                    part_files.append(part_path)
+                    total_bytes += os.path.getsize(part_path)
+            except Exception as e:
+                logger.warning(f"DISS: failed to download {fname}: {e}")
+
+        if not part_files:
+            return False
+
+        with open(filepath, 'wb') as out:
+            for part in part_files:
+                with open(part, 'rb') as inp:
+                    out.write(inp.read())
+
+    logger.info(
+        f"DISS: combined {len(part_files)}/{len(tc_urls)} files "
+        f"→ {filepath} ({total_bytes / 1024:.0f} KB)"
+    )
+    return True
 
 
 def download_tc_data(
@@ -94,6 +173,7 @@ def download_tc_data(
             continue
 
         logger.info(f"Downloading TC tracks: {forecast_date.strftime('%Y-%m-%d')} {rt:02d}Z (step={step}h)")
+        success = False
         try:
             client.retrieve(
                 date=forecast_date,
@@ -103,19 +183,31 @@ def download_tc_data(
                 step=step,
                 target=filepath,
             )
-
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
                 size_kb = os.path.getsize(filepath) / 1024
                 logger.info(f"Downloaded: {filename} ({size_kb:.0f} KB)")
-                downloaded += 1
+                success = True
             else:
-                logger.error(f"Download produced empty or missing file: {filename}")
-                failed += 1
-
+                logger.warning(f"data.ecmwf.int returned empty file for {filename}")
+                if os.path.exists(filepath):
+                    os.remove(filepath)
         except Exception as e:
-            logger.error(f"Download failed for {filename}: {e}")
+            logger.warning(f"data.ecmwf.int failed for {filename}: {e}")
             if os.path.exists(filepath):
                 os.remove(filepath)
+
+        if not success:
+            logger.info(f"Falling back to DISS (essential.ecmwf.int) for {filename}")
+            if _download_diss_and_combine(forecast_date, rt, filepath):
+                success = True
+            else:
+                logger.error(f"Download failed for {filename} (both data.ecmwf.int and essential.ecmwf.int)")
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
+        if success:
+            downloaded += 1
+        else:
             failed += 1
 
     logger.info(f"TC download complete — downloaded: {downloaded}, failed: {failed}")

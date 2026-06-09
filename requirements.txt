@@ -2,7 +2,7 @@
 eccodes>=1.5.0
 
 # ECMWF data access
-ecmwf-opendata>=0.0.8
+ecmwf-opendata>=0.3.29
 
 # Data processing
 pandas>=2.0.0
