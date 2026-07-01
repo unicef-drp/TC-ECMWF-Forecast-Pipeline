@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared pipeline core: configuration, statistics, and processing steps 1–5.
+Shared pipeline core: configuration, statistics, and processing steps 1–6.
 
 Both entry points import from here:
   - github_actions/main.py  — sequential execution, password auth
@@ -23,6 +23,7 @@ from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_storm_csvs
 from ecmwf_wind_data_downloader import download_ensemble_wind
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
+from ecmwf_precip_data_downloader import download_ensemble_precip
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,13 @@ class BasePipelineConfig:
         self.named_storms_only = os.getenv('NAMED_STORMS_ONLY', 'true').lower() == 'true'
         self.max_ensemble_members = 51  # Fixed: 50 perturbed + 1 control
 
+        # Precipitation processing (tp only)
+        self.precip_data_dir = Path(os.getenv('PRECIP_DATA_DIR', 'precip_data'))
+        self.process_precip = os.getenv('PROCESS_PRECIP', 'true').lower() == 'true'
+
+        # Snowflake stage name (used for precip Zarr PUT and impact data)
+        self.snowflake_stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
+
     def _validate_run_time(self) -> bool:
         """Validate run_time format and required-when-date-specified rule."""
         if self.download_date and not self.run_time:
@@ -102,16 +110,24 @@ class BasePipelineConfig:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
             return False
 
+        if self.process_precip and not self.snowflake_stage_name:
+            logger.error(
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_PRECIP=true and "
+                "DATA_PIPELINE_DB=SNOWFLAKE. Add it to GitHub Secrets."
+            )
+            return False
+
         return self._validate_run_time()
 
     def create_directories(self):
         """Ensure all required working directories exist."""
         for d in (self.raw_data_dir, self.transformed_data_dir,
-                  self.wind_data_dir, self.wind_extracted_dir):
+                  self.wind_data_dir, self.wind_extracted_dir,
+                  self.precip_data_dir):
             d.mkdir(parents=True, exist_ok=True)
         logger.info(
             f"Directories ready: {self.raw_data_dir}, {self.transformed_data_dir}, "
-            f"{self.wind_data_dir}, {self.wind_extracted_dir}"
+            f"{self.wind_data_dir}, {self.wind_extracted_dir}, {self.precip_data_dir}"
         )
 
 
@@ -209,14 +225,13 @@ def step1_download(config: BasePipelineConfig, stats: PipelineStats) -> List[Pat
             logger.info(f"Downloading latest {config.download_limit} forecast(s)")
             download_kwargs['limit'] = config.download_limit
 
+        download_kwargs['skip_existing'] = config.skip_existing
         result = download_tc_data(**download_kwargs)
         stats.files_downloaded = result['downloaded']
         logger.info(f"Downloaded {stats.files_downloaded} file(s)")
 
-        # Support both .bufr4 (ecmwf-opendata) and .bin (DISS) files
-        bufr_files = (list(config.raw_data_dir.glob("*.bufr4"))
-                      + list(config.raw_data_dir.glob("*.bin")))
-        return bufr_files
+        # Use the file list returned by the downloader (only files from this run)
+        return result['files']
 
     except Exception as e:
         error_msg = f"Download failed: {e}"
@@ -283,7 +298,7 @@ def _transform_worker(args: tuple) -> tuple:
     csv_file_path, transformed_data_dir, skip_existing = args
     csv_file = _Path(csv_file_path)
     output_base = _Path(transformed_data_dir) / f"transformed_{csv_file.stem}"
-    output_file = output_base.with_suffix('.csv')
+    output_file = _Path(str(output_base) + '_transformed.csv')
     if output_file.exists() and skip_existing:
         return True, str(output_file), f"Skipping: {output_file.name}"
     import re as _re
@@ -397,7 +412,9 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
             logger.info(f"Downloaded {stats.files_wind_downloaded} wind file(s)")
             return result['downloaded_files']
         else:
-            logger.warning(f"Wind download failed: {result.get('error', 'unknown error')}")
+            error_msg = f"Wind download failed: {result.get('files_failed', '?')} step(s) failed"
+            logger.warning(error_msg)
+            stats.errors.append(error_msg)
             return []
 
     except Exception as e:
@@ -457,6 +474,81 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
 
 
 # ---------------------------------------------------------------------------
+# Step 6: Precipitation download + Zarr build + stage upload
+# ---------------------------------------------------------------------------
+
+def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
+                          tc_data_info: Dict, storm_ids: List[str],
+                          snowflake_conn=None,
+                          max_workers: int = 4) -> List[Dict]:
+    """
+    Step 6: Download tp (total precipitation), build Zarr ZipStore, upload to stage.
+
+    Runs after wind processing. Downloads all 51 members × 25 steps globally
+    (60°S–60°N), builds one ZipStore, and either PUTs it to the Snowflake
+    internal stage or keeps it locally.
+
+    Returns list of metadata dicts for loading into PRECIP_FORECASTS table:
+      [{forecast_time, param, stage_path}]  — one entry per param (zarr is global, not per-storm)
+    """
+    params_to_run = ['tp'] if config.process_precip else []
+
+    if not params_to_run:
+        logger.info('Precipitation processing disabled — skipping')
+        return []
+
+    tc_run_time = tc_data_info.get('run_time')
+    tc_date     = tc_data_info.get('date')
+    tc_forecast_time = tc_data_info.get('forecast_time')
+    if tc_run_time is None or tc_date is None:
+        logger.warning('Cannot determine TC run time/date — skipping precipitation download')
+        return []
+
+    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+    if upload_to_stage and not config.snowflake_stage_name:
+        error_msg = 'SNOWFLAKE_STAGE_NAME required for precipitation stage upload — skipping'
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+    logger.info('=' * 70)
+    logger.info(f'STEP 6: Precipitation download ({", ".join(p.upper() for p in params_to_run)})')
+    logger.info('=' * 70)
+
+    metadata_rows: List[Dict] = []
+
+    for param in params_to_run:
+        result = download_ensemble_precip(
+            param=param,
+            date=tc_date,
+            run_time=tc_run_time,
+            output_dir=str(config.precip_data_dir),
+            snowflake_conn=snowflake_conn if upload_to_stage else None,
+            snowflake_stage_name=config.snowflake_stage_name if upload_to_stage else None,
+            upload_to_stage=upload_to_stage,
+            cleanup_grib=config.cleanup_after_load,
+            max_workers=max_workers,
+            verbose=True,
+        )
+
+        if not result['success']:
+            error_msg = f'Precipitation {param} download/upload failed'
+            logger.error(error_msg)
+            stats.errors.append(error_msg)
+            continue
+
+        # One metadata row per param — the zarr is global (one file per model run)
+        metadata_rows.append({
+            'forecast_time': tc_forecast_time,
+            'param':         param,
+            'stage_path':    result['stage_path'] or str(result['zip_path']),
+        })
+
+    logger.info(f'Precipitation step done — {len(metadata_rows)} metadata rows')
+    return metadata_rows
+
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
@@ -466,6 +558,8 @@ def cleanup_files(config: BasePipelineConfig):
         logger.info("Cleanup skipped (CLEANUP_AFTER_LOAD=false)")
         return
 
+    local_mode = getattr(config, 'data_pipeline_db', 'SNOWFLAKE') == 'LOCAL'
+
     logger.info("Cleaning up temporary files...")
     try:
         removed = 0
@@ -473,13 +567,18 @@ def cleanup_files(config: BasePipelineConfig):
             ("*.bufr4", config.raw_data_dir),
             ("*.bin", config.raw_data_dir),
             ("*.csv", config.raw_data_dir),
-            ("*.csv", config.transformed_data_dir),
+            # In LOCAL mode these CSVs are the final outputs — keep them
+            *([("*.csv", config.transformed_data_dir)] if not local_mode else []),
             ("*.grib2", config.wind_data_dir),
-            ("*.csv", config.wind_extracted_dir),
+            *([("*.csv", config.wind_extracted_dir)] if not local_mode else []),
+            # precip: grib_tmp only — ZipStore is the persistent output, keep it
+            ("*.grib2", config.precip_data_dir / "grib_tmp"),
+            ("*.idx",   config.precip_data_dir / "grib_tmp"),
         ]:
-            for f in directory.glob(pattern):
-                f.unlink()
-                removed += 1
+            if directory.exists():
+                for f in directory.glob(pattern):
+                    f.unlink()
+                    removed += 1
         logger.info(f"Removed {removed} temporary file(s)")
     except Exception as e:
         logger.warning(f"Cleanup failed (non-critical): {e}")

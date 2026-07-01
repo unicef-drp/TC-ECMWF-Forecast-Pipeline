@@ -3,6 +3,7 @@ eccodes>=1.5.0
 
 # ECMWF data access
 ecmwf-opendata>=0.3.29
+requests>=2.28.0  # used by DISS fallback downloader (ecmwf_tc_data_downloader.py)
 
 # Data processing
 pandas>=2.0.0
@@ -15,13 +16,18 @@ shapely>=2.0.0
 # GRIB data processing
 cfgrib>=0.9.10
 
-# Visualization
+# Visualization (notebooks + local development)
 matplotlib>=3.7.0
+cartopy>=0.22.0
+scipy>=1.10.0  # required by cartopy for tile image warping (add_image)
 
 # For Snowflake
 snowflake-connector-python[pandas]>=3.0.0
 cryptography>=41.0.0  # Required for private key authentication
 
-# For Dash web app
-dash>=2.14.0
-plotly>=5.15.0
+# Precipitation Zarr storage (requires Python >=3.11)
+zarr>=3.0.0
+numcodecs>=0.14.0  # zarr 3.x requires >=0.14; older versions cause CompatibilityError
+blosc2>=2.0.0      # required by zarr BloscCodec at write time (not in zarr's own deps)
+
+# Dash web app dependencies live in web/requirements.txt — not needed by the pipeline

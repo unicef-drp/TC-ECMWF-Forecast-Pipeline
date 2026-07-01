@@ -26,6 +26,20 @@ SNOWFLAKE_SCHEMA=your_schema
 # Process wind data (true/false)
 PROCESS_WIND_DATA=true
 
+# Filter to named storms only (true/false, default: true)
+# Set false to include unnamed disturbances (e.g. 70W, 95E)
+NAMED_STORMS_ONLY=true
+
+# Download and upload precipitation Zarr to Snowflake stage (true/false)
+PROCESS_PRECIP=true
+
+# Snowflake internal stage name for precipitation Zarr storage
+# REQUIRED when PROCESS_PRECIP=true and DATA_PIPELINE_DB=SNOWFLAKE
+SNOWFLAKE_STAGE_NAME=your_stage_name
+
+# Local directory for precipitation Zarr files
+PRECIP_DATA_DIR=precip_data
+
 # Clean up temporary files after successful load (true/false)
 CLEANUP_AFTER_LOAD=true
 

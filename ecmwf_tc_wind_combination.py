@@ -289,7 +289,11 @@ def combine_polygons_across_forecast_steps(envelope_records: List[Dict]) -> List
             try:
                 # Combine all polygons using unary_union
                 combined_polygon = unary_union(data['polygons'])
-                
+                # unary_union can return GEOMETRYCOLLECTION when inputs share edges;
+                # buffer(0) normalises it back to a (Multi)Polygon
+                if combined_polygon.geom_type not in ('Polygon', 'MultiPolygon'):
+                    combined_polygon = combined_polygon.buffer(0)
+
                 # Convert back to WKT
                 combined_wkt = polygon_to_wkt(combined_polygon)
                 
@@ -339,14 +343,31 @@ def find_wind_data_files(wind_data_dir: Path) -> List[Path]:
     return wind_files
 
 
+_pool_wind_files: List[Path] = []
+
+
+def _init_process_pool(wind_files: List[Path]) -> None:
+    """ProcessPoolExecutor initializer — stores wind_files in a per-process global."""
+    global _pool_wind_files
+    _pool_wind_files = wind_files
+
+
+def _process_track_point_parallel(args: Tuple) -> Tuple[List[Dict], str]:
+    """Wrapper for parallel execution — reads wind_files from process global."""
+    track_point_dict, bbox, storm_name, index_dir = args
+    return _process_track_point_worker(
+        (track_point_dict, _pool_wind_files, bbox, storm_name, index_dir)
+    )
+
+
 def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
     """
     Worker function to process a single track point (wind file extraction) in parallel.
     Must be top-level function for pickling.
-    
+
     Args:
         args: Tuple of (track_point_dict, wind_files, bbox, storm_name, index_dir)
-    
+
     Returns:
         Tuple of (list of envelope records, log message)
     """
@@ -495,7 +516,7 @@ def process_wind_combination(
     wind_data_dir: Path,
     output_dir: Path,
     buffer_radius_km: int = 500,
-    max_ensemble_members: int = 3,
+    max_ensemble_members: int = None,
     verbose: bool = True,
     use_process_pool: bool = False,
     max_workers: int = 4
@@ -573,7 +594,7 @@ def process_wind_combination(
 
             # Limit ensemble members for faster processing — sort before slicing so
             # the slice is deterministic regardless of CSV row order
-            unique_members = sorted(tc_data['ensemble_member'].unique())[:max_ensemble_members]
+            unique_members = sorted(tc_data['ensemble_member'].unique())[:max_ensemble_members]  # None = all
             filtered_tc_data = tc_data[tc_data['ensemble_member'].isin(unique_members)]
 
             if verbose:
@@ -587,7 +608,11 @@ def process_wind_combination(
             if use_process_pool and len(filtered_tc_data) > 1:
                 logger.info(f"  Processing {len(filtered_tc_data)} track points in parallel with {max_workers} workers")
 
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    initializer=_init_process_pool,
+                    initargs=(wind_files,),
+                ) as executor:
                     # Convert to records once — avoids iterrows DataFrame overhead
                     has_forecast_time = 'forecast_time' in filtered_tc_data.columns
                     track_point_args = [
@@ -598,14 +623,14 @@ def process_wind_combination(
                                 'ensemble_member': row['ensemble_member'],
                                 'forecast_time': row.get('forecast_time') if has_forecast_time else None,
                             },
-                            wind_files, bbox, storm_name, index_dir,
+                            bbox, storm_name, index_dir,
                         )
                         for row in filtered_tc_data.to_dict('records')
                     ]
-                    
-                    # Submit all track points for processing
+
+                    # Submit all track points for processing via the parallel wrapper
                     futures = {
-                        executor.submit(_process_track_point_worker, args): i
+                        executor.submit(_process_track_point_parallel, args): i
                         for i, args in enumerate(track_point_args)
                     }
                     
@@ -732,11 +757,12 @@ def process_wind_combination(
 
                     # Validate member count: warn if any threshold has fewer members than expected
                     actual_members = combined_df['ensemble_member'].nunique()
-                    if actual_members < max_ensemble_members:
-                        missing = max_ensemble_members - actual_members
+                    expected = max_ensemble_members if max_ensemble_members is not None else actual_members
+                    if actual_members < expected:
+                        missing = expected - actual_members
                         logger.warning(
                             f"  Member count mismatch for {storm_name}: "
-                            f"expected {max_ensemble_members}, got {actual_members} "
+                            f"expected {expected}, got {actual_members} "
                             f"({missing} member(s) missing — check GRIB files)"
                         )
 
@@ -745,7 +771,7 @@ def process_wind_combination(
 
                     logger.info(f"✓ Successfully processed {storm_name}")
                     logger.info(f"  - Combined records: {len(combined_records)}")
-                    logger.info(f"  - Members in output: {actual_members}/{max_ensemble_members}")
+                    logger.info(f"  - Members in output: {actual_members}")
                     logger.info(f"  - Combined file: {combined_file.name}")
                 else:
                     logger.warning(f"  No combined polygons created for {storm_name}")

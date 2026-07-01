@@ -2,7 +2,7 @@
 """
 GitHub Actions entry point — sequential pipeline execution with password auth.
 
-Orchestrates steps 1–5 from pipeline_core, then loads the results to Snowflake
+Orchestrates steps 1–7 from pipeline_core, then loads the results to Snowflake
 using the github_actions/snowflake_loader (password-based connection).
 """
 
@@ -25,9 +25,10 @@ from pipeline_core import (
     step3_transform,
     step4_download_wind,
     step5_process_wind,
+    step6_download_precip,
     cleanup_files,
 )
-from snowflake_loader import get_snowflake_connection, load_csv_to_snowflake
+from snowflake_loader import get_snowflake_connection, load_csv_to_snowflake, load_precip_metadata_to_snowflake
 
 # Configure logging
 logging.basicConfig(
@@ -45,17 +46,19 @@ class PipelineConfig(BasePipelineConfig):
     """Configuration for the GitHub Actions pipeline (password auth)."""
 
 
-def step6_load(config: PipelineConfig, stats: PipelineStats,
-               transformed_files: List[Path], envelope_files: List[Path]):
-    """Step 6: Load transformed data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
+def step7_load(config: PipelineConfig, stats: PipelineStats,
+               transformed_files: List[Path], envelope_files: List[Path],
+               precip_metadata: list):
+    """Step 7: Load all data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
     logger.info("=" * 70)
-    logger.info("STEP 6: Loading data...")
+    logger.info("STEP 7: Loading data to Snowflake...")
     logger.info("=" * 70)
 
     if config.data_pipeline_db == 'LOCAL':
         logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        logger.info(f"  Precip ZipStores   : {config.precip_data_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -86,19 +89,27 @@ def step6_load(config: PipelineConfig, stats: PipelineStats,
                     continue
                 total_rows += load_csv_to_snowflake(csv_file, conn, table_type=table_type)
 
+            if precip_metadata:
+                total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
+
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
-            tracks_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_INDIVIDUAL")
-            individual_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
-            combined_count = cursor.fetchone()[0]
-            cursor.close()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
+                tracks_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_INDIVIDUAL")
+                individual_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
+                combined_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM PRECIP_FORECASTS")
+                precip_count = cursor.fetchone()[0]
+            finally:
+                cursor.close()
 
             logger.info("Total records in database:")
             logger.info(f"  TC_TRACKS:                {tracks_count:,}")
             logger.info(f"  TC_ENVELOPES_INDIVIDUAL:  {individual_count:,}")
             logger.info(f"  TC_ENVELOPES_COMBINED:    {combined_count:,}")
+            logger.info(f"  PRECIP_FORECASTS:         {precip_count:,}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -150,6 +161,9 @@ def main():
             sys.exit(0)
 
         csv_files = step2_extract(config, stats, bufr_files)
+        if not csv_files:
+            logger.warning("No named storms found in BUFR data. Exiting.")
+            sys.exit(1 if stats.errors else 0)
         transformed_files = step3_transform(config, stats, csv_files)
 
         tc_data_info = extract_tc_data_info(csv_files)
@@ -157,7 +171,29 @@ def main():
 
         step4_download_wind(config, stats, tc_data_info)
         envelope_files = step5_process_wind(config, stats)
-        step6_load(config, stats, transformed_files, envelope_files)
+
+        storm_ids = [f.stem.split('_storm_')[-1].split('_extracted')[0]
+                     for f in csv_files if '_storm_' in f.stem]
+
+        # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
+        _precip_conn = None
+        if config.data_pipeline_db == 'SNOWFLAKE':
+            os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+            os.environ['SNOWFLAKE_USER'] = config.sf_user
+            os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+            os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+            os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+            os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+            _precip_conn = get_snowflake_connection()
+
+        try:
+            precip_metadata = step6_download_precip(config, stats, tc_data_info, storm_ids,
+                                                     snowflake_conn=_precip_conn)
+        finally:
+            if _precip_conn:
+                _precip_conn.close()
+
+        step7_load(config, stats, transformed_files, envelope_files, precip_metadata)
 
         cleanup_files(config)
         stats.log_summary()

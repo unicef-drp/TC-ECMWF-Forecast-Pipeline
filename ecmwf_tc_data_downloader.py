@@ -129,8 +129,9 @@ def download_tc_data(
     run_time: Optional[str] = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
     named_storms_only: bool = True,
+    skip_existing: bool = True,
     **_kwargs,
-) -> Dict[str, int]:
+) -> Dict:
     """
     Download TC track BUFR files from ECMWF Open Data.
 
@@ -145,9 +146,11 @@ def download_tc_data(
         output_dir: Directory for downloaded files.
         named_storms_only: Passed through for compatibility; actual storm
                            filtering happens in the extractor after download.
+        skip_existing: If False, re-download even if the file already exists
+                       (controlled via SKIP_EXISTING env var in pipeline_core).
 
     Returns:
-        dict with 'downloaded' and 'failed' counts.
+        dict with 'downloaded', 'failed', and 'files' (list of Path objects).
     """
     os.makedirs(output_dir, exist_ok=True)
     client = Client(source="ecmwf")
@@ -157,19 +160,21 @@ def download_tc_data(
 
     if not targets:
         logger.error("No forecast targets resolved — nothing to download")
-        return {'downloaded': 0, 'failed': 0}
+        return {'downloaded': 0, 'failed': 0, 'files': []}
 
     downloaded = 0
     failed = 0
+    files: List[Path] = []
 
     for forecast_date, rt in targets:
         step = _step_for_run_time(rt)
         filename = _output_filename(forecast_date, rt)
         filepath = os.path.join(output_dir, filename)
 
-        if os.path.exists(filepath):
+        if os.path.exists(filepath) and skip_existing:
             logger.info(f"Skipping already downloaded: {filename}")
             downloaded += 1
+            files.append(Path(filepath))
             continue
 
         logger.info(f"Downloading TC tracks: {forecast_date.strftime('%Y-%m-%d')} {rt:02d}Z (step={step}h)")
@@ -207,11 +212,12 @@ def download_tc_data(
 
         if success:
             downloaded += 1
+            files.append(Path(filepath))
         else:
             failed += 1
 
     logger.info(f"TC download complete — downloaded: {downloaded}, failed: {failed}")
-    return {'downloaded': downloaded, 'failed': failed}
+    return {'downloaded': downloaded, 'failed': failed, 'files': files}
 
 
 def _resolve_targets(

@@ -27,14 +27,17 @@ from ecmwf.opendata import Client
 # Configuration
 DEFAULT_OUTPUT_DIR = "wind_data"
 
-# Forecast step configurations - simplified to 0-144h with 6h steps for all run times
+# ENS perturbed (pf) forecast steps — 0–144h for all run times
 FORECAST_STEPS = {
-    0: list(range(0, 145, 6)),
-    # 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144
-    6: list(range(0, 145, 6)),  # Same as 00Z
-    12: list(range(0, 145, 6)),  # Same as 00Z
-    18: list(range(0, 145, 6))  # Same as 00Z
+    0:  list(range(0, 145, 6)),
+    6:  list(range(0, 145, 6)),
+    12: list(range(0, 145, 6)),
+    18: list(range(0, 145, 6)),
 }
+
+# HRES control (stream=oper, type=fc) max step per run time.
+# All run times reach T+144h; 06Z/18Z just don't extend to 360h beyond that.
+CF_MAX_STEP = {0: 144, 6: 144, 12: 144, 18: 144}
 
 
 def get_forecast_steps(run_time: int) -> List[int]:
@@ -179,16 +182,21 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
             'skipped': True
         }
 
+    # Skip steps beyond the HRES horizon for this run time
+    if step > CF_MAX_STEP.get(run_time, 144):
+        return {'success': True, 'step': step, 'type': 'cf', 'filepath': None, 'file_size': 0, 'skipped': True}
+
     try:
         if verbose:
             print(f"  [DOWN] +{step:3d}h CF: Downloading...", end='', flush=True)
 
-        # Download CF (control forecast) data for member 51
+        # Download HRES control forecast (member 51).
+        # stream=enfo type=cf was removed in IFS Cycle 50r1 (May 2026); use stream=oper type=fc.
         client.retrieve(
             date=forecast_date,
             time=run_time,
-            stream="enfo",
-            type="cf",  # Control forecast (member 51)
+            stream="oper",
+            type="fc",
             step=step,
             param=["10u", "10v"],
             target=filepath
@@ -479,8 +487,8 @@ def get_file_info(filepath: str) -> Dict[str, Union[str, int]]:
 
     filename = os.path.basename(filepath)
 
-    # Parse filename
-    pattern = r'wind_ens_(\d{4}-\d{2}-\d{2})_r(\d{2})_f(\d{3})h\.grib2'
+    # Parse filename — matches both _pf.grib2 and _cf.grib2 suffixes
+    pattern = r'wind_ens_(\d{4}-\d{2}-\d{2})_r(\d{2})_f(\d{3})h_(?:pf|cf)\.grib2'
     match = re.match(pattern, filename)
 
     if match:

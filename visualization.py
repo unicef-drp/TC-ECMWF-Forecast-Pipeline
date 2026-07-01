@@ -89,24 +89,47 @@ def plot_polygon_on_map(ax, polygon, color, alpha=0.6, linewidth=1.5):
                 transform=ccrs.PlateCarree())
 
 
-def setup_map(ax, bounds):
-    """Setup map with standard features."""
-    lon_min, lon_max, lat_min, lat_max = bounds
+def _tile_zoom(lon_min, lon_max):
+    """Auto-select tile zoom level from longitude span."""
+    span = lon_max - lon_min
+    if span > 100:
+        return 2
+    elif span > 30:
+        return 3
+    elif span > 10:
+        return 4
+    else:
+        return 5
 
-    # Set map extent
+
+def setup_map(ax, bounds, basemap=True):
+    """Setup map with Carto Positron tile basemap and cartopy features."""
+    import cartopy.io.img_tiles as cimgt
+
+    lon_min, lon_max, lat_min, lat_max = bounds
     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-    # Add map features
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, alpha=0.8)
-    ax.add_feature(cfeature.BORDERS, linewidth=0.5, alpha=0.6)
-    ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.2)
-    ax.add_feature(cfeature.LAND, color='lightgray', alpha=0.2)
+    # Tile basemap (Carto Positron)
+    if basemap:
+        class _Positron(cimgt.GoogleWTS):
+            def _image_url(self, tile):
+                x, y, z = tile
+                return f'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'
+        try:
+            ax.add_image(_Positron(), _tile_zoom(lon_min, lon_max))
+        except Exception:
+            ax.add_feature(cfeature.OCEAN, color='#d0e8f5', alpha=1.0)
+            ax.add_feature(cfeature.LAND,  color='#f0ede8', alpha=1.0)
 
-    # Add gridlines
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.6, alpha=0.7, zorder=3)
+    ax.add_feature(cfeature.BORDERS,   linewidth=0.4, alpha=0.5, zorder=3)
+
     gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
-                      linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+                      linewidth=0.4, color='gray', alpha=0.4, linestyle='--')
     gl.top_labels = False
     gl.right_labels = False
+    if hasattr(gl, 'geo_labels'):
+        gl.geo_labels = False
 
 
 def visualize_tc_tracks(csv_file, output_dir=DEFAULT_OUTPUT_DIR, show_plot=True, save_plot=False):
@@ -288,21 +311,20 @@ def visualize_tracks_with_wind_polygons(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     plt.title(f"Tropical Cyclone {storm_name} - Tracks with Wind Polygons\nForecast: {forecast_time}",
               fontsize=16, fontweight='bold', pad=20)
 
-    # Add track legend
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    # Add track legend — store it before creating the threshold legend, which would replace it
+    track_legend = ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
 
-    # Add threshold legend - only show available thresholds (outside the map)
+    # Add threshold legend outside the map (second ax.legend() call replaces the first,
+    # so we re-add the track legend as an artist afterwards)
     if available_thresholds:
         legend_patches = []
         for threshold in sorted(available_thresholds):
             legend_patches.append(plt.Rectangle((0, 0), 1, 1,
                                                 facecolor=THRESHOLD_COLORS[threshold],
                                                 label=f'{threshold} kt'))
-
-        # Create a separate legend outside the map
-        legend = ax.legend(handles=legend_patches, loc='center left', fontsize=8,
-                           framealpha=0.9, title='Wind Thresholds', bbox_to_anchor=(1.05, 0.5))
-        legend.set_bbox_to_anchor((1.05, 0.5))
+        ax.legend(handles=legend_patches, loc='center left', fontsize=8,
+                  framealpha=0.9, title='Wind Thresholds', bbox_to_anchor=(1.05, 0.5))
+        ax.add_artist(track_legend)  # restore track legend after second ax.legend() replaced it
 
     # Save and show
     filepath = None
@@ -632,3 +654,379 @@ def show_individual_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR, member=1)
 def show_combined_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR):
     """Quick function to show combined wind envelopes."""
     return visualize_combined_wind_envelopes(csv_file, output_dir, show_plot=True, save_plot=False)
+
+
+# ─── Precipitation Visualizations ───────────────────────────────────────────
+
+def _load_precip_zarr(zarr_path):
+    """Load precip Zarr ZipStore, return data array + coordinate metadata."""
+    import zarr as _zarr
+    store = _zarr.storage.ZipStore(str(zarr_path), mode='r')
+    try:
+        root = _zarr.open_group(store=store, mode='r')
+        z = root['data']
+        attrs = dict(root.attrs)
+        n_lat, n_lon = z.shape[2], z.shape[3]
+        # Zarr rows run N→S (row 0 = lat_max). Build descending lat array to match.
+        lats = np.linspace(attrs['lat_max'], attrs['lat_min'], n_lat)
+        lons = np.linspace(attrs['lon_min'], attrs['lon_max'], n_lon)
+        # Load data eagerly so the store can be closed immediately
+        data = np.asarray(z)
+    finally:
+        store.close()
+    return {
+        'data': data,                         # shape (51, 25, n_lat, n_lon) float16
+        'lats': lats,
+        'lons': lons,
+        'steps': attrs['steps'],              # [0, 6, 12, ..., 144]
+        'member_numbers': attrs.get('member_numbers', list(range(1, 52))),
+        'forecast_date': attrs.get('forecast_date', ''),
+        'run_time': int(attrs.get('run_time', 0)),
+    }
+
+
+def _precip_bounds_from_track(track_csv, padding=5.0):
+    """Return (lon_min, lon_max, lat_min, lat_max) from TC track CSV."""
+    return get_bounds_from_data(pd.read_csv(track_csv), padding=padding)
+
+
+def _step_index(steps, hour):
+    """Return Zarr step-axis index for a given forecast hour."""
+    arr = np.array(steps)
+    hits = np.where(arr == hour)[0]
+    if not len(hits):
+        raise ValueError(f"Hour {hour} not in available steps {steps}")
+    return int(hits[0])
+
+
+def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
+                                   output_dir=DEFAULT_OUTPUT_DIR,
+                                   show_plot=True, save_plot=False):
+    """
+    Map of ensemble mean accumulated precipitation at a given forecast hour.
+
+    Args:
+        zarr_path:  Path to tp_YYYYMMDD_HH.zarr.zip
+        step_h:     Accumulated-total forecast hour shown (0–144, multiple of 6)
+        track_csv:  Optional TC track CSV for spatial extent + overlay
+        output_dir: Directory for saved PNG
+        show_plot:  Display interactively
+        save_plot:  Save PNG to output_dir
+    """
+    print("=" * 60)
+    print("PRECIPITATION — ENSEMBLE MEAN")
+    print("=" * 60)
+
+    p = _load_precip_zarr(zarr_path)
+    sidx = _step_index(p['steps'], step_h)
+
+    # (51, lat, lon) → ensemble mean (lat, lon)
+    arr = np.asarray(p['data'][:, sidx, :, :]).astype(np.float32)
+    mean_arr = arr.mean(axis=0)
+
+    if track_csv:
+        bounds = _precip_bounds_from_track(track_csv)
+        df_track = pd.read_csv(track_csv)
+        storm_name = df_track['track_id'].iloc[0] if 'track_id' in df_track.columns else ''
+    else:
+        bounds = (float(p['lons'][0]), float(p['lons'][-1]),
+                  float(p['lats'][-1]), float(p['lats'][0]))  # lats is N→S, so [-1]=S [0]=N
+        df_track = None
+        storm_name = ''
+
+    lon_min, lon_max, lat_min, lat_max = bounds
+    lat_idx = np.where((p['lats'] >= lat_min) & (p['lats'] <= lat_max))[0]
+    lon_idx = np.where((p['lons'] >= lon_min) & (p['lons'] <= lon_max))[0]
+    plot_lons = p['lons'][lon_idx]
+    plot_lats = p['lats'][lat_idx]
+    plot_data = mean_arr[np.ix_(lat_idx, lon_idx)]
+    vmax = max(float(np.percentile(plot_data, 99)), 1.0)
+    vmin_precip = 0.5  # cells below 0.5 mm are transparent (show basemap)
+
+    print(f"  Step: {step_h}h  |  Ensemble max mean: {plot_data.max():.1f}mm")
+
+    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    setup_map(ax, bounds)
+
+    _cmap = plt.cm.Blues.copy()
+    _cmap.set_under('none')
+    mesh = ax.pcolormesh(plot_lons, plot_lats, plot_data,
+                         cmap=_cmap, vmin=vmin_precip, vmax=vmax,
+                         transform=ccrs.PlateCarree(), zorder=2)
+    plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
+                 label='Accumulated precipitation (mm)', shrink=0.8)
+
+    if df_track is not None:
+        for member in sorted(df_track['ensemble_member'].unique()):
+            mdf = df_track[df_track['ensemble_member'] == member].sort_values('lead_time')
+            ax.plot(mdf['longitude'], mdf['latitude'],
+                    color='orange', linewidth=0.8, alpha=0.4,
+                    transform=ccrs.PlateCarree())
+        hres = df_track[df_track['ensemble_member'] == 51].sort_values('lead_time')
+        if not hres.empty:
+            ax.plot(hres['longitude'], hres['latitude'],
+                    color='red', linewidth=2.5, alpha=0.95,
+                    transform=ccrs.PlateCarree(), label='HRES (member 51)', zorder=5)
+        ax.legend(loc='upper right', fontsize=9)
+
+    title = f"Ensemble Mean Accumulated Precipitation — {step_h}h"
+    if storm_name:
+        title = f"{storm_name} — {title}"
+    title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
+    plt.title(title, fontsize=14, fontweight='bold', pad=15)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        tag = f"{storm_name}_" if storm_name else ''
+        filepath = Path(output_dir) / f"{tag}precip_mean_{step_h}h.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
+                                   output_dir=DEFAULT_OUTPUT_DIR,
+                                   show_plot=True, save_plot=False):
+    """
+    4-panel map of ensemble mean period precipitation (default: 0-24h, 24-48h, 48-72h, 72-144h).
+
+    Args:
+        zarr_path:  Path to tp_YYYYMMDD_HH.zarr.zip
+        track_csv:  Optional TC track CSV for spatial extent + overlay
+        periods:    List of (start_h, end_h) pairs. Defaults to [(0,24),(24,48),(48,72),(72,144)]
+        output_dir: Directory for saved PNG
+        show_plot:  Display interactively
+        save_plot:  Save PNG to output_dir
+    """
+    print("=" * 60)
+    print("PRECIPITATION — PERIOD ACCUMULATION PANELS")
+    print("=" * 60)
+
+    if periods is None:
+        periods = [(0, 24), (24, 48), (48, 72), (72, 144)]
+
+    p = _load_precip_zarr(zarr_path)
+
+    if track_csv:
+        bounds = _precip_bounds_from_track(track_csv)
+        df_track = pd.read_csv(track_csv)
+        storm_name = df_track['track_id'].iloc[0] if 'track_id' in df_track.columns else ''
+    else:
+        bounds = (float(p['lons'][0]), float(p['lons'][-1]),
+                  float(p['lats'][-1]), float(p['lats'][0]))  # lats is N→S, so [-1]=S [0]=N
+        df_track = None
+        storm_name = ''
+
+    lon_min, lon_max, lat_min, lat_max = bounds
+    lat_idx = np.where((p['lats'] >= lat_min) & (p['lats'] <= lat_max))[0]
+    lon_idx = np.where((p['lons'] >= lon_min) & (p['lons'] <= lon_max))[0]
+    plot_lons = p['lons'][lon_idx]
+    plot_lats = p['lats'][lat_idx]
+
+    # Pre-load accumulated data at each period boundary
+    needed_hours = sorted({h for pair in periods for h in pair})
+    step_data = {}
+    for h in needed_hours:
+        sidx = _step_index(p['steps'], h)
+        step_data[h] = np.asarray(p['data'][:, sidx, :, :]).astype(np.float32)  # (51, lat, lon)
+
+    period_means = []
+    for start_h, end_h in periods:
+        delta = step_data[end_h] - step_data[start_h]
+        mean = delta.mean(axis=0)
+        period_means.append(mean[np.ix_(lat_idx, lon_idx)])
+
+    vmax = max(max(float(np.percentile(pm, 99)) for pm in period_means), 1.0)
+    vmin_precip = 0.5
+    _cmap = plt.cm.Blues.copy()
+    _cmap.set_under('none')
+
+    n = len(periods)
+    n_cols = min(2, n)
+    n_rows = (n + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(n_cols * 7, n_rows * 5),
+                             subplot_kw={'projection': ccrs.PlateCarree()})
+    axes = np.array(axes).flatten()
+
+    meshes = []
+    for i, (start_h, end_h) in enumerate(periods):
+        ax = axes[i]
+        setup_map(ax, bounds)
+
+        mesh = ax.pcolormesh(plot_lons, plot_lats, period_means[i],
+                             cmap=_cmap, vmin=vmin_precip, vmax=vmax,
+                             transform=ccrs.PlateCarree(), zorder=2)
+        meshes.append(mesh)
+
+        if df_track is not None:
+            period_track = df_track[
+                (df_track['lead_time'] >= start_h) & (df_track['lead_time'] <= end_h)
+            ]
+            for member in sorted(period_track['ensemble_member'].unique()):
+                mdf = period_track[period_track['ensemble_member'] == member].sort_values('lead_time')
+                ax.plot(mdf['longitude'], mdf['latitude'],
+                        color='orange', linewidth=0.8, alpha=0.35,
+                        transform=ccrs.PlateCarree())
+            hres_p = period_track[period_track['ensemble_member'] == 51].sort_values('lead_time')
+            if not hres_p.empty:
+                ax.plot(hres_p['longitude'], hres_p['latitude'],
+                        color='red', linewidth=2.5, alpha=0.95,
+                        transform=ccrs.PlateCarree(), zorder=5)
+
+        ax.set_title(f"{start_h}–{end_h}h period  (max {period_means[i].max():.1f}mm)",
+                     fontsize=11, fontweight='bold')
+        print(f"  {start_h:>3d}–{end_h:>3d}h: max {period_means[i].max():.1f}mm")
+
+    for i in range(n, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.subplots_adjust(right=0.87)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+    fig.colorbar(meshes[0], cax=cbar_ax, label='Period accumulation (mm)')
+
+    title = 'Ensemble Mean Period Precipitation'
+    if storm_name:
+        title = f"{storm_name} — {title}"
+    title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        tag = f"{storm_name}_" if storm_name else ''
+        filepath = Path(output_dir) / f"{tag}precip_period_panels.png"
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv=None,
+                                output_dir=DEFAULT_OUTPUT_DIR,
+                                show_plot=True, save_plot=False):
+    """
+    Probability map: fraction of ensemble members that accumulate > threshold_mm by step_h.
+
+    Args:
+        zarr_path:      Path to tp_YYYYMMDD_HH.zarr.zip
+        threshold_mm:   Precipitation threshold in mm
+        step_h:         Forecast hour for the accumulated total (0–144)
+        track_csv:      Optional TC track CSV for spatial extent + overlay
+        output_dir:     Directory for saved PNG
+        show_plot:      Display interactively
+        save_plot:      Save PNG to output_dir
+    """
+    print("=" * 60)
+    print(f"PRECIPITATION — EXCEEDANCE PROBABILITY (>{threshold_mm}mm by {step_h}h)")
+    print("=" * 60)
+
+    p = _load_precip_zarr(zarr_path)
+    sidx = _step_index(p['steps'], step_h)
+
+    arr = np.asarray(p['data'][:, sidx, :, :]).astype(np.float32)    # (51, lat, lon)
+    exceed_pct = (arr > threshold_mm).mean(axis=0) * 100              # (lat, lon) 0–100%
+
+    if track_csv:
+        bounds = _precip_bounds_from_track(track_csv)
+        df_track = pd.read_csv(track_csv)
+        storm_name = df_track['track_id'].iloc[0] if 'track_id' in df_track.columns else ''
+    else:
+        bounds = (float(p['lons'][0]), float(p['lons'][-1]),
+                  float(p['lats'][-1]), float(p['lats'][0]))  # lats is N→S, so [-1]=S [0]=N
+        df_track = None
+        storm_name = ''
+
+    lon_min, lon_max, lat_min, lat_max = bounds
+    lat_idx = np.where((p['lats'] >= lat_min) & (p['lats'] <= lat_max))[0]
+    lon_idx = np.where((p['lons'] >= lon_min) & (p['lons'] <= lon_max))[0]
+    plot_lons = p['lons'][lon_idx]
+    plot_lats = p['lats'][lat_idx]
+    plot_data = exceed_pct[np.ix_(lat_idx, lon_idx)]
+
+    print(f"  Max exceedance probability : {plot_data.max():.1f}%")
+    print(f"  Grid cells with P > 50%   : {(plot_data > 50).sum()}")
+
+    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    setup_map(ax, bounds)
+
+    _cmap_ex = plt.cm.YlOrRd.copy()
+    _cmap_ex.set_under('none')
+    mesh = ax.pcolormesh(plot_lons, plot_lats, plot_data,
+                         cmap=_cmap_ex, vmin=1, vmax=100,
+                         transform=ccrs.PlateCarree(), zorder=2)
+    plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
+                 label=f'P(accumulated tp > {threshold_mm}mm by {step_h}h)  [%]',
+                 shrink=0.8)
+
+    if df_track is not None:
+        for member in sorted(df_track['ensemble_member'].unique()):
+            mdf = df_track[df_track['ensemble_member'] == member].sort_values('lead_time')
+            ax.plot(mdf['longitude'], mdf['latitude'],
+                    color='black', linewidth=0.6, alpha=0.25,
+                    transform=ccrs.PlateCarree())
+        hres = df_track[df_track['ensemble_member'] == 51].sort_values('lead_time')
+        if not hres.empty:
+            ax.plot(hres['longitude'], hres['latitude'],
+                    color='blue', linewidth=2.5, alpha=0.95,
+                    transform=ccrs.PlateCarree(), label='HRES (member 51)', zorder=5)
+        ax.legend(loc='upper right', fontsize=9)
+
+    title = f"Exceedance Probability: >{threshold_mm}mm by {step_h}h"
+    if storm_name:
+        title = f"{storm_name} — {title}"
+    title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
+    plt.title(title, fontsize=14, fontweight='bold', pad=15)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        tag = f"{storm_name}_" if storm_name else ''
+        filepath = Path(output_dir) / f"{tag}precip_exceedance_{threshold_mm}mm_{step_h}h.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None):
+    """Quick function to show ensemble mean accumulated precipitation map."""
+    return visualize_precip_ensemble_mean(zarr_path, step_h=step_h, track_csv=track_csv,
+                                          show_plot=True, save_plot=False)
+
+
+def show_precip_period_panels(zarr_path, track_csv=None, periods=None):
+    """Quick function to show ensemble mean period accumulation panels."""
+    return visualize_precip_period_panels(zarr_path, track_csv=track_csv, periods=periods,
+                                          show_plot=True, save_plot=False)
+
+
+def show_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv=None):
+    """Quick function to show exceedance probability map."""
+    return visualize_precip_exceedance(zarr_path, threshold_mm=threshold_mm,
+                                       step_h=step_h, track_csv=track_csv,
+                                       show_plot=True, save_plot=False)

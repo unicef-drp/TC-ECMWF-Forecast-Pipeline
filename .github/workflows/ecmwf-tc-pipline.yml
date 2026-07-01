@@ -35,33 +35,33 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements-ci.txt'
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libeccodes0 \
-            libeccodes-dev \
-            libeccodes-tools \
-            libhdf5-dev \
-            libnetcdf-dev \
-            pkg-config \
-            libfreetype6-dev \
-            libpng-dev
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: >-
+            libeccodes0
+            libeccodes-dev
+            libeccodes-tools
+            libhdf5-dev
+            libnetcdf-dev
+            pkg-config
+          version: 1.0
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          pip install -r requirements-ci.txt
           echo "=== Checking critical packages ==="
-          pip list | grep -E "(xarray|matplotlib|cfgrib|ecmwf)" || echo "Some packages missing!"
-          echo "=== Installing missing packages individually ==="
-          pip install --no-cache-dir xarray matplotlib cfgrib
+          pip list | grep -E "(xarray|cfgrib|ecmwf|zarr)" || echo "Some packages missing!"
 
       - name: Create directories
         run: |
           mkdir -p tc_data
           mkdir -p tc_data_transformed
+          mkdir -p precip_data/grib_tmp
 
       - name: Run TC Forecast Pipeline
         env:
@@ -80,6 +80,13 @@ jobs:
           PROCESS_WIND_DATA: 'true'
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
           SKIP_EXISTING: 'false'  # Always process new data in CI
+
+          # Precipitation processing (total precipitation - tp)
+          PROCESS_PRECIP: 'true'
+          PRECIP_DATA_DIR: 'precip_data'
+          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+          # Headless matplotlib (no display available in CI)
+          MPLBACKEND: 'Agg'
         run: |
           python github_actions/main.py
 
@@ -90,7 +97,6 @@ jobs:
           name: pipeline-logs-${{ github.run_number }}
           path: |
             pipeline.log
-            tc_data/verification.json
           retention-days: 30
 
       - name: Upload artifacts (if pipeline fails)

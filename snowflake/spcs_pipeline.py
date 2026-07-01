@@ -49,9 +49,10 @@ from pipeline_core import (
     step3_transform,
     step4_download_wind,
     step5_process_wind,
+    step6_download_precip,
     cleanup_files,
 )
-from snowflake.snowflake_loader import get_snowflake_connection, load_csv_to_snowflake
+from snowflake.snowflake_loader import get_snowflake_connection, load_csv_to_snowflake, load_precip_metadata_to_snowflake
 
 # Configure logging
 logging.basicConfig(
@@ -118,6 +119,12 @@ class PipelineConfig(BasePipelineConfig):
             if not Path(self.spcs_token_path).is_file():
                 logger.error(f"SPCS token file not found: {self.spcs_token_path}")
                 return False
+            if not os.getenv('SNOWFLAKE_HOST'):
+                logger.error("Missing required environment variable for SPCS mode: SNOWFLAKE_HOST")
+                return False
+            if not os.getenv('SNOWFLAKE_PORT'):
+                logger.error("Missing required environment variable for SPCS mode: SNOWFLAKE_PORT")
+                return False
         else:
             if not self.sf_user:
                 logger.error("Missing required environment variable: SNOWFLAKE_USER")
@@ -128,6 +135,13 @@ class PipelineConfig(BasePipelineConfig):
             if self.sf_private_key_path and not Path(self.sf_private_key_path).is_file():
                 logger.error(f"Private key file not found: {self.sf_private_key_path}")
                 return False
+
+        if self.process_precip and not self.snowflake_stage_name:
+            logger.error(
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_PRECIP=true and "
+                "DATA_PIPELINE_DB=SNOWFLAKE. Add it to the SPCS service spec."
+            )
+            return False
 
         return self._validate_run_time()
 
@@ -182,9 +196,40 @@ class PipelineStats(_BasePipelineStats):
 # Pipeline phases
 # ---------------------------------------------------------------------------
 
+def _open_snowflake_conn(config: PipelineConfig):
+    """Open a Snowflake connection using the auth mode active in config."""
+    os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+    os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
+    os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+    os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+    os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+
+    if config.spcs_run:
+        os.environ['SPCS_RUN'] = 'true'
+        os.environ['SPCS_TOKEN_PATH'] = config.spcs_token_path
+        for key in ('SNOWFLAKE_PASSWORD', 'SNOWFLAKE_PRIVATE_KEY_PATH',
+                    'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
+            os.environ.pop(key, None)
+        logger.info("Connecting with SPCS OAuth authentication")
+    elif config.sf_private_key_path:
+        os.environ['SNOWFLAKE_PRIVATE_KEY_PATH'] = config.sf_private_key_path
+        if config.sf_private_key_passphrase:
+            os.environ['SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'] = config.sf_private_key_passphrase
+        os.environ.pop('SNOWFLAKE_PASSWORD', None)
+        logger.info(f"Connecting with private key: {config.sf_private_key_path}")
+    else:
+        os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+        for key in ('SNOWFLAKE_PRIVATE_KEY_PATH', 'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
+            os.environ.pop(key, None)
+        logger.info("Connecting with password authentication")
+
+    return get_snowflake_connection()
+
+
 def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                               transformed_files: List[Path],
-                              envelope_files: List[Path]):
+                              envelope_files: List[Path],
+                              precip_metadata: list = None):
     """Phase 4: Load all results to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
     logger.info("=" * 70)
     logger.info("PHASE 4: SNOWFLAKE LOADING")
@@ -195,6 +240,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        logger.info(f"  Precip ZipStores   : {config.precip_data_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -203,39 +249,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         return
 
     try:
-        os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
-        os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
-        os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
-        os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
-        os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
-
-        if config.spcs_run:
-            os.environ['SPCS_RUN'] = 'true'
-            os.environ['SPCS_TOKEN_PATH'] = config.spcs_token_path
-            for key in ('SNOWFLAKE_PASSWORD', 'SNOWFLAKE_PRIVATE_KEY_PATH',
-                        'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
-                os.environ.pop(key, None)
-            logger.info("Connecting with SPCS OAuth authentication")
-        elif config.sf_private_key_path:
-            os.environ['SNOWFLAKE_PRIVATE_KEY_PATH'] = config.sf_private_key_path
-            if config.sf_private_key_passphrase:
-                os.environ['SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'] = config.sf_private_key_passphrase
-            os.environ.pop('SNOWFLAKE_PASSWORD', None)
-            logger.info(f"Connecting with private key: {config.sf_private_key_path}")
-        else:
-            os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
-            for key in ('SNOWFLAKE_PRIVATE_KEY_PATH', 'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
-                os.environ.pop(key, None)
-            logger.info("Connecting with password authentication")
-
-        conn = get_snowflake_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(f"USE WAREHOUSE {config.sf_warehouse}")
-            cursor.execute(f"USE DATABASE {config.sf_database}")
-            cursor.execute(f"USE SCHEMA {config.sf_schema}")
-        finally:
-            cursor.close()
+        conn = _open_snowflake_conn(config)
 
         def _set_context():
             c = conn.cursor()
@@ -247,6 +261,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 c.close()
 
         try:
+            _set_context()  # initial context — inside try/finally: conn.close()
             total_rows = 0
             for csv_file in transformed_files:
                 _set_context()
@@ -263,6 +278,10 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                     continue
                 total_rows += load_csv_to_snowflake(csv_file, conn, table_type=table_type)
 
+            if precip_metadata:
+                _set_context()
+                total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
+
             cursor = conn.cursor()
             try:
                 _set_context()
@@ -272,6 +291,8 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 individual_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
                 combined_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM PRECIP_FORECASTS")
+                precip_count = cursor.fetchone()[0]
             finally:
                 cursor.close()
 
@@ -279,6 +300,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
             logger.info(f"  TC_TRACKS:                {tracks_count:,}")
             logger.info(f"  TC_ENVELOPES_INDIVIDUAL:  {individual_count:,}")
             logger.info(f"  TC_ENVELOPES_COMBINED:    {combined_count:,}")
+            logger.info(f"  PRECIP_FORECASTS:         {precip_count:,}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -349,7 +371,7 @@ def main():
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
             logger.warning("No per-storm CSVs extracted. Exiting.")
-            sys.exit(0)
+            sys.exit(1 if stats.errors else 0)
 
         tc_data_info = extract_tc_data_info(csv_files)
         stats.log_phase_time("Phase 1: Download & Extract", (datetime.now() - phase_start).total_seconds())
@@ -370,9 +392,27 @@ def main():
             use_process_pool=config.use_process_pool,
             max_workers=config.max_workers,
         )
-        stats.log_phase_time("Phase 3: Wind & Envelopes", (datetime.now() - phase_start).total_seconds())
+        storm_ids = [f.stem.split('_storm_')[-1].split('_extracted')[0]
+                     for f in csv_files if '_storm_' in f.stem]
 
-        phase4_snowflake_loading(config, stats, transformed_files, envelope_files)
+        # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
+        _precip_conn = None
+        if config.data_pipeline_db == 'SNOWFLAKE':
+            _precip_conn = _open_snowflake_conn(config)
+
+        try:
+            precip_metadata = step6_download_precip(
+                config, stats, tc_data_info, storm_ids,
+                snowflake_conn=_precip_conn,
+                max_workers=config.max_concurrent_downloads,
+            )
+        finally:
+            if _precip_conn:
+                _precip_conn.close()
+
+        stats.log_phase_time("Phase 3: Wind, Envelopes & Precip", (datetime.now() - phase_start).total_seconds())
+
+        phase4_snowflake_loading(config, stats, transformed_files, envelope_files, precip_metadata)
 
         cleanup_files(config)
         stats.log_summary()

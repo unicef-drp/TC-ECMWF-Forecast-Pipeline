@@ -180,41 +180,43 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
     else:
         ds = xr.open_dataset(grib_file, engine='cfgrib')
 
-    # Extract u and v components
-    u10 = ds['u10']
-    v10 = ds['v10']
-
-    # Compute wind speed
-    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
-
     # Select specific ensemble member, mapping control member 51 to GRIB number 0
-    if 'number' in wind_speed.dims:
-        desired_number = 0 if member_number == 51 else member_number
+    try:
+        # Extract u and v components (inside try so ds.close() fires on KeyError etc.)
+        u10 = ds['u10']
+        v10 = ds['v10']
+        wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+        if 'number' in wind_speed.dims:
+            desired_number = 0 if member_number == 51 else member_number
+            if verbose:
+                print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
+            try:
+                wind_speed = wind_speed.sel(number=desired_number)
+            except Exception as e:
+                logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data: {e}")
+                return xr.DataArray()  # outer finally: ds.close() still fires
+        else:
+            if verbose:
+                print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
+
+        # Subset to bounding box
+        wind_region = wind_speed.sel(
+            latitude=slice(bbox['lat_max'], bbox['lat_min']),
+            longitude=slice(bbox['lon_min'], bbox['lon_max'])
+        )
+
         if verbose:
-            print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
-        try:
-            wind_speed = wind_speed.sel(number=desired_number)
-        except Exception as e:
-            logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data; proceeding without selection: {e}")
-    else:
-        if verbose:
-            print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
+            print(f"    Wind data shape: {wind_region.shape}")
+            try:
+                max_ms = float(wind_region.max())
+                print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
+            except Exception:
+                pass
 
-    # Subset to bounding box
-    wind_region = wind_speed.sel(
-        latitude=slice(bbox['lat_max'], bbox['lat_min']),
-        longitude=slice(bbox['lon_min'], bbox['lon_max'])
-    )
-
-    if verbose:
-        print(f"    Wind data shape: {wind_region.shape}")
-        try:
-            max_ms = float(wind_region.max())
-            print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
-        except Exception:
-            pass
-
-    return wind_region
+        wind_region.load()  # materialise into RAM before closing the file handle
+        return wind_region
+    finally:
+        ds.close()
 
 
 def load_wind_data_all_members(
@@ -239,12 +241,16 @@ def load_wind_data_all_members(
     else:
         ds = xr.open_dataset(grib_file, engine='cfgrib')
 
-    wind_speed = np.sqrt(ds['u10'] ** 2 + ds['v10'] ** 2)
-
-    return wind_speed.sel(
-        latitude=slice(bbox['lat_max'], bbox['lat_min']),
-        longitude=slice(bbox['lon_min'], bbox['lon_max']),
-    )
+    try:
+        wind_speed = np.sqrt(ds['u10'] ** 2 + ds['v10'] ** 2)
+        wind_region = wind_speed.sel(
+            latitude=slice(bbox['lat_max'], bbox['lat_min']),
+            longitude=slice(bbox['lon_min'], bbox['lon_max']),
+        )
+        wind_region.load()  # materialise into RAM before closing the file handle
+        return wind_region
+    finally:
+        ds.close()
 
 
 def create_wind_threshold_contours(wind_data: xr.DataArray,
@@ -291,8 +297,17 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
         polygons = []
         try:
-            if i < len(cs.allsegs) and len(cs.allsegs[i]) > 0:
-                for segment in cs.allsegs[i]:
+            # cs.allsegs is the stable per-level segments API (confirmed matplotlib 3.11).
+            # cs.collections was removed in matplotlib 3.9 and must not be used.
+            # If allsegs is ever removed, fall back to contourpy (bundled with matplotlib).
+            try:
+                level_segs = cs.allsegs[i] if i < len(cs.allsegs) else []
+            except AttributeError:
+                from contourpy import contour_generator
+                gen = contour_generator(x=lons, y=lats, z=winds)
+                level_segs = gen.lines(threshold_ms) or []
+            if len(level_segs) > 0:
+                for segment in level_segs:
                     if len(segment) > 3:
                         try:
                             poly = Polygon(segment)
@@ -309,6 +324,10 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
         if polygons:
             combined = unary_union(polygons)
+            # unary_union can return GEOMETRYCOLLECTION when inputs share edges;
+            # buffer(0) normalises it back to a (Multi)Polygon
+            if combined.geom_type not in ('Polygon', 'MultiPolygon'):
+                combined = combined.buffer(0)
             contour_polygons[threshold_kt] = combined
             if verbose:
                 area_km2 = combined.area * 111 * 104
@@ -468,23 +487,24 @@ def extract_multiple_storms(
     try:
         # Open wind dataset once
         wind_ds = xr.open_dataset(wind_grib, engine='cfgrib')
-        u10 = wind_ds['u10']
-        v10 = wind_ds['v10']
-        
-        if verbose:
-            print(f"  Wind data loaded: {wind_ds.dims}")
-            print(f"  Available ensemble members: {wind_ds.number.values if 'number' in wind_ds.dims else 'N/A'}")
-            
     except Exception as e:
         if verbose:
             print(f"   Error loading wind data: {e}")
         return {'success': False, 'error': f'Failed to load wind data: {e}'}
-    
-    # Process each storm
+
+    # Process each storm — wind_ds.close() in finally covers u10/v10 extraction too
     all_envelope_records = []
     storm_summaries = {}
-    
-    for i, storm_config in enumerate(storm_configs):
+
+    try:
+      u10 = wind_ds['u10']
+      v10 = wind_ds['v10']
+
+      if verbose:
+          print(f"  Wind data loaded: {wind_ds.dims}")
+          print(f"  Available ensemble members: {wind_ds.number.values if 'number' in wind_ds.dims else 'N/A'}")
+
+      for i, storm_config in enumerate(storm_configs):
         track_csv = storm_config['track_csv']
         storm_name = storm_config.get('storm_name', f'STORM_{i+1}')
         
@@ -530,12 +550,19 @@ def extract_multiple_storms(
                     # Extract wind data for this member and region (reuse loaded data)
                     wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
                     
-                    # Select specific ensemble member
+                    # Select specific ensemble member; member 51 = HRES control stored as number=0
                     if 'number' in wind_speed.dims:
-                        member_wind_data = wind_speed.sel(number=member)
+                        grib_number = 0 if member == 51 else member
+                        member_wind_data = wind_speed.sel(number=grib_number)
+                    elif member == 51:
+                        # CF GRIB file (single-member HRES) has no number dim — use directly
+                        logger.warning(
+                            f"  Member 51 (HRES): no 'number' dim in wind file — using data directly"
+                        )
+                        member_wind_data = wind_speed
                     else:
                         if verbose:
-                            print("  No ensemble dimension")
+                            print(f"  No ensemble dimension for member {member} — skipping")
                         continue
                     
                     # Subset to bounding box
@@ -611,8 +638,8 @@ def extract_multiple_storms(
                 'error': str(e)
             }
     
-    # Close wind dataset
-    wind_ds.close()
+    finally:
+        wind_ds.close()
     
     # Overall summary
     if verbose:

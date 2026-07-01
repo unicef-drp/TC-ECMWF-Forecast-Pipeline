@@ -278,10 +278,11 @@ def create_wind_field_polygons(forecasts_df: pd.DataFrame, wind_threshold: int =
 
     # Create wind field polygons using apply (avoids iterrows overhead)
     def _make_polygon(row):
-        r_ne = row[radius_cols[0]] or 0
-        r_se = row[radius_cols[1]] or 0
-        r_sw = row[radius_cols[2]] or 0
-        r_nw = row[radius_cols[3]] or 0
+        _z = lambda v: 0.0 if pd.isna(v) else v
+        r_ne = _z(row[radius_cols[0]])
+        r_se = _z(row[radius_cols[1]])
+        r_sw = _z(row[radius_cols[2]])
+        r_nw = _z(row[radius_cols[3]])
         if any([r_ne, r_se, r_sw, r_nw]):
             return wind_quadrant_polygon(row['latitude'], row['longitude'], r_ne, r_se, r_sw, r_nw)
         return None
@@ -640,13 +641,13 @@ def transform_all_in_directory(input_dir: str,
 
     for csv_file in csv_files:
         try:
-            # Generate output filename
-            output_file = output_path / f"transformed_{csv_file.name}"
+            # Generate output base (no extension) — transform_tc_data appends _transformed.csv
+            output_base = output_path / csv_file.stem
 
             # Transform
-            result = transform_tc_data(str(csv_file), str(output_file), verbose=False)
+            result = transform_tc_data(str(csv_file), str(output_base), verbose=False)
             if result['success']:
-                transformed_files.append(output_file)
+                transformed_files.append(Path(f"{output_base}_transformed.csv"))
                 total_transformed += 1
             else:
                 total_failed += 1

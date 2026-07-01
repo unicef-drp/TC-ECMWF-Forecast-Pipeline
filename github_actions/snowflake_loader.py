@@ -201,6 +201,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
 
             if not success:
                 logger.error(f"  Failed to write to staging table")
+                cursor.close()
                 return 0
 
             logger.info(f"  Uploaded {nrows} rows to staging table")
@@ -348,6 +349,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
 
             if not success:
                 logger.error(f"  Failed to write to {table_type}")
+                cursor.close()
                 return 0
 
             logger.info(f"  Inserted {nrows} rows directly")
@@ -362,7 +364,86 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
     except Exception as e:
         logger.error(f"Error loading {csv_file.name}: {e}")
         conn.rollback()
+        try:
+            cursor.close()
+        except Exception:
+            pass
         return 0
+
+
+def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
+    """
+    Load precipitation forecast metadata rows into PRECIP_FORECASTS table.
+
+    Creates the table if it does not exist. Uses staging + MERGE to deduplicate
+    on (FORECAST_TIME, PARAM) — re-runs are safe.
+
+    The zarr is a global file (one per model run), so there is one row per
+    (FORECAST_TIME, PARAM), not one per storm.
+
+    Args:
+        metadata_rows: list of dicts with keys forecast_time, param, stage_path
+        conn: active Snowflake connection
+
+    Returns number of rows merged.
+    """
+    if not metadata_rows:
+        return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS PRECIP_FORECASTS (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR,
+                CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE PRECIP_FORECASTS_STAGING (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR
+            )
+        """)
+
+        df = pd.DataFrame(metadata_rows)
+        df.columns = df.columns.str.upper()
+        if 'FORECAST_TIME' in df.columns:
+            df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'], errors='coerce').apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
+            )
+
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='PRECIP_FORECASTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write precip metadata to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO PRECIP_FORECASTS t
+            USING PRECIP_FORECASTS_STAGING s
+              ON  t.FORECAST_TIME = s.FORECAST_TIME
+              AND t.PARAM         = s.PARAM
+            WHEN MATCHED THEN
+                UPDATE SET t.STAGE_PATH = s.STAGE_PATH
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_TIME, PARAM, STAGE_PATH)
+                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} rows into PRECIP_FORECASTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error loading precip metadata: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
 
 
 def main():

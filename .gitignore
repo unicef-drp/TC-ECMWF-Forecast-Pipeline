@@ -29,6 +29,7 @@ tc_data_transformed/
 tc_data_transformed_jan2026/
 wind_data/
 wind_extracted/
+precip_data/
 ecmwf_wind_data_extractor_BACKUP.py
 pipeline_demonstration_JAM.ipynb
 pipeline_demonstration_TEST.ipynb
