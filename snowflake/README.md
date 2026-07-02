@@ -11,13 +11,16 @@ This directory contains the SPCS entry point for the ECMWF TC Forecast Pipeline.
 - **Flexible Authentication**: SPCS OAuth, private key, or password
 - **Phase-level Timing**: per-phase timing logged to `unicef_pipeline.log`
 
-All data processing steps (1–5) are shared with the GitHub Actions pipeline via `pipeline_core.py`.  This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
+All data processing steps (1–6) are shared with the GitHub Actions pipeline via `pipeline_core.py`. This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
 
 Execution sequence:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
 2. **Phase 2**: Transform per-storm CSVs (concurrently if `USE_PROCESS_POOL=true`)
 3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 4**: Load all results to Snowflake (SPCS OAuth / private key / password)
+4. **Phase 3b** *(optional)*: Download global precipitation GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+5. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, and `PRECIP_FORECASTS` to Snowflake
+
+> **No named storms**: If Phase 1 finds no named storms, Phases 2–3 (wind) are skipped. Phase 3b (precipitation) still runs when `PROCESS_PRECIP=true`, then the pipeline exits cleanly.
 
 ## Files
 
@@ -96,9 +99,9 @@ docker build -f snowflake/Dockerfile -t tc-ecmwf-pipeline:latest . --platform=li
 ```
 
 This will:
-- Install all system dependencies (eccodes, geospatial libraries)
-- Install Python dependencies from `requirements.txt`
-- Copy all pipeline modules
+- Install all system dependencies (eccodes, geospatial libraries, HDF5/NetCDF for zarr)
+- Install Python dependencies from `requirements-ci.txt`
+- Copy all pipeline modules (including `ecmwf_precip_data_downloader.py`)
 - Set up the container entrypoint
 
 ## Tagging the Image for Snowflake Registry
@@ -167,6 +170,8 @@ docker run --rm \
   -e SNOWFLAKE_WAREHOUSE='your_warehouse' \
   -e SNOWFLAKE_DATABASE='your_database' \
   -e SNOWFLAKE_SCHEMA='your_schema' \
+  -e SNOWFLAKE_STAGE_NAME='AOTS_ANALYSIS' \
+  -e PROCESS_PRECIP=true \
   tc-ecmwf-pipeline:latest
 ```
 
@@ -197,6 +202,8 @@ EXECUTE JOB SERVICE
           MAX_WORKERS: 0
           MAX_CONCURRENT_DOWNLOADS: 8
           NAMED_STORMS_ONLY: true
+          PROCESS_PRECIP: "true"
+          SNOWFLAKE_STAGE_NAME: "AOTS_ANALYSIS"
           DOWNLOAD_DATE: YYYYMMDD
           RUN_TIME: 00
      platformMonitor:
@@ -246,6 +253,17 @@ The `ecmwf-opendata` client downloads a **single combined BUFR4 file per forecas
 - **Format**: `true` or `false` (case-insensitive)
 - **Default**: `true`
 - **Description**: Enable/disable wind data download and processing
+
+#### `PROCESS_PRECIP`
+- **Format**: `true` or `false` (case-insensitive)
+- **Default**: `true`
+- **Description**: Enable/disable precipitation download and Zarr upload. When `true`, runs even if no named storms are found.
+
+#### `SNOWFLAKE_STAGE_NAME`
+- **Format**: String (Snowflake internal stage name)
+- **Default**: not set
+- **Required**: Yes, when `PROCESS_PRECIP=true` and `DATA_PIPELINE_DB=SNOWFLAKE`
+- **Description**: The Snowflake internal stage where precipitation Zarr ZipStore files are uploaded (e.g. `AOTS_ANALYSIS`)
 
 #### `NAMED_STORMS_ONLY`
 - **Format**: `true` or `false` (case-insensitive)
@@ -317,9 +335,10 @@ Wind data download depends on TC data:
 ## Pipeline Phases
 
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
-2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`)
-3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED` to Snowflake
+2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`) — skipped if no named storms
+3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons — skipped if no named storms
+4. **Phase 3b** *(optional)*: Download global precipitation GRIB files (tp, cp, lsp) → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+5. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, and `PRECIP_FORECASTS` to Snowflake
 
 
 ---

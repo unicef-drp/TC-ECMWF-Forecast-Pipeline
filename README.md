@@ -2,7 +2,7 @@
 
 # TC-ECMWF-Forecast-Pipeline – Data Pipeline Setup Guide
 
-This repository contains the pipeline for processing ECMWF tropical cyclone and wind forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications.
+This repository contains the pipeline for processing ECMWF tropical cyclone, wind, and precipitation forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications.
 
 ## Related Repositories
 
@@ -18,7 +18,10 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 3. **Transform TC Data**: Standardises units, computes wind radii, creates WKT polygons for Snowflake
 4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files matching the TC forecast run time
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
-6. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
+6. **Download Precipitation Data** *(optional)*: Downloads global precipitation GRIB files (total, convective, large-scale precipitation), converts to Zarr, and uploads to a Snowflake internal stage. Runs regardless of whether named storms were found.
+7. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
+
+> **No named storms**: If Step 2 finds no named storms, Steps 3–5 (wind) are skipped. Step 6 (precipitation) still runs when `PROCESS_PRECIP=true`, then the pipeline exits cleanly.
 
 ### Output Data
 
@@ -27,6 +30,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_transformed.csv` | `TC_TRACKS` | One row per member × step, with wind radii and WKT polygons |
 | `*_envelopes_individual.csv` | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygon per member × step |
 | `*_envelopes_combined.csv` | `TC_ENVELOPES_COMBINED` | Unioned polygon per member × threshold |
+| `precip_data/*.zarr.zip` | `PRECIP_FORECASTS` | One row per (forecast_time, param) pointing to the Zarr stage path |
 
 ## Prerequisites
 
@@ -71,7 +75,11 @@ pip install -r requirements.txt
 | `DOWNLOAD_DATE` | latest | Specific date to download (YYYYMMDD) |
 | `RUN_TIME` | latest | Forecast run time: 00, 06, 12, or 18 |
 | `DOWNLOAD_LIMIT` | 1 | Number of latest forecast runs to download |
-| `PROCESS_WIND_DATA` | true | Enable wind envelope processing |
+| `NAMED_STORMS_ONLY` | true | Filter to named storms only (skips unnamed disturbances like "92W") |
+| `PROCESS_WIND_DATA` | true | Enable wind envelope processing (Steps 4–5) |
+| `PROCESS_PRECIP` | true | Enable precipitation download and stage upload (Step 6) |
+| `SNOWFLAKE_STAGE_NAME` | — | Snowflake internal stage for Zarr upload — **required when `PROCESS_PRECIP=true`** |
+| `PRECIP_DATA_DIR` | `precip_data` | Local directory for precipitation Zarr files |
 | `CLEANUP_AFTER_LOAD` | true | Delete temporary files after successful load |
 | `SKIP_EXISTING` | true | Skip already-processed files |
 
@@ -82,26 +90,32 @@ pip install -r requirements.txt
 ```
 ECMWF Open Data (ecmwf-opendata client, type="tf")
     ↓  one combined BUFR4 file per run (all storms, all 51 members)
-ecmwf_tc_data_downloader.py   ← Step 1: download
+ecmwf_tc_data_downloader.py      ← Step 1: download
     ↓
-ecmwf_tc_data_extractor.py    ← Step 2: parse BUFR, filter named storms, split per-storm CSVs
-    ↓
-ecmwf_tc_data_transformer.py  ← Step 3: transform + WKT polygons
+ecmwf_tc_data_extractor.py       ← Step 2: parse BUFR, filter named storms, split per-storm CSVs
+    ↓ (if named storms found)
+ecmwf_tc_data_transformer.py     ← Step 3: transform + WKT polygons
 
 ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
     ↓  ensemble 10m wind GRIB files
-ecmwf_wind_data_downloader.py ← Step 4: download
+ecmwf_wind_data_downloader.py    ← Step 4: download  (skipped if no named storms)
     ↓
-ecmwf_tc_wind_combination.py  ← Step 5: wind threshold contours + union
+ecmwf_tc_wind_combination.py     ← Step 5: wind threshold contours + union  (skipped if no named storms)
 
-github_actions/snowflake_loader.py  ← Step 6: MERGE into Snowflake
+ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
+    ↓  global precipitation GRIB files (tp)
+ecmwf_precip_data_downloader.py  ← Step 6: download + convert to Zarr + PUT to Snowflake stage
+                                     (always runs when PROCESS_PRECIP=true, even with no named storms)
+
+github_actions/snowflake_loader.py  ← Step 7: MERGE into Snowflake
 ```
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `pipeline_core.py` | Shared steps 1–5, `BasePipelineConfig`, `PipelineStats` |
+| `pipeline_core.py` | Shared steps 1–6, `BasePipelineConfig`, `PipelineStats` |
+| `ecmwf_precip_data_downloader.py` | Precipitation GRIB download, Zarr conversion, stage upload |
 | `github_actions/main.py` | Sequential entry point — imports from `pipeline_core`, password auth |
 | `snowflake/spcs_pipeline.py` | Concurrent entry point — ProcessPool/SPCS OAuth |
 | `github_actions/snowflake_loader.py` | Snowflake loader for GitHub Actions (password auth) |
@@ -115,6 +129,8 @@ Uses a **staging table → MERGE** pattern:
 3. Executes MERGE into the production table using a compound key to skip duplicates
 
 **Wind field polygons** are stored as VARCHAR (WKT strings) in `TC_TRACKS`. `TRY_TO_GEOGRAPHY()` is applied during MERGE for `TC_ENVELOPES_INDIVIDUAL` and `TC_ENVELOPES_COMBINED`.
+
+**Precipitation** is stored as Zarr ZipStore files in a Snowflake internal stage. `PRECIP_FORECASTS` records one metadata row per `(FORECAST_TIME, PARAM)` pointing to the stage path. The Zarr is global (not per-storm), so there is no `TRACK_ID` in this table.
 
 ## Running the Pipeline
 
@@ -140,7 +156,7 @@ DOWNLOAD_DATE=20250929 RUN_TIME=12 python github_actions/main.py
 
 **Publication schedule** — ECMWF publishes TC forecasts at 00, 06, 12, 18 UTC. Data is typically available 4–9 hours after the model run time.
 
-**Setup:** Configure GitHub Secrets with the six `SNOWFLAKE_*` variables listed above.
+**Setup:** Configure GitHub Secrets with the six `SNOWFLAKE_*` variables plus `SNOWFLAKE_STAGE_NAME` (see `github_actions/README.md`).
 
 ### Containerized (SPCS)
 
@@ -164,6 +180,10 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 - Ensure wind data download completed successfully for the correct run time
 - Wind data downloads forecast hours 0–144h in 6-hour increments
 
+### "SNOWFLAKE_STAGE_NAME is required"
+- Set `SNOWFLAKE_STAGE_NAME` to your Snowflake internal stage name (e.g. `AOTS_ANALYSIS`)
+- Required when `PROCESS_PRECIP=true` and `DATA_PIPELINE_DB=SNOWFLAKE`
+
 ### Import errors
 - Ensure you are in the virtual environment: `source .venv/bin/activate`
 - Reinstall dependencies: `pip install -r requirements.txt`
@@ -178,6 +198,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `tc_data_transformed/` | Transformed TC CSVs |
 | `wind_data/` | Wind GRIB files |
 | `wind_extracted/` | Envelope CSV files |
+| `precip_data/` | Precipitation Zarr ZipStore files |
 
 ### Snowflake Tables
 
@@ -186,6 +207,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_TRACKS` | Storm positions, wind speeds, pressure, wind radii |
 | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygons per forecast step |
 | `TC_ENVELOPES_COMBINED` | Combined wind threshold polygons across all forecast steps |
+| `PRECIP_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
 
 ## Quick Start
 
@@ -197,7 +219,6 @@ pip install -r requirements.txt
 
 # 2. Configure credentials
 cp sample_env.txt .env
-# Edit .env with your Snowflake credentials
 
 # 3. Test locally
 jupyter notebook pipeline_demonstration.ipynb
