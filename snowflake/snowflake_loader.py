@@ -512,7 +512,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
 
 def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     """
-    Load precipitation forecast metadata rows into PRECIP_FORECASTS table.
+    Load met forecast metadata rows into MET_FORECASTS table.
 
     Creates the table if it does not exist. Uses staging + MERGE to deduplicate
     on (FORECAST_TIME, PARAM) — re-runs are safe.
@@ -532,7 +532,7 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS PRECIP_FORECASTS (
+            CREATE TABLE IF NOT EXISTS MET_FORECASTS (
                 FORECAST_TIME  TIMESTAMP_NTZ,
                 PARAM          VARCHAR,
                 STAGE_PATH     VARCHAR,
@@ -541,7 +541,7 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
         """)
 
         cursor.execute("""
-            CREATE OR REPLACE TEMPORARY TABLE PRECIP_FORECASTS_STAGING (
+            CREATE OR REPLACE TEMPORARY TABLE MET_FORECASTS_STAGING (
                 FORECAST_TIME  TIMESTAMP_NTZ,
                 PARAM          VARCHAR,
                 STAGE_PATH     VARCHAR
@@ -555,15 +555,15 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
                 lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
             )
 
-        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='PRECIP_FORECASTS_STAGING',
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='MET_FORECASTS_STAGING',
                                         auto_create_table=False, quote_identifiers=False)
         if not success:
             logger.error('  Failed to write precip metadata to staging table')
             return 0
 
         cursor.execute("""
-            MERGE INTO PRECIP_FORECASTS t
-            USING PRECIP_FORECASTS_STAGING s
+            MERGE INTO MET_FORECASTS t
+            USING MET_FORECASTS_STAGING s
               ON  t.FORECAST_TIME = s.FORECAST_TIME
               AND t.PARAM         = s.PARAM
             WHEN MATCHED THEN
@@ -574,7 +574,7 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
         """)
         rows_merged = cursor.rowcount
         conn.commit()
-        logger.info(f'  Merged {rows_merged} rows into PRECIP_FORECASTS')
+        logger.info(f'  Merged {rows_merged} rows into MET_FORECASTS')
         return rows_merged
 
     except Exception as e:

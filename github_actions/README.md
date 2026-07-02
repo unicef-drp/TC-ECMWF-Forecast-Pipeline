@@ -12,7 +12,7 @@ This directory contains the GitHub Actions entry point for the ECMWF TC Forecast
 
 ### No named storms — precipitation still runs
 
-If Step 2 finds no named storms, steps 3–5 (wind) are skipped entirely. Step 6 (precipitation download and Zarr upload) still runs when `PROCESS_PRECIP=true`, using the date and run time parsed from the BUFR filename (`tc_tracks_YYYY-MM-DD_rHH.bufr4`). This ensures global precipitation data is always captured even during quiet TC seasons.
+If Step 2 finds no named storms, steps 3–5 (wind) are skipped entirely. Step 6 (`tp` + `ro` download and Zarr upload) still runs when `PROCESS_MET=true`, using the date and run time parsed from the BUFR filename (`tc_tracks_YYYY-MM-DD_rHH.bufr4`). This ensures global gridded data is always captured even during quiet TC seasons.
 
 ## Files
 
@@ -36,7 +36,7 @@ Configure the following secrets in your GitHub repository settings:
 | `SNOWFLAKE_WAREHOUSE` | Snowflake warehouse name |
 | `SNOWFLAKE_DATABASE` | Snowflake database name |
 | `SNOWFLAKE_SCHEMA` | Snowflake schema name |
-| `SNOWFLAKE_STAGE_NAME` | Internal stage for precipitation Zarr upload (e.g. `AOTS_ANALYSIS`) — required when `PROCESS_PRECIP=true` |
+| `SNOWFLAKE_STAGE_NAME` | Internal stage for met Zarr upload (e.g. `AOTS_ANALYSIS`) — required when `PROCESS_MET=true` |
 
 ### Manual Trigger
 
@@ -62,9 +62,9 @@ Trigger the workflow from the GitHub Actions UI with optional inputs:
 | `DOWNLOAD_LIMIT` | 1 | Number of latest forecast runs |
 | `NAMED_STORMS_ONLY` | true | Filter to named storms; wind steps are skipped if none found |
 | `PROCESS_WIND_DATA` | true | Enable wind envelope processing (steps 4–5) |
-| `PROCESS_PRECIP` | true | Enable precipitation download + Zarr upload (step 6) |
-| `SNOWFLAKE_STAGE_NAME` | — | Internal stage for Zarr upload — required when `PROCESS_PRECIP=true` |
-| `PRECIP_DATA_DIR` | `precip_data` | Local directory for precipitation Zarr files |
+| `PROCESS_MET` | true | Enable met parameter download + Zarr upload (step 6) |
+| `SNOWFLAKE_STAGE_NAME` | — | Internal stage for Zarr upload — required when `PROCESS_MET=true` |
+| `MET_DATA_DIR` | `met_data` | Local directory for met Zarr files |
 | `CLEANUP_AFTER_LOAD` | true | Delete temp files after load |
 | `SKIP_EXISTING` | true | Skip already-processed files |
 
@@ -91,6 +91,6 @@ DOWNLOAD_DATE=20250929 RUN_TIME=12 python github_actions/main.py
 
 **No data downloaded** — check ECMWF data availability (data is published 4–9 hours after the model run time).
 
-**`SNOWFLAKE_STAGE_NAME` is required** — set this secret to your internal stage name; required when `PROCESS_PRECIP=true`.
+**`SNOWFLAKE_STAGE_NAME` is required** — set this secret to your internal stage name; required when `PROCESS_MET=true`.
 
 **Import errors** — ensure core modules are in the repo root and `sys.path` is correctly set.

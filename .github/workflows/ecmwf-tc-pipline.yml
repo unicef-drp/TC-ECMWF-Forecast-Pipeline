@@ -61,7 +61,7 @@ jobs:
         run: |
           mkdir -p tc_data
           mkdir -p tc_data_transformed
-          mkdir -p precip_data/grib_tmp
+          mkdir -p met_data/grib_tmp
 
       - name: Run TC Forecast Pipeline
         env:
@@ -81,9 +81,9 @@ jobs:
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
           SKIP_EXISTING: 'false'  # Always process new data in CI
 
-          # Precipitation processing (total precipitation - tp)
-          PROCESS_PRECIP: 'true'
-          PRECIP_DATA_DIR: 'precip_data'
+          # Gridded met parameter downloads (tp, ro)
+          PROCESS_MET: 'true'
+          MET_DATA_DIR: 'met_data'
           SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
           # Headless matplotlib (no display available in CI)
           MPLBACKEND: 'Agg'

@@ -24,10 +24,10 @@ SNOWFLAKE_SCHEMA=your_schema
 # Pipeline-specific (see github_actions/sample_env.txt for full reference)
 # ==============================================================================
 
-# Download and upload precipitation Zarr (true/false, default: true)
-PROCESS_PRECIP=true
+# Download tp + ro as Zarr to Snowflake stage (true/false, default: true)
+PROCESS_MET=true
 
-# Snowflake internal stage for precipitation Zarr — REQUIRED when PROCESS_PRECIP=true
+# Snowflake internal stage for met Zarr — REQUIRED when PROCESS_MET=true
 SNOWFLAKE_STAGE_NAME=your_stage_name
 
 # Filter to named storms only (true/false, default: true)

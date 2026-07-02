@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-ECMWF Ensemble Precipitation Downloader
+ECMWF Ensemble Parameter Downloader
 
-Downloads tp (total precipitation) from ECMWF Open Data,
-converts to Zarr ZipStore, and uploads to a Snowflake internal stage.
+Downloads gridded IFS ENS parameters from ECMWF Open Data, converts to Zarr
+ZipStore, and uploads to a Snowflake internal stage.
 
-Note: only tp is available in ECMWF open data. cp (convective) and lsp
-(large-scale) are not downloaded here.
+Parameters currently downloaded (both per pipeline run):
+  tp  — total precipitation (accumulated mm from T+0)
+  ro  — total runoff = surface runoff (sro) + subsurface drainage (ssro).
+        Land-only (HTESSEL is a land surface model; ro=0 over ocean).
+        Provides a soil-aware pluvial flood signal over land.
+        Note: sro and ssro are NOT available separately in ECMWF Open Data.
 
 Storage format:
   Zarr ZipStore (.zarr.zip) — single file, chunked (1, 1, lat, lon), float16, zstd.
   dims: (member=51, step=25, lat, lon)
-  values: accumulated mm from T+0 (subtract consecutive steps for period values)
+  values: accumulated from T+0 (subtract consecutive steps for period values)
   spatial: 60°S–60°N (all TC-active basins; Arctic/Antarctica excluded)
 
 Storage destinations:
   DATA_PIPELINE_DB=SNOWFLAKE  →  PUT to Snowflake internal stage @{SNOWFLAKE_STAGE_NAME}
-  DATA_PIPELINE_DB=LOCAL       →  ZipStore kept in precip_data/ on disk
+  DATA_PIPELINE_DB=LOCAL       →  ZipStore kept in met_data/ on disk
 
 Member 51 (HRES control):
   stream=enfo, type=cf was deprecated in IFS Cycle 50r1 (May 2026).
@@ -51,7 +55,7 @@ FORECAST_STEPS = list(range(0, 145, 6))
 # All run times publish HRES to T+144h per ECMWF IFS documentation.
 HRES_MAX_STEP = {0: 144, 6: 144, 12: 144, 18: 144}
 
-DEFAULT_PRECIP_DIR = 'precip_data'
+DEFAULT_MET_DIR = 'met_data'
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +286,14 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
             'n_members':      n_members,
             'member_numbers': member_numbers,
             'description': (
-                f'ECMWF ENS {param} accumulated precipitation mm from T+0. '
+                f'ECMWF ENS {param} accumulated from T+0 (mm). '
+                f'Zarr index i → ECMWF member member_numbers[i] (1-50=ENS pf, 51=HRES). '
+                f'Matches TC_TRACKS.ENSEMBLE_MEMBER and wind pipeline member numbering. '
+                f'Steps: 0-144h at 6h intervals. period[a,b] = data[member,b] - data[member,a]. '
+                f'Clip: {LAT_MIN}S-{LAT_MAX}N. '
+                f'ro=0 over ocean (HTESSEL is land-only).'
+                if param == 'ro' else
+                f'ECMWF ENS {param} accumulated from T+0 (mm). '
                 f'Zarr index i → ECMWF member member_numbers[i] (1-50=ENS pf, 51=HRES). '
                 f'Matches TC_TRACKS.ENSEMBLE_MEMBER and wind pipeline member numbering. '
                 f'Steps: 0-144h at 6h intervals. period[a,b] = data[member,b] - data[member,a]. '
@@ -312,7 +323,7 @@ def upload_to_snowflake_stage(zip_path: Path, stage_name: str,
     Args:
         zip_path:   Local path to the .zarr.zip file
         stage_name: Snowflake stage name (e.g. 'AOTS_ANALYSIS')
-        stage_path: Path within the stage (e.g. 'precip/20260629_00/cp.zarr.zip')
+        stage_path: Path within the stage (e.g. 'met/20260629_00/tp.zarr.zip')
         conn:       Active Snowflake connector connection
 
     Returns True on success.
@@ -342,11 +353,14 @@ def upload_to_snowflake_stage(zip_path: Path, stage_name: str,
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def download_ensemble_precip(
+SUPPORTED_PARAMS = {'tp', 'ro'}
+
+
+def download_ensemble_param(
         param: str,
         date: Union[str, datetime],
         run_time: int,
-        output_dir: str = DEFAULT_PRECIP_DIR,
+        output_dir: str = DEFAULT_MET_DIR,
         snowflake_conn=None,
         snowflake_stage_name: Optional[str] = None,
         upload_to_stage: bool = True,
@@ -355,10 +369,10 @@ def download_ensemble_precip(
         verbose: bool = True,
 ) -> Dict:
     """
-    Download ECMWF ENS precipitation for one parameter, build Zarr, store result.
+    Download one ECMWF ENS parameter, build Zarr ZipStore, store result.
 
     Args:
-        param:                'tp' (total precipitation — only param available in ECMWF open data)
+        param:                Parameter short name ('tp' or 'ro')
         date:                 Forecast date as 'YYYY-MM-DD' or datetime
         run_time:             Model run hour (0, 6, 12, or 18)
         output_dir:           Working directory for GRIB2 + ZipStore files
@@ -378,8 +392,8 @@ def download_ensemble_precip(
         run_time:      int
         param:         str
     """
-    if param != 'tp':
-        raise ValueError(f"param must be 'tp' (only total precipitation is available in ECMWF open data), got '{param}'")
+    if param not in SUPPORTED_PARAMS:
+        raise ValueError(f"param must be one of {SUPPORTED_PARAMS}, got '{param}'")
 
     forecast_date = datetime.strptime(date, '%Y-%m-%d') if isinstance(date, str) else date
 
@@ -392,7 +406,7 @@ def download_ensemble_precip(
 
     if verbose:
         logger.info('=' * 70)
-        logger.info(f'ECMWF PRECIPITATION — {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
+        logger.info(f'ECMWF ENS — {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
         logger.info(f'  Steps: {len(FORECAST_STEPS)} (0–144h at 6h)  |  Members: 51 (50 pf + 1 hres)')
         logger.info(f'  Spatial: {LAT_MIN}°–{LAT_MAX}°  |  Upload: {"stage" if upload_to_stage else "local"}')
         logger.info('=' * 70)
@@ -423,7 +437,7 @@ def download_ensemble_precip(
             return {'success': False, 'zip_path': zip_path, 'stage_path': None,
                     'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
 
-        stage_path = f'precip/{run_str}/{zip_path.name}'
+        stage_path = f'met/{run_str}/{zip_path.name}'
         ok = upload_to_snowflake_stage(zip_path, snowflake_stage_name, stage_path, snowflake_conn)
         if not ok:
             return {'success': False, 'zip_path': zip_path, 'stage_path': None,

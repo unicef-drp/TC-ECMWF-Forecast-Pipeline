@@ -137,9 +137,9 @@ class PipelineConfig(BasePipelineConfig):
                 logger.error(f"Private key file not found: {self.sf_private_key_path}")
                 return False
 
-        if self.process_precip and not self.snowflake_stage_name:
+        if self.process_met and not self.snowflake_stage_name:
             logger.error(
-                "SNOWFLAKE_STAGE_NAME is required when PROCESS_PRECIP=true and "
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_MET=true and "
                 "DATA_PIPELINE_DB=SNOWFLAKE. Add it to the SPCS service spec."
             )
             return False
@@ -241,7 +241,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
-        logger.info(f"  Precip ZipStores   : {config.precip_data_dir}")
+        logger.info(f"  Met ZipStores      : {config.met_data_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -292,8 +292,8 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 individual_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
                 combined_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM PRECIP_FORECASTS")
-                precip_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM MET_FORECASTS")
+                met_count = cursor.fetchone()[0]
             finally:
                 cursor.close()
 
@@ -301,7 +301,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
             logger.info(f"  TC_TRACKS:                {tracks_count:,}")
             logger.info(f"  TC_ENVELOPES_INDIVIDUAL:  {individual_count:,}")
             logger.info(f"  TC_ENVELOPES_COMBINED:    {combined_count:,}")
-            logger.info(f"  PRECIP_FORECASTS:         {precip_count:,}")
+            logger.info(f"  MET_FORECASTS:         {met_count:,}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -372,8 +372,8 @@ def main():
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
             logger.warning("No named storms found in BUFR data — skipping wind processing.")
-            if config.process_precip:
-                logger.info("PROCESS_PRECIP=true — running precipitation download anyway.")
+            if config.process_met:
+                logger.info("PROCESS_MET=true — running met download anyway.")
                 tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
                 _precip_conn = None
                 if config.data_pipeline_db == 'SNOWFLAKE':

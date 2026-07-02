@@ -22,7 +22,7 @@
 # - TC data download from ECMWF
 # - BUFR extraction and transformation
 # - Wind data download and processing
-# - Precipitation download and zarr storage
+# - Met data download and zarr storage
 # - Snowflake data loading
 #
 # The container will execute snowflake/spcs_pipeline.py and terminate when complete.
@@ -110,7 +110,7 @@ RUN mkdir -p /app/tc_data \
     /app/tc_transformed \
     /app/wind_data \
     /app/wind_extracted \
-    /app/precip_data/grib_tmp
+    /app/met_data/grib_tmp
 
 # ==============================================================================
 # Health check (optional - for monitoring)
@@ -133,12 +133,12 @@ ENV WIND_EXTRACTED_DIR=/app/wind_extracted
 ENV DOWNLOAD_LIMIT=1
 ENV MAX_WORKERS=4
 ENV PROCESS_WIND_DATA=true
-ENV PROCESS_PRECIP=true
-ENV PRECIP_DATA_DIR=/app/precip_data
+ENV PROCESS_MET=true
+ENV MET_DATA_DIR=/app/met_data
 ENV NAMED_STORMS_ONLY=true
 ENV CLEANUP_AFTER_LOAD=true
 ENV USE_PROCESS_POOL=false
-# SNOWFLAKE_STAGE_NAME must be overridden at runtime when PROCESS_PRECIP=true
+# SNOWFLAKE_STAGE_NAME must be overridden at runtime when PROCESS_MET=true
 
 # Snowflake defaults (MUST be overridden at runtime)
 ENV SNOWFLAKE_WAREHOUSE=COMPUTE_WH

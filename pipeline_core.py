@@ -23,7 +23,7 @@ from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_storm_csvs
 from ecmwf_wind_data_downloader import download_ensemble_wind
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
-from ecmwf_precip_data_downloader import download_ensemble_precip
+from ecmwf_met_downloader import download_ensemble_param
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +72,11 @@ class BasePipelineConfig:
         self.named_storms_only = os.getenv('NAMED_STORMS_ONLY', 'true').lower() == 'true'
         self.max_ensemble_members = 51  # Fixed: 50 perturbed + 1 control
 
-        # Precipitation processing (tp only)
-        self.precip_data_dir = Path(os.getenv('PRECIP_DATA_DIR', 'precip_data'))
-        self.process_precip = os.getenv('PROCESS_PRECIP', 'true').lower() == 'true'
+        # Gridded ENS parameter downloads (tp, ro, and future params)
+        self.met_data_dir = Path(os.getenv('MET_DATA_DIR', 'met_data'))
+        self.process_met = os.getenv('PROCESS_MET', 'true').lower() == 'true'
 
-        # Snowflake stage name (used for precip Zarr PUT and impact data)
+        # Snowflake stage name (used for gridded Zarr PUT and impact data)
         self.snowflake_stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
 
     def _validate_run_time(self) -> bool:
@@ -110,9 +110,9 @@ class BasePipelineConfig:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
             return False
 
-        if self.process_precip and not self.snowflake_stage_name:
+        if self.process_met and not self.snowflake_stage_name:
             logger.error(
-                "SNOWFLAKE_STAGE_NAME is required when PROCESS_PRECIP=true and "
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_MET=true and "
                 "DATA_PIPELINE_DB=SNOWFLAKE. Add it to GitHub Secrets."
             )
             return False
@@ -123,11 +123,11 @@ class BasePipelineConfig:
         """Ensure all required working directories exist."""
         for d in (self.raw_data_dir, self.transformed_data_dir,
                   self.wind_data_dir, self.wind_extracted_dir,
-                  self.precip_data_dir):
+                  self.met_data_dir):
             d.mkdir(parents=True, exist_ok=True)
         logger.info(
             f"Directories ready: {self.raw_data_dir}, {self.transformed_data_dir}, "
-            f"{self.wind_data_dir}, {self.wind_extracted_dir}, {self.precip_data_dir}"
+            f"{self.wind_data_dir}, {self.wind_extracted_dir}, {self.met_data_dir}"
         )
 
 
@@ -493,7 +493,7 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
 
 
 # ---------------------------------------------------------------------------
-# Step 6: Precipitation download + Zarr build + stage upload
+# Step 6: MET parameter download + Zarr build + stage upload
 # ---------------------------------------------------------------------------
 
 def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
@@ -501,16 +501,19 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
                           snowflake_conn=None,
                           max_workers: int = 4) -> List[Dict]:
     """
-    Step 6: Download tp (total precipitation), build Zarr ZipStore, upload to stage.
+    Step 6: Download tp and ro, build Zarr ZipStores, upload to stage.
 
     Runs after wind processing. Downloads all 51 members × 25 steps globally
-    (60°S–60°N), builds one ZipStore, and either PUTs it to the Snowflake
-    internal stage or keeps it locally.
+    (60°S–60°N), builds one ZipStore per param, and either PUTs them to the
+    Snowflake internal stage or keeps them locally.
 
-    Returns list of metadata dicts for loading into PRECIP_FORECASTS table:
+    tp  — total precipitation (global; primary pluvial forcing)
+    ro  — total runoff (land-only; soil-aware flood response signal)
+
+    Returns list of metadata dicts for loading into MET_FORECASTS table:
       [{forecast_time, param, stage_path}]  — one entry per param (zarr is global, not per-storm)
     """
-    params_to_run = ['tp'] if config.process_precip else []
+    params_to_run = ['tp', 'ro'] if config.process_met else []
 
     if not params_to_run:
         logger.info('Precipitation processing disabled — skipping')
@@ -520,7 +523,7 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
     tc_date     = tc_data_info.get('date')
     tc_forecast_time = tc_data_info.get('forecast_time')
     if tc_run_time is None or tc_date is None:
-        logger.warning('Cannot determine TC run time/date — skipping precipitation download')
+        logger.warning('Cannot determine TC run time/date — skipping MET parameter download')
         return []
 
     upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
@@ -531,17 +534,17 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
         return []
 
     logger.info('=' * 70)
-    logger.info(f'STEP 6: Precipitation download ({", ".join(p.upper() for p in params_to_run)})')
+    logger.info(f'STEP 6: MET download ({", ".join(p.upper() for p in params_to_run)})')
     logger.info('=' * 70)
 
     metadata_rows: List[Dict] = []
 
     for param in params_to_run:
-        result = download_ensemble_precip(
+        result = download_ensemble_param(
             param=param,
             date=tc_date,
             run_time=tc_run_time,
-            output_dir=str(config.precip_data_dir),
+            output_dir=str(config.met_data_dir),
             snowflake_conn=snowflake_conn if upload_to_stage else None,
             snowflake_stage_name=config.snowflake_stage_name if upload_to_stage else None,
             upload_to_stage=upload_to_stage,
@@ -591,8 +594,8 @@ def cleanup_files(config: BasePipelineConfig):
             ("*.grib2", config.wind_data_dir),
             *([("*.csv", config.wind_extracted_dir)] if not local_mode else []),
             # precip: grib_tmp only — ZipStore is the persistent output, keep it
-            ("*.grib2", config.precip_data_dir / "grib_tmp"),
-            ("*.idx",   config.precip_data_dir / "grib_tmp"),
+            ("*.grib2", config.met_data_dir / "grib_tmp"),
+            ("*.idx",   config.met_data_dir / "grib_tmp"),
         ]:
             if directory.exists():
                 for f in directory.glob(pattern):
