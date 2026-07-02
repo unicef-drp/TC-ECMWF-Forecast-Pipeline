@@ -49,7 +49,9 @@ from pipeline_core import (
     step2_extract,
     step3_transform,
     step4_download_wind,
+    step4b_download_gust,
     step5_process_wind,
+    step5b_extract_gust_envelopes,
     step6_download_precip,
     cleanup_files,
 )
@@ -270,7 +272,11 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
 
             for csv_file in envelope_files:
                 _set_context()
-                if 'individual' in csv_file.name:
+                if 'gust_envelopes_individual' in csv_file.name:
+                    table_type = 'TC_GUST_ENVELOPES_INDIVIDUAL'
+                elif 'gust_envelopes_combined' in csv_file.name:
+                    table_type = 'TC_GUST_ENVELOPES_COMBINED'
+                elif 'individual' in csv_file.name:
                     table_type = 'TC_ENVELOPES_INDIVIDUAL'
                 elif 'combined' in csv_file.name:
                     table_type = 'TC_ENVELOPES_COMBINED'
@@ -292,16 +298,22 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 individual_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
                 combined_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM TC_GUST_ENVELOPES_INDIVIDUAL")
+                gust_individual_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM TC_GUST_ENVELOPES_COMBINED")
+                gust_combined_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM MET_FORECASTS")
                 met_count = cursor.fetchone()[0]
             finally:
                 cursor.close()
 
             logger.info("Total records in database:")
-            logger.info(f"  TC_TRACKS:                {tracks_count:,}")
-            logger.info(f"  TC_ENVELOPES_INDIVIDUAL:  {individual_count:,}")
-            logger.info(f"  TC_ENVELOPES_COMBINED:    {combined_count:,}")
-            logger.info(f"  MET_FORECASTS:         {met_count:,}")
+            logger.info(f"  TC_TRACKS:                     {tracks_count:,}")
+            logger.info(f"  TC_ENVELOPES_INDIVIDUAL:       {individual_count:,}")
+            logger.info(f"  TC_ENVELOPES_COMBINED:         {combined_count:,}")
+            logger.info(f"  TC_GUST_ENVELOPES_INDIVIDUAL:  {gust_individual_count:,}")
+            logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {gust_combined_count:,}")
+            logger.info(f"  MET_FORECASTS:                 {met_count:,}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -380,7 +392,7 @@ def main():
                     _precip_conn = _open_snowflake_conn(config)
                 try:
                     precip_metadata = step6_download_precip(
-                        config, stats, tc_data_info, [],
+                        config, stats, tc_data_info,
                         snowflake_conn=_precip_conn,
                         max_workers=config.max_concurrent_downloads,
                     )
@@ -406,13 +418,14 @@ def main():
         phase_start = datetime.now()
         step4_download_wind(config, stats, tc_data_info,
                             max_workers=config.max_concurrent_downloads)
+        step4b_download_gust(config, stats, tc_data_info,
+                             max_workers=config.max_concurrent_downloads)
         envelope_files = step5_process_wind(
             config, stats,
             use_process_pool=config.use_process_pool,
             max_workers=config.max_workers,
         )
-        storm_ids = [f.stem.split('_storm_')[-1].split('_extracted')[0]
-                     for f in csv_files if '_storm_' in f.stem]
+        gust_files = step5b_extract_gust_envelopes(config, stats)
 
         # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
         _precip_conn = None
@@ -421,7 +434,7 @@ def main():
 
         try:
             precip_metadata = step6_download_precip(
-                config, stats, tc_data_info, storm_ids,
+                config, stats, tc_data_info,
                 snowflake_conn=_precip_conn,
                 max_workers=config.max_concurrent_downloads,
             )
@@ -431,7 +444,7 @@ def main():
 
         stats.log_phase_time("Phase 3: Wind, Envelopes & Precip", (datetime.now() - phase_start).total_seconds())
 
-        phase4_snowflake_loading(config, stats, transformed_files, envelope_files, precip_metadata)
+        phase4_snowflake_loading(config, stats, transformed_files, envelope_files + gust_files, precip_metadata)
 
         cleanup_files(config)
         stats.log_summary()

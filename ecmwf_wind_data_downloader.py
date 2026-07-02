@@ -7,8 +7,10 @@ from ECMWF's Open Data service.
 
 The downloader processes:
 - Ensemble forecasts (50 perturbed members: 1-50, + control member 51)
-- 10m wind components (u10 and v10)
-- Multiple forecast lead times (every 3-6 hours up to 360 hours)
+- 10m wind components (u10 and v10) — sustained wind, used for TC_ENVELOPES_*
+- 10fg (maximum 10m wind gust) — indexed as '10fg' for steps ≤ 90h, '10fg3' for steps > 90h;
+  used for TC_GUST_ENVELOPES_*
+- Multiple forecast lead times (every 3-6 hours up to 360 hours for wind, 6-144 hours for gust)
 - Different forecast run times (00Z, 06Z, 12Z, 18Z)
 
 References:
@@ -38,6 +40,11 @@ FORECAST_STEPS = {
 # HRES control (stream=oper, type=fc) max step per run time.
 # All run times reach T+144h; 06Z/18Z just don't extend to 360h beyond that.
 CF_MAX_STEP = {0: 144, 6: 144, 12: 144, 18: 144}
+
+# ECMWF open data indexes 10m max gust as '10fg' for steps 0–90h and '10fg3'
+# for steps > 90h (same physical quantity, different accumulation interval label).
+def _gust_param(step: int) -> str:
+    return "10fg3" if step > 90 else "10fg"
 
 
 def get_forecast_steps(run_time: int) -> List[int]:
@@ -238,6 +245,200 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
             'error': str(e),
             'skipped': False
         }
+
+
+def _download_single_step_gust_pf(client: Client, forecast_date: datetime, run_time: int,
+                                   step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
+    """Download one 10fg perturbed forecast step (members 1-50)."""
+    filename = f"gust_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_pf.grib2"
+    filepath = os.path.join(output_dir, filename)
+    if os.path.exists(filepath):
+        return {'success': True, 'step': step, 'type': 'pf', 'filepath': filepath,
+                'file_size': os.path.getsize(filepath), 'skipped': True}
+    try:
+        if verbose:
+            print(f"  [DOWN] +{step:3d}h PF gust: Downloading...", end='', flush=True)
+        client.retrieve(date=forecast_date, time=run_time, stream="enfo", type="pf",
+                        step=step, param=[_gust_param(step)], target=filepath)
+        if os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            if verbose:
+                print(f" ({size / 1024 / 1024:.1f} MB)")
+            return {'success': True, 'step': step, 'type': 'pf', 'filepath': filepath,
+                    'file_size': size, 'skipped': False}
+        return {'success': False, 'step': step, 'type': 'pf', 'filepath': None,
+                'error': 'File not created', 'skipped': False}
+    except Exception as e:
+        if verbose:
+            print(f" Error: {e}")
+        return {'success': False, 'step': step, 'type': 'pf', 'filepath': None,
+                'error': str(e), 'skipped': False}
+
+
+def _download_single_step_gust_cf(client: Client, forecast_date: datetime, run_time: int,
+                                   step: int, output_dir: str, verbose: bool = False) -> Dict[str, Union[str, int, bool]]:
+    """Download one 10fg HRES control step (member 51)."""
+    filename = f"gust_ens_{forecast_date.strftime('%Y-%m-%d')}_r{run_time:02d}_f{step:03d}h_cf.grib2"
+    filepath = os.path.join(output_dir, filename)
+    if os.path.exists(filepath):
+        return {'success': True, 'step': step, 'type': 'cf', 'filepath': filepath,
+                'file_size': os.path.getsize(filepath), 'skipped': True}
+    if step > CF_MAX_STEP.get(run_time, 144):
+        return {'success': True, 'step': step, 'type': 'cf', 'filepath': None,
+                'file_size': 0, 'skipped': True}
+    try:
+        if verbose:
+            print(f"  [DOWN] +{step:3d}h CF gust: Downloading...", end='', flush=True)
+        client.retrieve(date=forecast_date, time=run_time, stream="oper", type="fc",
+                        step=step, param=[_gust_param(step)], target=filepath)
+        if os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            if verbose:
+                print(f" ({size / 1024 / 1024:.1f} MB)")
+            return {'success': True, 'step': step, 'type': 'cf', 'filepath': filepath,
+                    'file_size': size, 'skipped': False}
+        return {'success': False, 'step': step, 'type': 'cf', 'filepath': None,
+                'error': 'File not created', 'skipped': False}
+    except Exception as e:
+        if verbose:
+            print(f" Error: {e}")
+        return {'success': False, 'step': step, 'type': 'cf', 'filepath': None,
+                'error': str(e), 'skipped': False}
+
+
+def download_ensemble_gust(
+        date: Union[str, datetime],
+        run_time: int,
+        forecast_hours: Optional[List[int]] = None,
+        output_dir: str = DEFAULT_OUTPUT_DIR,
+        verbose: bool = True,
+        max_workers: int = 4
+) -> Dict[str, Union[str, int, bool]]:
+    """
+    Download ensemble 10fg (maximum wind gust) forecasts from ECMWF.
+
+    Downloads peak gust for both perturbed ensemble members (1-50, PF files)
+    and control forecast (member 51, CF files) at specified forecast lead times.
+    Supports concurrent downloads for improved performance.
+
+    Args:
+        date: Forecast date in 'YYYY-MM-DD' format or datetime object
+        run_time: Model run time (0, 6, 12, or 18 UTC)
+        forecast_hours: Specific forecast hours to download.
+            If None, downloads all available hours for the run_time.
+        output_dir: Output directory for downloaded files
+        verbose: Whether to print detailed progress information
+        max_workers: Maximum number of concurrent downloads (default: 4).
+                     Set to 1 for sequential downloads.
+
+    Returns:
+        dict: Summary with 'success', 'files_downloaded', 'files_failed',
+              'files_skipped', 'downloaded_files' (List[Path]), 'total_size_mb'
+    """
+    # Parse date
+    if isinstance(date, str):
+        forecast_date = datetime.strptime(date, '%Y-%m-%d')
+    else:
+        forecast_date = date
+
+    # Validate run time
+    if run_time not in [0, 6, 12, 18]:
+        raise ValueError(f"Invalid run_time: {run_time}. Must be 0, 6, 12, or 18")
+
+    # Get forecast hours
+    if forecast_hours is None:
+        forecast_hours = get_forecast_steps(run_time)
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Initialize ECMWF client
+    client = Client(source="ecmwf")
+
+    if verbose:
+        print("=" * 70)
+        if max_workers > 1:
+            print("ECMWF ENSEMBLE GUST FORECAST DOWNLOAD (CONCURRENT)")
+        else:
+            print("ECMWF ENSEMBLE GUST FORECAST DOWNLOAD")
+        print("=" * 70)
+        print(f"Date: {forecast_date.strftime('%Y-%m-%d')}")
+        print(f"Run: {run_time:02d}Z")
+        print(f"Forecast hours: {len(forecast_hours)} steps ({min(forecast_hours)}-{max(forecast_hours)}h)")
+        if max_workers > 1:
+            print(f"Concurrent workers: {max_workers}")
+        print(f"Output: {output_dir}/")
+        print("=" * 70)
+
+    downloaded_files: List[Path] = []
+    failed_downloads = 0
+    skipped_count = 0
+    total_size_bytes = 0
+
+    if max_workers > 1:
+        # Concurrent download mode
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for step in forecast_hours:
+                futures.append(
+                    executor.submit(_download_single_step_gust_pf, client, forecast_date,
+                                    run_time, step, output_dir, verbose))
+                futures.append(
+                    executor.submit(_download_single_step_gust_cf, client, forecast_date,
+                                    run_time, step, output_dir, verbose))
+
+            for future in as_completed(futures):
+                result = future.result()
+                if result['success']:
+                    if result['filepath']:
+                        downloaded_files.append(Path(result['filepath']))
+                        total_size_bytes += result.get('file_size', 0)
+                    if result.get('skipped'):
+                        skipped_count += 1
+                else:
+                    failed_downloads += 1
+    else:
+        # Sequential download mode
+        for step in forecast_hours:
+            result_pf = _download_single_step_gust_pf(client, forecast_date, run_time,
+                                                       step, output_dir, verbose)
+            if result_pf['success'] and result_pf['filepath']:
+                downloaded_files.append(Path(result_pf['filepath']))
+                total_size_bytes += result_pf.get('file_size', 0)
+            elif not result_pf['success']:
+                failed_downloads += 1
+            if result_pf.get('skipped'):
+                skipped_count += 1
+
+            result_cf = _download_single_step_gust_cf(client, forecast_date, run_time,
+                                                       step, output_dir, verbose)
+            if result_cf['success'] and result_cf['filepath']:
+                downloaded_files.append(Path(result_cf['filepath']))
+                total_size_bytes += result_cf.get('file_size', 0)
+            elif not result_cf['success']:
+                failed_downloads += 1
+            if result_cf.get('skipped'):
+                skipped_count += 1
+
+    if verbose:
+        print("=" * 70)
+        print("GUST DOWNLOAD SUMMARY")
+        print("=" * 70)
+        print(f"Successfully downloaded: {len(downloaded_files)} files")
+        print(f"Failed downloads: {failed_downloads} files")
+        print(f"Skipped (already exist): {skipped_count} steps")
+        print(f"Total size: {total_size_bytes / 1024 / 1024:.1f} MB")
+        print(f"Files saved to: {output_dir}/")
+        print("=" * 70)
+
+    return {
+        'success': failed_downloads == 0,
+        'files_downloaded': len(downloaded_files),
+        'files_failed': failed_downloads,
+        'files_skipped': skipped_count,
+        'downloaded_files': downloaded_files,
+        'total_size_mb': total_size_bytes / 1024 / 1024,
+    }
 
 
 def download_ensemble_wind(

@@ -150,14 +150,9 @@ ENV SNOWFLAKE_SCHEMA=TC_DATA
 # ==============================================================================
 
 # Create startup script to clean old index files
-RUN echo '#!/bin/bash\n\
-# Clean any old GRIB index files that may cause conflicts\n\
-rm -f /app/wind_data/*.idx 2>/dev/null || true\n\
-rm -f /app/wind_data/*.grib2.*.idx 2>/dev/null || true\n\
-echo "Cleaned old index files"\n\
-# Run the pipeline\n\
-exec python snowflake/spcs_pipeline.py\n\
-' > /app/start.sh && chmod +x /app/start.sh
+# Use printf so \n is expanded as real newlines (echo does not expand \n in /bin/sh)
+RUN printf '#!/bin/bash\nrm -rf /app/wind_data/.idx_cache 2>/dev/null || true\nrm -f /app/wind_data/*.idx 2>/dev/null || true\necho "Cleaned old index files"\nexec python snowflake/spcs_pipeline.py\n' \
+    > /app/start.sh && chmod +x /app/start.sh
 
 # Run the SPCS pipeline with cleanup
 CMD ["/app/start.sh"]

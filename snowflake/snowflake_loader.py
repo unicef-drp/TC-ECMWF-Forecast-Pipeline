@@ -249,7 +249,9 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
     Args:
         csv_file: Path to CSV file
         conn: Snowflake connection
-        table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL', 'TC_ENVELOPES_COMBINED')
+        table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL',
+                    'TC_ENVELOPES_COMBINED', 'TC_GUST_ENVELOPES_INDIVIDUAL',
+                    'TC_GUST_ENVELOPES_COMBINED')
         use_staging: If True, use staging table + MERGE (handles duplicates)
                      If False, direct INSERT (faster but no deduplication)
     """
@@ -324,6 +326,29 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         ENSEMBLE_MEMBER INTEGER,
                         LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
                         WIND_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_GUST_ENVELOPES_INDIVIDUAL':
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME INTEGER,
+                        GUST_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
+                        GUST_THRESHOLD INTEGER,
                         ENVELOPE_REGION VARCHAR
                     )
                 """)
@@ -433,19 +458,19 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_ENVELOPES_COMBINED t
                     USING (
-                        SELECT 
+                        SELECT
                             FORECAST_TIME,
                             TRACK_ID,
                             ENSEMBLE_MEMBER,
-                            CASE 
-                                WHEN LEAD_TIME LIKE '%-%' THEN 
+                            CASE
+                                WHEN LEAD_TIME LIKE '%-%' THEN
                                     CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
                                 ELSE CAST(LEAD_TIME AS INTEGER)
                             END AS LEAD_TIME_RANGE,
                             WIND_THRESHOLD,
-                            CASE 
-                                WHEN ENVELOPE_REGION IS NOT NULL 
-                                     AND ENVELOPE_REGION != '' 
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
                                      AND ENVELOPE_REGION != 'None'
                                      AND ENVELOPE_REGION != 'null'
                                 THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
@@ -466,6 +491,82 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     ) VALUES (
                         s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
                         s.WIND_THRESHOLD, s.ENVELOPE_REGION
+                    )
+                """
+
+            elif table_type == 'TC_GUST_ENVELOPES_INDIVIDUAL':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+
+                merge_sql = f"""
+                    MERGE INTO TC_GUST_ENVELOPES_INDIVIDUAL t
+                    USING (
+                        SELECT
+                            FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                            GUST_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.LEAD_TIME = s.LEAD_TIME
+                        AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                        GUST_THRESHOLD, ENVELOPE_REGION
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION
+                    )
+                """
+
+            elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+                logger.info(f"  LEAD_TIME will be parsed from VARCHAR to INTEGER during MERGE")
+
+                merge_sql = f"""
+                    MERGE INTO TC_GUST_ENVELOPES_COMBINED t
+                    USING (
+                        SELECT
+                            FORECAST_TIME,
+                            TRACK_ID,
+                            ENSEMBLE_MEMBER,
+                            CASE
+                                WHEN LEAD_TIME LIKE '%-%' THEN
+                                    CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
+                                ELSE CAST(LEAD_TIME AS INTEGER)
+                            END AS LEAD_TIME_RANGE,
+                            GUST_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        LEAD_TIME_RANGE = s.LEAD_TIME_RANGE
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
+                        GUST_THRESHOLD, ENVELOPE_REGION
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION
                     )
                 """
 

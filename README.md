@@ -16,8 +16,10 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 1. **Download TC Data**: Downloads one combined BUFR4 file per forecast run (all storms, all 51 ensemble members) from ECMWF Open Data via the `ecmwf-opendata` client (`type="tf"`)
 2. **Extract TC Data**: Parses BUFR Template 316082, filters to named storms, splits into per-storm CSVs
 3. **Transform TC Data**: Standardises units, computes wind radii, creates WKT polygons for Snowflake
-4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files matching the TC forecast run time
+4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files (`u10`/`v10`) matching the TC forecast run time
+4b. **Download Gust Data**: Downloads ensemble 10fg (maximum wind gust) GRIB files for the same run time and lead times as Step 4
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
+5b. **Extract Gust Envelopes**: Creates gust threshold envelope polygons from 10fg GRIB files (step 0 skipped — no accumulation period at T+0)
 6. **Download Gridded Parameters** *(optional)*: Downloads global GRIB files for `tp` (total precipitation) and `ro` (total runoff), converts each to a Zarr ZipStore, and uploads to a Snowflake internal stage. Runs regardless of whether named storms were found.
 7. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
 
@@ -30,6 +32,8 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_transformed.csv` | `TC_TRACKS` | One row per member × step, with wind radii and WKT polygons |
 | `*_envelopes_individual.csv` | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygon per member × step |
 | `*_envelopes_combined.csv` | `TC_ENVELOPES_COMBINED` | Unioned polygon per member × threshold |
+| `*_gust_envelopes_individual.csv` | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygon per member × step (10fg, m/s thresholds) |
+| `*_gust_envelopes_combined.csv` | `TC_GUST_ENVELOPES_COMBINED` | Unioned gust polygon per member × threshold |
 | `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `tp` total precipitation (global) |
 | `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `ro` total runoff (land-only) |
 
@@ -98,10 +102,17 @@ ecmwf_tc_data_extractor.py       ← Step 2: parse BUFR, filter named storms, sp
 ecmwf_tc_data_transformer.py     ← Step 3: transform + WKT polygons
 
 ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
-    ↓  ensemble 10m wind GRIB files
+    ↓  ensemble 10m wind GRIB files (u10/v10)
 ecmwf_wind_data_downloader.py    ← Step 4: download  (skipped if no named storms)
     ↓
 ecmwf_tc_wind_combination.py     ← Step 5: wind threshold contours + union  (skipped if no named storms)
+
+ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
+    ↓  ensemble 10fg (max wind gust) GRIB files
+ecmwf_wind_data_downloader.py    ← Step 4b: download gust files  (skipped if no named storms)
+    ↓
+ecmwf_gust_envelope_extractor.py ← Step 5b: gust threshold contours + union  (skipped if no named storms)
+                                             produces: *_gust_envelopes_individual.csv + *_gust_envelopes_combined.csv
 
 ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
     ↓  global GRIB files — tp (total precipitation) and ro (total runoff)
@@ -209,6 +220,8 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_TRACKS` | Storm positions, wind speeds, pressure, wind radii |
 | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygons per forecast step |
 | `TC_ENVELOPES_COMBINED` | Combined wind threshold polygons across all forecast steps |
+| `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygons per forecast step (10fg, m/s) |
+| `TC_GUST_ENVELOPES_COMBINED` | Combined gust threshold polygons across all forecast steps |
 | `MET_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
 
 ## Quick Start

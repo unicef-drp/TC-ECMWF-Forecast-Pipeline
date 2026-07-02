@@ -8,7 +8,9 @@ This directory contains the GitHub Actions entry point for the ECMWF TC Forecast
 
 - `PipelineConfig(BasePipelineConfig)` — password auth (no additional fields)
 - `step7_load()` — Snowflake loading via `snowflake_loader.py` (password auth)
-- `main()` — sequential step orchestration (steps 1–7)
+- `main()` — sequential step orchestration (steps 1, 2, 3, 4, 4b, 5, 5b, 6, 7)
+  - Step 4b downloads 10fg gust GRIB files; Step 5b extracts gust threshold envelope polygons
+  - Both produce `TC_GUST_ENVELOPES_INDIVIDUAL` / `TC_GUST_ENVELOPES_COMBINED` rows loaded in Step 7
 
 ### No named storms — precipitation still runs
 

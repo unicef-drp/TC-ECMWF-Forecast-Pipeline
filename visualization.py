@@ -379,7 +379,11 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     storm_name = df_polygons['track_id'].iloc[0]
     forecast_time = df_polygons['forecast_time'].iloc[0]
 
-    # Select member
+    # Select member — fall back to first available if requested member has no data
+    available_members = sorted(df_polygons['ensemble_member'].unique())
+    if member not in available_members:
+        print(f"Member {member} not in data (available: {available_members[:5]}{'...' if len(available_members) > 5 else ''}); using member {available_members[0]}")
+        member = available_members[0]
     member_df = df_polygons[df_polygons['ensemble_member'] == member]
 
     # Get unique forecast steps - check for different possible column names
@@ -1030,3 +1034,493 @@ def show_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv=None
     return visualize_precip_exceedance(zarr_path, threshold_mm=threshold_mm,
                                        step_h=step_h, track_csv=track_csv,
                                        show_plot=True, save_plot=False)
+
+
+# ─── Gust Envelope Visualizations ────────────────────────────────────────────
+
+# Gust threshold colors (oranges/reds — distinct from wind blues/greens)
+GUST_THRESHOLD_COLORS = {
+    17: '#FED8B1',   # Light orange  — Gale force          (~34 kt equivalent)
+    21: '#FFA500',   # Orange        — Storm force         (~40 kt equivalent)
+    26: '#FF4500',   # OrangeRed     — Violent storm       (~50 kt equivalent)
+    33: '#8B0000',   # Dark red      — Hurricane force     (~64 kt equivalent)
+    43: '#6A0DAD',   # Purple        — Cat-2 gust          (~83 kt equivalent)
+    49: '#4B0082',   # Indigo        — Cat-3 gust          (~96 kt equivalent)
+    58: '#00008B',   # Dark blue     — Cat-4 gust          (~113 kt equivalent)
+    70: '#000000',   # Black         — Cat-5 gust          (~137 kt equivalent)
+}
+
+GUST_THRESHOLD_LABELS = {
+    17: 'Gale Force Gust (17 m/s)',
+    21: 'Storm Force Gust (21 m/s)',
+    26: 'Violent Storm Gust (26 m/s)',
+    33: 'Hurricane Force Gust (33 m/s)',
+    43: 'Cat-2 Gust (43 m/s)',
+    49: 'Cat-3 Gust (49 m/s)',
+    58: 'Cat-4 Gust (58 m/s)',
+    70: 'Cat-5 Gust (70 m/s)',
+}
+
+
+def visualize_individual_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
+                                        show_plot=True, save_plot=False, member=1):
+    """
+    Visualize individual gust envelopes per forecast step for one ensemble member.
+
+    Args:
+        csv_file (str): Path to individual gust envelopes CSV (gust_threshold column in m/s)
+        output_dir (str): Output directory
+        show_plot (bool): Whether to display the plot
+        save_plot (bool): Whether to save the plot
+        member (int): Ensemble member to display
+
+    Returns:
+        str: Path to saved file (if saved)
+    """
+    print("=" * 60)
+    print("INDIVIDUAL GUST ENVELOPES")
+    print("=" * 60)
+
+    df = pd.read_csv(csv_file)
+    print(f"Loaded {len(df)} records from {Path(csv_file).name}")
+
+    df_polygons = df[df['envelope_region'].notna() & (df['envelope_region'] != '')].copy()
+    print(f"Found {len(df_polygons)} records with polygons")
+
+    if df_polygons.empty:
+        print("No polygons found to visualize!")
+        return None
+
+    storm_name = df_polygons['track_id'].iloc[0]
+    forecast_time = df_polygons['forecast_time'].iloc[0]
+
+    # Fall back to first available member if requested member has no data
+    available_members = sorted(df_polygons['ensemble_member'].unique())
+    if member not in available_members:
+        print(f"Member {member} not in data (available: {available_members[:5]}{'...' if len(available_members) > 5 else ''}); using member {available_members[0]}")
+        member = available_members[0]
+    member_df = df_polygons[df_polygons['ensemble_member'] == member]
+
+    if 'lead_time' in member_df.columns:
+        step_col = 'lead_time'
+    elif 'forecast_step' in member_df.columns:
+        step_col = 'forecast_step'
+    else:
+        step_col = None
+
+    forecast_steps = (sorted(member_df[step_col].unique()) if step_col
+                      else list(range(len(member_df))))
+
+    print(f"Storm: {storm_name}")
+    print(f"Forecast: {forecast_time}")
+    print(f"Member: {member}")
+    print(f"Forecast steps: {len(forecast_steps)}")
+
+    n_steps = len(forecast_steps)
+    n_cols = min(4, n_steps)
+    n_rows = (n_steps + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3),
+                             subplot_kw={'projection': ccrs.PlateCarree()})
+
+    if n_steps == 1:
+        axes = [axes]
+    elif n_rows == 1:
+        axes = axes if n_steps > 1 else [axes]
+    else:
+        axes = axes.flatten()
+
+    _polys = []
+    for s in member_df['envelope_region'].dropna():
+        try:
+            p = wkt.loads(s)
+            if p and not p.is_empty:
+                _polys.append(p)
+        except Exception:
+            pass
+    bounds = get_bounds_from_data(_polys) if _polys else get_bounds_from_data(member_df)
+
+    for i, step in enumerate(forecast_steps):
+        ax = axes[i]
+        setup_map(ax, bounds)
+
+        step_df = (member_df[member_df[step_col] == step] if step_col
+                   else member_df.iloc[[i]] if i < len(member_df) else member_df.iloc[0:0])
+
+        thresholds_present = []
+        for _, row in step_df.iterrows():
+            try:
+                polygon = wkt.loads(row['envelope_region'])
+                threshold = row['gust_threshold']
+                if polygon and not polygon.is_empty:
+                    color = GUST_THRESHOLD_COLORS.get(threshold, '#FFA500')
+                    plot_polygon_on_map(ax, polygon, color, alpha=0.6)
+                    thresholds_present.append(threshold)
+            except Exception:
+                continue
+
+        ax.set_title(f"Step {step}h\n{len(thresholds_present)} thresholds",
+                     fontsize=10, fontweight='bold')
+
+    for i in range(n_steps, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle(f"Storm: {storm_name} — Member {member} Gust Envelopes\nForecast: {forecast_time}",
+                 fontsize=14, fontweight='bold')
+
+    if n_steps > 0:
+        legend_patches = [plt.Rectangle((0, 0), 1, 1,
+                                        facecolor=GUST_THRESHOLD_COLORS[t],
+                                        label=GUST_THRESHOLD_LABELS[t])
+                          for t in sorted(GUST_THRESHOLD_COLORS.keys())]
+        legend = axes[0].legend(handles=legend_patches, loc='center left', fontsize=7,
+                                framealpha=0.9, title='Gust Thresholds', bbox_to_anchor=(1.05, 0.5))
+        legend.set_bbox_to_anchor((1.05, 0.5))
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"{storm_name}_gust_individual_envelopes.png"
+        filepath = Path(output_dir) / filename
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_combined_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
+                                      show_plot=True, save_plot=False, max_members=3):
+    """
+    Visualize combined gust envelopes (unioned across all forecast steps).
+
+    Args:
+        csv_file (str): Path to combined gust envelopes CSV (gust_threshold column in m/s)
+        output_dir (str): Output directory
+        show_plot (bool): Whether to display the plot
+        save_plot (bool): Whether to save the plot
+        max_members (int): Maximum number of members to show
+
+    Returns:
+        str: Path to saved file (if saved)
+    """
+    print("=" * 60)
+    print("COMBINED GUST ENVELOPES")
+    print("=" * 60)
+
+    df = pd.read_csv(csv_file)
+    print(f"Loaded {len(df)} records from {Path(csv_file).name}")
+
+    df_polygons = df[df['envelope_region'].notna() & (df['envelope_region'] != '')].copy()
+    print(f"Found {len(df_polygons)} records with polygons")
+
+    if df_polygons.empty:
+        print("No polygons found to visualize!")
+        return None
+
+    storm_name = df_polygons['track_id'].iloc[0]
+    forecast_time = df_polygons['forecast_time'].iloc[0]
+    members = sorted(df_polygons['ensemble_member'].unique())[:max_members]
+
+    print(f"Storm: {storm_name}")
+    print(f"Forecast: {forecast_time}")
+    print(f"Showing {len(members)} members")
+
+    n_members = len(members)
+    n_cols = min(3, n_members)
+    n_rows = (n_members + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 4),
+                             subplot_kw={'projection': ccrs.PlateCarree()})
+
+    if n_members == 1:
+        axes = [axes]
+    elif n_rows == 1:
+        axes = axes if n_members > 1 else [axes]
+    else:
+        axes = axes.flatten()
+
+    all_polygons = []
+    for _, row in df_polygons.iterrows():
+        try:
+            polygon = wkt.loads(row['envelope_region'])
+            if polygon and not polygon.is_empty:
+                all_polygons.append(polygon)
+        except Exception:
+            continue
+    bounds = get_bounds_from_data(all_polygons)
+
+    for i, member in enumerate(members):
+        ax = axes[i]
+        setup_map(ax, bounds)
+
+        member_df = df_polygons[df_polygons['ensemble_member'] == member]
+
+        thresholds_present = []
+        for _, row in member_df.iterrows():
+            try:
+                polygon = wkt.loads(row['envelope_region'])
+                threshold = row['gust_threshold']
+                if polygon and not polygon.is_empty:
+                    color = GUST_THRESHOLD_COLORS.get(threshold, '#FFA500')
+                    plot_polygon_on_map(ax, polygon, color, alpha=0.6)
+                    thresholds_present.append(threshold)
+            except Exception:
+                continue
+
+        ax.set_title(f"Member {member}\n{len(thresholds_present)} thresholds",
+                     fontsize=12, fontweight='bold')
+
+        if thresholds_present:
+            ax.text(0.02, 0.98,
+                    f"{min(thresholds_present)}–{max(thresholds_present)} m/s",
+                    transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    for i in range(n_members, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle(f"Storm: {storm_name} — Combined Gust Envelopes\nForecast: {forecast_time}",
+                 fontsize=16, fontweight='bold')
+
+    if n_members > 0:
+        legend_patches = [plt.Rectangle((0, 0), 1, 1,
+                                        facecolor=GUST_THRESHOLD_COLORS[t],
+                                        label=GUST_THRESHOLD_LABELS[t])
+                          for t in sorted(GUST_THRESHOLD_COLORS.keys())]
+        legend = axes[0].legend(handles=legend_patches, loc='center left', fontsize=8,
+                                framealpha=0.9, title='Gust Thresholds', bbox_to_anchor=(1.05, 0.5))
+        legend.set_bbox_to_anchor((1.05, 0.5))
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"{storm_name}_gust_combined_envelopes.png"
+        filepath = Path(output_dir) / filename
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
+                                      output_dir=DEFAULT_OUTPUT_DIR,
+                                      show_plot=True, save_plot=False,
+                                      wind_kt=34, gust_ms=17, member=1, max_steps=8,
+                                      steps=None):
+    """
+    Overlay sustained-wind and gust envelopes at the same physical threshold (~17 m/s /
+    34 kt) for a single ensemble member to illustrate that gust envelopes extend further.
+
+    Args:
+        wind_individual_csv (str): Path to wind individual envelopes CSV (wind_threshold in kt)
+        gust_individual_csv (str): Path to gust individual envelopes CSV (gust_threshold in m/s)
+        output_dir (str): Output directory
+        show_plot (bool): Whether to display the plot
+        save_plot (bool): Whether to save the plot
+        wind_kt (int): Wind threshold in knots to compare (default 34 kt ≈ 17 m/s)
+        gust_ms (int): Gust threshold in m/s to compare (default 17 m/s)
+        member (int): Ensemble member to display
+        max_steps (int): Maximum number of lead-time panels to show
+
+    Returns:
+        str: Path to saved file (if saved)
+    """
+    print("=" * 60)
+    print(f"WIND vs GUST COMPARISON  ({wind_kt} kt sustained  vs  {gust_ms} m/s gust)")
+    print("=" * 60)
+
+    df_wind_all = pd.read_csv(wind_individual_csv)
+    df_gust_all = pd.read_csv(gust_individual_csv)
+
+    # Find a member with data in both datasets at the requested thresholds;
+    # fall back to first member that has at least gust data
+    wind_members = set(
+        df_wind_all.loc[df_wind_all['wind_threshold'] == wind_kt, 'ensemble_member'].unique()
+    )
+    gust_members = set(
+        df_gust_all.loc[df_gust_all['gust_threshold'] == gust_ms, 'ensemble_member'].unique()
+    )
+    both_members = sorted(wind_members & gust_members)
+    if member not in (wind_members | gust_members):
+        fallback = both_members[0] if both_members else sorted(gust_members or wind_members)[0]
+        print(f"Member {member} has no data at these thresholds; using member {fallback}")
+        member = fallback
+    elif member not in both_members:
+        if both_members:
+            print(f"Member {member} missing from one dataset; using member {both_members[0]} (has both)")
+            member = both_members[0]
+
+    # Filter to selected member and threshold
+    df_wind = df_wind_all[
+        (df_wind_all['ensemble_member'] == member) &
+        (df_wind_all['wind_threshold'] == wind_kt) &
+        df_wind_all['envelope_region'].notna() &
+        (df_wind_all['envelope_region'] != '')
+    ].copy()
+
+    df_gust = df_gust_all[
+        (df_gust_all['ensemble_member'] == member) &
+        (df_gust_all['gust_threshold'] == gust_ms) &
+        df_gust_all['envelope_region'].notna() &
+        (df_gust_all['envelope_region'] != '')
+    ].copy()
+
+    print(f"Wind ({wind_kt} kt): {len(df_wind)} steps with polygons")
+    print(f"Gust ({gust_ms} m/s): {len(df_gust)} steps with polygons")
+
+    if df_wind.empty and df_gust.empty:
+        print("No polygons found for either dataset!")
+        return None
+
+    # Storm metadata
+    storm_name = ''
+    if not df_wind.empty and 'track_id' in df_wind.columns:
+        storm_name = df_wind['track_id'].iloc[0]
+    elif not df_gust.empty and 'track_id' in df_gust.columns:
+        storm_name = df_gust['track_id'].iloc[0]
+
+    forecast_time = ''
+    if not df_wind.empty and 'forecast_time' in df_wind.columns:
+        forecast_time = df_wind['forecast_time'].iloc[0]
+    elif not df_gust.empty and 'forecast_time' in df_gust.columns:
+        forecast_time = df_gust['forecast_time'].iloc[0]
+
+    step_col_w = 'lead_time' if 'lead_time' in df_wind.columns else 'forecast_step'
+    step_col_g = 'lead_time' if 'lead_time' in df_gust.columns else 'forecast_step'
+
+    wind_steps = set(df_wind[step_col_w].unique()) if not df_wind.empty else set()
+    gust_steps = set(df_gust[step_col_g].unique()) if not df_gust.empty else set()
+    if steps is not None:
+        all_steps = sorted(s for s in steps if s in (wind_steps | gust_steps))
+    else:
+        all_steps = sorted(wind_steps | gust_steps)[:max_steps]
+
+    print(f"Showing {len(all_steps)} lead-time panels")
+
+    # Overall bounding box
+    all_polys = []
+    for df_src in [df_wind, df_gust]:
+        for s in df_src['envelope_region'].dropna():
+            try:
+                p = wkt.loads(s)
+                if p and not p.is_empty:
+                    all_polys.append(p)
+            except Exception:
+                pass
+    bounds = get_bounds_from_data(all_polys) if all_polys else (-70, -50, 10, 30)
+
+    n_steps = len(all_steps)
+    if n_steps == 0:
+        print("No lead-time steps found!")
+        return None
+
+    n_cols = min(4, n_steps)
+    n_rows = (n_steps + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3),
+                             subplot_kw={'projection': ccrs.PlateCarree()})
+
+    if n_steps == 1:
+        axes = [axes]
+    elif n_rows == 1:
+        axes = axes if n_steps > 1 else [axes]
+    else:
+        axes = axes.flatten()
+
+    WIND_COLOR = '#4169E1'    # Royal blue   — sustained wind
+    GUST_COLOR = '#FF4500'    # OrangeRed    — gust
+
+    for i, step in enumerate(all_steps):
+        ax = axes[i]
+        setup_map(ax, bounds)
+
+        # Gust envelope drawn first (background) so wind core sits on top as a visible inset
+        for _, row in df_gust[df_gust[step_col_g] == step].iterrows():
+            try:
+                polygon = wkt.loads(row['envelope_region'])
+                if polygon and not polygon.is_empty:
+                    plot_polygon_on_map(ax, polygon, GUST_COLOR, alpha=0.35, linewidth=1.2)
+            except Exception:
+                pass
+
+        # Wind envelope (blue, drawn on top so the sustained-wind core is clearly visible)
+        for _, row in df_wind[df_wind[step_col_w] == step].iterrows():
+            try:
+                polygon = wkt.loads(row['envelope_region'])
+                if polygon and not polygon.is_empty:
+                    plot_polygon_on_map(ax, polygon, WIND_COLOR, alpha=0.55, linewidth=1.2)
+            except Exception:
+                pass
+
+        ax.set_title(f"Step {step}h", fontsize=10, fontweight='bold')
+
+    for i in range(n_steps, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle(
+        f"Storm: {storm_name} — Sustained Wind ({wind_kt} kt) vs Gust ({gust_ms} m/s) — Member {member}\n"
+        f"Forecast: {forecast_time}  |  Gust envelopes extend beyond sustained-wind envelopes",
+        fontsize=12, fontweight='bold'
+    )
+
+    # Legend on first subplot
+    legend_patches = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=WIND_COLOR,
+                       label=f'Sustained wind  ≥ {wind_kt} kt  (~{gust_ms} m/s)'),
+        plt.Rectangle((0, 0), 1, 1, facecolor=GUST_COLOR,
+                       label=f'Wind gust  ≥ {gust_ms} m/s'),
+    ]
+    axes[0].legend(handles=legend_patches, loc='center left', fontsize=8,
+                   framealpha=0.9, title='Layer', bbox_to_anchor=(1.05, 0.5))
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"{storm_name}_wind_vs_gust_comparison.png"
+        filepath = Path(output_dir) / filename
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_gust_individual(csv_file, output_dir=DEFAULT_OUTPUT_DIR, member=1):
+    """Quick function to show individual gust envelopes per forecast step."""
+    return visualize_individual_gust_envelopes(csv_file, output_dir,
+                                               show_plot=True, save_plot=False, member=member)
+
+
+def show_gust_combined(csv_file, output_dir=DEFAULT_OUTPUT_DIR):
+    """Quick function to show combined gust envelopes."""
+    return visualize_combined_gust_envelopes(csv_file, output_dir,
+                                             show_plot=True, save_plot=False)
+
+
+def show_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
+                                 output_dir=DEFAULT_OUTPUT_DIR, member=1,
+                                 steps=None, max_steps=8):
+    """Quick function to overlay sustained-wind and gust envelopes for comparison."""
+    return visualize_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
+                                             output_dir, show_plot=True, save_plot=False,
+                                             member=member, steps=steps, max_steps=max_steps)

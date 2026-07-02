@@ -26,6 +26,7 @@ COPY ecmwf_tc_data_transformer.py .
 COPY ecmwf_wind_data_downloader.py .
 COPY ecmwf_wind_data_extractor.py .
 COPY ecmwf_tc_wind_combination.py .
+COPY ecmwf_gust_envelope_extractor.py .
 COPY ecmwf_met_downloader.py .
 COPY pipeline_core.py .
 

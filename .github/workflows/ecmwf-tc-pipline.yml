@@ -61,6 +61,8 @@ jobs:
         run: |
           mkdir -p tc_data
           mkdir -p tc_data_transformed
+          mkdir -p wind_data
+          mkdir -p wind_extracted
           mkdir -p met_data/grib_tmp
 
       - name: Run TC Forecast Pipeline

@@ -17,8 +17,9 @@ Execution sequence:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
 2. **Phase 2**: Transform per-storm CSVs (concurrently if `USE_PROCESS_POOL=true`)
 3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 3b** *(optional)*: Download global met GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
-5. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+5. **Phase 3c** *(optional)*: Download global met GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
 > **No named storms**: If Phase 1 finds no named storms, Phases 2–3 (wind) are skipped. Phase 3b (precipitation) still runs when `PROCESS_MET=true`, then the pipeline exits cleanly.
 
@@ -337,8 +338,9 @@ Wind data download depends on TC data:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
 2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`) — skipped if no named storms
 3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons — skipped if no named storms
-4. **Phase 3b** *(optional)*: Download global GRIB files for `tp` (total precipitation) and `ro` (total runoff) → convert each to a Zarr ZipStore → PUT to Snowflake stage. Runs regardless of whether named storms were found.
-5. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+5. **Phase 3c** *(optional)*: Download global GRIB files for `tp` (total precipitation) and `ro` (total runoff) → convert each to a Zarr ZipStore → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
 
 ---

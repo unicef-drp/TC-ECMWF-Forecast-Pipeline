@@ -21,8 +21,9 @@ import pandas as pd
 
 from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_storm_csvs
-from ecmwf_wind_data_downloader import download_ensemble_wind
+from ecmwf_wind_data_downloader import download_ensemble_wind, download_ensemble_gust
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
+from ecmwf_gust_envelope_extractor import process_gust_combination
 from ecmwf_met_downloader import download_ensemble_param
 
 logger = logging.getLogger(__name__)
@@ -443,6 +444,44 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
         return []
 
 
+def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
+                          tc_data_info: Dict, max_workers: int = 4) -> List[Path]:
+    """Step 4b: Download ensemble 10fg (max wind gust) GRIB files alongside u10/v10."""
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled — skipping gust download")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 4b: Downloading gust forecast data (10fg)...")
+    logger.info("=" * 70)
+    try:
+        tc_run_time = tc_data_info.get('run_time')
+        tc_date = tc_data_info.get('date')
+        if tc_run_time is None or tc_date is None:
+            logger.warning("Cannot determine TC run time or date — skipping gust download")
+            return []
+        max_forecast_hour = analyze_required_forecast_hours(config.transformed_data_dir, verbose=False)
+        required_forecast_hours = list(range(6, max_forecast_hour + 1, 6))
+        logger.info(f"Gust steps: 6–{max_forecast_hour}h every 6h ({len(required_forecast_hours)} files)")
+        result = download_ensemble_gust(
+            date=tc_date, run_time=tc_run_time,
+            forecast_hours=required_forecast_hours,
+            output_dir=str(config.wind_data_dir),
+            verbose=False, max_workers=max_workers,
+        )
+        if result['success']:
+            logger.info(f"Downloaded {result['files_downloaded']} gust file(s)")
+            return result['downloaded_files']
+        error_msg = f"Gust download failed: {result.get('files_failed', '?')} step(s) failed"
+        logger.warning(error_msg)
+        stats.errors.append(error_msg)
+        return []
+    except Exception as e:
+        error_msg = f"Gust download failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+
 def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
                        use_process_pool: bool = False,
                        max_workers: int = 1) -> List[Path]:
@@ -478,7 +517,10 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
         if result['processed_storms'] > 0:
             stats.files_wind_processed = result['processed_storms']
             logger.info(f"Processed wind data for {result['processed_storms']} storm(s)")
-            envelope_files = list(config.wind_extracted_dir.glob("*_envelopes_*.csv"))
+            envelope_files = [
+                f for f in config.wind_extracted_dir.glob("*_envelopes_*.csv")
+                if 'gust' not in f.name
+            ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
             return envelope_files
         else:
@@ -492,12 +534,40 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
         return []
 
 
+def step5b_extract_gust_envelopes(config: BasePipelineConfig,
+                                   stats: PipelineStats) -> List[Path]:
+    """Step 5b: Extract gust envelope polygons from 10fg GRIB files."""
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled — skipping gust envelope extraction")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 5b: Extracting gust envelopes from 10fg GRIB files...")
+    logger.info("=" * 70)
+    try:
+        process_gust_combination(
+            tc_data_dir=config.transformed_data_dir,
+            gust_data_dir=config.wind_data_dir,
+            output_dir=config.wind_extracted_dir,
+        )
+        gust_files = sorted(config.wind_extracted_dir.glob('*_gust_envelopes_*.csv'))
+        if gust_files:
+            logger.info(f"Gust envelope files: {[f.name for f in gust_files]}")
+        else:
+            logger.warning("No gust envelope files generated")
+        return gust_files
+    except Exception as e:
+        error_msg = f"Gust envelope extraction failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Step 6: MET parameter download + Zarr build + stage upload
 # ---------------------------------------------------------------------------
 
 def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
-                          tc_data_info: Dict, storm_ids: List[str],
+                          tc_data_info: Dict,
                           snowflake_conn=None,
                           max_workers: int = 4) -> List[Dict]:
     """
@@ -584,6 +654,7 @@ def cleanup_files(config: BasePipelineConfig):
 
     logger.info("Cleaning up temporary files...")
     try:
+        import shutil
         removed = 0
         for pattern, directory in [
             ("*.bufr4", config.raw_data_dir),
@@ -601,6 +672,14 @@ def cleanup_files(config: BasePipelineConfig):
                 for f in directory.glob(pattern):
                     f.unlink()
                     removed += 1
+
+        # Remove the cfgrib index cache directory — orphaned .idx files accumulate
+        # here after GRIB files are deleted and trigger spurious warnings on next run
+        idx_cache = config.wind_data_dir / ".idx_cache"
+        if idx_cache.exists():
+            shutil.rmtree(idx_cache)
+            logger.info("Removed .idx_cache directory")
+
         logger.info(f"Removed {removed} temporary file(s)")
     except Exception as e:
         logger.warning(f"Cleanup failed (non-critical): {e}")
