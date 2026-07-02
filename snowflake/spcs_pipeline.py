@@ -44,6 +44,7 @@ from pipeline_core import (
     BasePipelineConfig,
     PipelineStats as _BasePipelineStats,
     extract_tc_data_info,
+    extract_tc_data_info_from_bufr,
     step1_download,
     step2_extract,
     step3_transform,
@@ -370,7 +371,25 @@ def main():
 
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
-            logger.warning("No per-storm CSVs extracted. Exiting.")
+            logger.warning("No named storms found in BUFR data — skipping wind processing.")
+            if config.process_precip:
+                logger.info("PROCESS_PRECIP=true — running precipitation download anyway.")
+                tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
+                _precip_conn = None
+                if config.data_pipeline_db == 'SNOWFLAKE':
+                    _precip_conn = _open_snowflake_conn(config)
+                try:
+                    precip_metadata = step6_download_precip(
+                        config, stats, tc_data_info, [],
+                        snowflake_conn=_precip_conn,
+                        max_workers=config.max_concurrent_downloads,
+                    )
+                finally:
+                    if _precip_conn:
+                        _precip_conn.close()
+                phase4_snowflake_loading(config, stats, [], [], precip_metadata)
+                cleanup_files(config)
+            stats.log_summary()
             sys.exit(1 if stats.errors else 0)
 
         tc_data_info = extract_tc_data_info(csv_files)

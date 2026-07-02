@@ -20,6 +20,7 @@ from pipeline_core import (
     BasePipelineConfig,
     PipelineStats,
     extract_tc_data_info,
+    extract_tc_data_info_from_bufr,
     step1_download,
     step2_extract,
     step3_transform,
@@ -162,8 +163,30 @@ def main():
 
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
-            logger.warning("No named storms found in BUFR data. Exiting.")
+            logger.warning("No named storms found in BUFR data — skipping wind processing.")
+            if config.process_precip:
+                logger.info("PROCESS_PRECIP=true — running precipitation download anyway.")
+                tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
+                _precip_conn = None
+                if config.data_pipeline_db == 'SNOWFLAKE':
+                    os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+                    os.environ['SNOWFLAKE_USER'] = config.sf_user
+                    os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+                    os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+                    os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+                    os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+                    _precip_conn = get_snowflake_connection()
+                try:
+                    precip_metadata = step6_download_precip(config, stats, tc_data_info, [],
+                                                             snowflake_conn=_precip_conn)
+                finally:
+                    if _precip_conn:
+                        _precip_conn.close()
+                step7_load(config, stats, [], [], precip_metadata)
+                cleanup_files(config)
+            stats.log_summary()
             sys.exit(1 if stats.errors else 0)
+
         transformed_files = step3_transform(config, stats, csv_files)
 
         tc_data_info = extract_tc_data_info(csv_files)

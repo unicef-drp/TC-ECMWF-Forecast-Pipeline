@@ -204,6 +204,25 @@ def extract_tc_data_info(csv_files: List[Path]) -> Dict:
         return {}
 
 
+def extract_tc_data_info_from_bufr(bufr_files: List[Path]) -> Dict:
+    """Derive forecast run date and hour from the BUFR filename.
+
+    Parses filenames like tc_tracks_2026-07-01_r06.bufr4.
+    Used when no named storms are found but precipitation should still run.
+    """
+    import re
+    for f in bufr_files:
+        m = re.search(r'(\d{4}-\d{2}-\d{2})_r(\d{2})', f.name)
+        if m:
+            date = m.group(1)
+            run_time = int(m.group(2))
+            forecast_time = f'{date} {run_time:02d}:00:00'
+            logger.info(f"TC data info from BUFR filename: {date} {run_time:02d}Z")
+            return {'run_time': run_time, 'date': date, 'forecast_time': forecast_time}
+    logger.warning("Could not parse date/run_time from BUFR filename(s)")
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Pipeline steps 1–5
 # ---------------------------------------------------------------------------
