@@ -2,7 +2,7 @@
 
 # TC-ECMWF-Forecast-Pipeline – Data Pipeline Setup Guide
 
-This repository contains the pipeline for processing ECMWF tropical cyclone, wind, and precipitation forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications.
+This repository contains the pipeline for processing ECMWF tropical cyclone, wind, and precipitation forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications. It also includes a fully separate, standalone GloFAS riverine discharge pipeline (see the dedicated section below).
 
 ## Related Repositories
 
@@ -36,6 +36,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_gust_envelopes_combined.csv` | `TC_GUST_ENVELOPES_COMBINED` | Unioned gust polygon per member × threshold |
 | `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `tp` total precipitation (global) |
 | `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `ro` total runoff (land-only) |
+| `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24') — GloFAS riverine discharge, standalone pipeline, see below |
 
 ## Prerequisites
 
@@ -212,6 +213,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `wind_data/` | Wind GRIB files |
 | `wind_extracted/` | Envelope CSV files |
 | `met_data/` | Precipitation Zarr ZipStore files |
+| `glofas_data/` | GloFAS riverine discharge Zarr ZipStore files (standalone pipeline — see below) |
 
 ### Snowflake Tables
 
@@ -223,6 +225,31 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygons per forecast step (10fg, m/s) |
 | `TC_GUST_ENVELOPES_COMBINED` | Combined gust threshold polygons across all forecast steps |
 | `MET_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
+| `RIVER_FORECASTS` | Metadata: one row per (forecast_time, param='dis24') with GloFAS Zarr stage path |
+
+## GloFAS Riverine Discharge Pipeline (standalone)
+
+A fully separate daily pipeline, **not** part of the TC forecast pipeline above —
+see `testing/RIVERINE_FLOODING_PLAN.md` for the full architecture and rationale.
+
+- **Entry points:** `github_actions/glofas_pipeline.py` (own workflow,
+  `.github/workflows/glofas.yml`, cron `0 15 * * *` UTC) and
+  `snowflake/glofas_spcs_pipeline.py` (SPCS, triggered separately from the main
+  SPCS job)
+- **Core module:** `glofas_downloader.py` — downloads the GloFAS v4.0
+  51-member ensemble discharge forecast via `cdsapi` (a different API from
+  `ecmwf-opendata`), builds a sparse Zarr ZipStore filtered to cells that cross the
+  RP2yr threshold, uploads to `@{stage}/glofas/{date}/river_{date}.zarr.zip`
+- **One-time setup required first:** `setup_glofas_thresholds.py` — caches the
+  official RP threshold files the sparse filter depends on; run manually once, not
+  part of any recurring schedule
+- **Why separate from the main pipeline:** GloFAS's ~11h publication latency
+  doesn't align with the main pipeline's 4 daily run slots, and a full global
+  fetch can take far longer than the main pipeline's other steps — bundling them
+  would force one pipeline's schedule/timeout onto the other
+- **Demo notebook:** `pipeline_demonstration_glofas.ipynb` — download, sparse Zarr
+  inspection, and visualizations (raster maps, RP exceedance hotspot zoom, single-gauge
+  ensemble hydrograph)
 
 ## Quick Start
 
@@ -247,3 +274,5 @@ jupyter notebook pipeline_demonstration.ipynb
 - [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
 - [ECMWF BUFR Format Documentation](https://confluence.ecmwf.int/display/ECC/BUFR+examples)
 - [eccodes Library](https://pypi.org/project/eccodes/)
+- [CDS/EWDS API (cdsapi)](https://pypi.org/project/cdsapi/) — used by the standalone GloFAS pipeline
+- [GloFAS — Global Flood Awareness System](https://global-flood.emergency.copernicus.eu/)

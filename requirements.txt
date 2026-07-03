@@ -4,6 +4,8 @@ eccodes>=1.5.0
 # ECMWF data access
 ecmwf-opendata>=0.3.29
 requests>=2.28.0  # used by DISS fallback downloader (ecmwf_tc_data_downloader.py)
+cdsapi>=0.7.0      # GloFAS riverine discharge (glofas_downloader.py) — separate
+                   # CEMS product/API from ecmwf-opendata; requires ~/.cdsapirc credentials
 
 # Data processing
 pandas>=2.0.0

@@ -1,4 +1,4 @@
-../.venv/
+.venv/
 .env
 __pycache__/
 .ipynb_checkpoints/
@@ -20,12 +20,21 @@ __pycache__/
 .DS_Store
 .idea/
 
+# Main TC pipeline local working directories
 tc_data/
 tc_extracted/
 tc_transformed/
 tc_data_transformed/
 wind_data/
 wind_extracted/
+met_data/
+
+# GloFAS local working directories (never COPY'd into either image — both Dockerfiles
+# create their own empty dirs fresh via mkdir)
+glofas_data/
+glofas_thresholds/
+glofas_thresholds_tmp/
+
 ecmwf_wind_data_extractor_BACKUP.py
 pipeline_demonstration_JAM.ipynb
 pipeline_demonstration_TEST.ipynb

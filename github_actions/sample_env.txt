@@ -55,3 +55,24 @@ DOWNLOAD_LIMIT=1
 # Specific run time to download (00, 06, 12, or 18, optional)
 # RUN_TIME=00
 
+# ==============================================================================
+# GloFAS riverine discharge — glofas_pipeline.py ONLY (standalone, separate cron
+# from the main pipeline above — see .github/workflows/glofas.yml)
+# ==============================================================================
+
+# Local dir for GloFAS Zarr files
+GLOFAS_DATA_DIR=glofas_data
+
+# Where the RP2 threshold file is read from: snowflake (default, works even when
+# DATA_PIPELINE_DB=LOCAL) or local (requires setup_glofas_thresholds.py --local-only
+# to have been run first)
+GLOFAS_THRESHOLD_SOURCE=snowflake
+GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
+
+# CDS/EWDS API credentials for cems-glofas-forecast (separate from ecmwf-opendata)
+CDSAPI_URL=https://ewds.climate.copernicus.eu/api
+CDSAPI_KEY=your_ewds_api_key
+
+# Specific date to download (YYYY-MM-DD format, optional — defaults to today UTC)
+# DOWNLOAD_DATE=2026-07-02
+

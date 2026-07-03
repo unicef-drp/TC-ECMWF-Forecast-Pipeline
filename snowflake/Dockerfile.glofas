@@ -1,0 +1,97 @@
+# ==============================================================================
+# Dockerfile for the standalone GloFAS Riverine Discharge Pipeline (SPCS Deployment)
+# ==============================================================================
+# Deliberately SEPARATE from Dockerfile (the main TC pipeline's image) — GloFAS never
+# touches BUFR/GRIB/wind/geospatial processing, so it doesn't need eccodes, geos, proj,
+# gdal, or gfortran. Building a shared image (or reusing Dockerfile's CMD) would either
+# bloat this image with unused system packages, or require a fragile configurable
+# entrypoint. See requirements-glofas.txt for the matching lean Python dependency set.
+#
+# The container executes snowflake/glofas_spcs_pipeline.py and terminates when complete.
+# ==============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="TC Forecast Pipeline"
+LABEL description="GloFAS Riverine Discharge Pipeline with Snowflake Integration (SPCS)"
+LABEL version="1.0"
+
+# ==============================================================================
+# Install system dependencies
+# ==============================================================================
+
+# Only what's needed to build/run netCDF4 and blosc2 wheels — no eccodes/geos/proj/gdal
+# (unlike Dockerfile, the main pipeline's image) since GloFAS never touches BUFR/GRIB/
+# geospatial processing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libhdf5-dev \
+    libnetcdf-dev \
+    pkg-config \
+    gcc \
+    g++ \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ==============================================================================
+# Set environment variables
+# ==============================================================================
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# ==============================================================================
+# Copy application code
+# ==============================================================================
+
+# Repo-root modules glofas_spcs_pipeline.py imports (via its own sys.path.insert)
+COPY glofas_downloader.py /app/
+COPY glofas_pipeline_core.py /app/
+COPY setup_glofas_thresholds.py /app/
+
+# Snowflake directory (contains glofas_spcs_pipeline.py and snowflake_loader.py)
+COPY snowflake/ /app/snowflake/
+
+COPY requirements-glofas.txt /app/requirements-glofas.txt
+
+# ==============================================================================
+# Install Python dependencies
+# ==============================================================================
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -r requirements-glofas.txt
+
+# ==============================================================================
+# Create directories for data
+# ==============================================================================
+
+RUN mkdir -p /app/glofas_data
+
+# ==============================================================================
+# Health check (optional - for monitoring)
+# ==============================================================================
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)"
+
+# ==============================================================================
+# Set default environment variables (can be overridden at runtime)
+# ==============================================================================
+
+ENV GLOFAS_DATA_DIR=/app/glofas_data
+ENV GLOFAS_THRESHOLD_SOURCE=snowflake
+ENV CLEANUP_AFTER_LOAD=true
+ENV DATA_PIPELINE_DB=SNOWFLAKE
+
+# Snowflake defaults (MUST be overridden at runtime)
+ENV SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+ENV SNOWFLAKE_DATABASE=WEATHER_DB
+ENV SNOWFLAKE_SCHEMA=TC_DATA
+# SNOWFLAKE_STAGE_NAME, CDSAPI_URL, CDSAPI_KEY must be set at runtime
+
+# ==============================================================================
+# Entrypoint and command
+# ==============================================================================
+
+CMD ["python", "snowflake/glofas_spcs_pipeline.py"]

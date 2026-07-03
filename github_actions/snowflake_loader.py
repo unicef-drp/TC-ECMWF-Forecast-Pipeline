@@ -547,6 +547,81 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
         cursor.close()
 
 
+def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
+    """
+    Load GloFAS riverine discharge metadata rows into RIVER_FORECASTS table.
+
+    Separate table from MET_FORECASTS (not an extension) — GloFAS discharge is a
+    derived LISFLOOD hydrological model output, not a raw ECMWF meteorological
+    field like tp/ro. Uses staging + MERGE to deduplicate on
+    (FORECAST_TIME, PARAM) — re-runs are safe. Same pattern as
+    load_precip_metadata_to_snowflake.
+
+    Args:
+        metadata_rows: list of dicts with keys forecast_time, param, stage_path
+        conn: active Snowflake connection
+
+    Returns number of rows merged.
+    """
+    if not metadata_rows:
+        return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS RIVER_FORECASTS (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR,
+                CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE RIVER_FORECASTS_STAGING (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR
+            )
+        """)
+
+        df = pd.DataFrame(metadata_rows)
+        df.columns = df.columns.str.upper()
+        if 'FORECAST_TIME' in df.columns:
+            df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'], errors='coerce').apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
+            )
+
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='RIVER_FORECASTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write riverine metadata to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO RIVER_FORECASTS t
+            USING RIVER_FORECASTS_STAGING s
+              ON  t.FORECAST_TIME = s.FORECAST_TIME
+              AND t.PARAM         = s.PARAM
+            WHEN MATCHED THEN
+                UPDATE SET t.STAGE_PATH = s.STAGE_PATH
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_TIME, PARAM, STAGE_PATH)
+                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} rows into RIVER_FORECASTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error loading riverine metadata: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
+
+
 def main():
     """Main execution."""
     try:

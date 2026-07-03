@@ -345,6 +345,82 @@ Wind data download depends on TC data:
 
 ---
 
+## GloFAS Riverine Discharge (Standalone Pipeline)
+
+A fully separate pipeline from everything above — not a phase of the main TC
+pipeline, not triggered alongside it. See `testing/RIVERINE_FLOODING_PLAN.md` for
+full architecture/rationale (why standalone, sparse Zarr filtering design, cadence).
+
+**Entry point:** `snowflake/glofas_spcs_pipeline.py`. **Image:** built from
+`snowflake/Dockerfile.glofas` — a dedicated, leaner image (no eccodes/geos/proj/gdal;
+GloFAS never touches BUFR/GRIB/wind/geospatial processing), using
+`requirements-glofas.txt` instead of `requirements-ci.txt`. This is a genuinely
+separate Docker image from `tc-ecmwf-pipeline` above — the main image's `CMD` is
+hardcoded to `spcs_pipeline.py` and never copies any GloFAS files in, so it cannot
+run this pipeline.
+
+### Building and pushing the GloFAS image
+
+Same registry/tagging flow as the main image above, just a different Dockerfile and
+image name:
+
+```bash
+docker build -f snowflake/Dockerfile.glofas -t glofas-pipeline:latest . --platform=linux/amd64
+
+docker tag glofas-pipeline:latest \
+  orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/myservice/glofas-pipeline:latest
+
+snow spcs image-registry login --connection default
+docker push orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/myservice/glofas-pipeline:latest
+```
+
+### Running in SPCS
+
+```sql
+EXECUTE JOB SERVICE
+   IN COMPUTE POOL my_compute_pool
+   NAME = glofas_job
+   ASYNC = TRUE
+   EXTERNAL_ACCESS_INTEGRATIONS = (AOTS_EGRESS_ACCESS_INTEGRATION)
+   FROM SPECIFICATION $$
+   spec:
+     containers:
+     - name: glofas-pipeline
+       image: /your_database/your_schema/your_service/glofas-pipeline:latest
+       env:
+          SPCS_RUN: true
+          SNOWFLAKE_ACCOUNT: your-account
+          SNOWFLAKE_USER: your_user
+          SNOWFLAKE_WAREHOUSE: your_warehouse
+          SNOWFLAKE_DATABASE: your_database
+          SNOWFLAKE_SCHEMA: your_schema
+          SNOWFLAKE_STAGE_NAME: "AOTS_ANALYSIS"
+          DATA_PIPELINE_DB: "SNOWFLAKE"
+          GLOFAS_THRESHOLD_SOURCE: "snowflake"
+          CDSAPI_URL: "https://ewds.climate.copernicus.eu/api"
+          CDSAPI_KEY: "your_ewds_api_key"
+     platformMonitor:
+       metricConfig:
+         groups:
+         - system
+         - network
+   $$;
+```
+
+Schedule via a Snowflake TASK calling this `EXECUTE JOB SERVICE`, once daily
+comfortably past GloFAS's ~11h publication latency (e.g. 12-13 UTC).
+
+**Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
+(manually, not part of any recurring job) to populate
+`@{stage}/glofas/thresholds_cache/rl_*.nc` — the sparse cell filter depends on
+these being present and will fail without them (unless `GLOFAS_THRESHOLD_SOURCE=local`
+with a pre-populated local directory instead).
+
+**Snowflake table:** `RIVER_FORECASTS` — same staging+MERGE pattern as the main
+pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`.
+
+---
+
 ## License
 
 Copyright 2025 Snowflake Inc.

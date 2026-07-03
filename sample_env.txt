@@ -34,6 +34,27 @@ SNOWFLAKE_STAGE_NAME=your_stage_name
 NAMED_STORMS_ONLY=true
 
 # ==============================================================================
+# GloFAS riverine discharge (standalone pipeline)
+# ==============================================================================
+
+# Local dir for GloFAS forecast Zarr files
+GLOFAS_DATA_DIR=glofas_data
+
+# Where the RP2 threshold file is read from: snowflake (default, works even when
+# DATA_PIPELINE_DB=LOCAL) or local (fully offline dev — requires
+# setup_glofas_thresholds.py --local-only to have been run first)
+GLOFAS_THRESHOLD_SOURCE=snowflake
+
+# Local dir containing rl_2.0.nc, used only when GLOFAS_THRESHOLD_SOURCE=local
+GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
+
+# CDS/EWDS API credentials for cems-glofas-forecast (separate from ecmwf-opendata,
+# no auth needed elsewhere in this pipeline). Format: https://cds.climate.copernicus.eu
+# account page. Omit to fall back to a local ~/.cdsapirc file instead.
+CDSAPI_URL=https://ewds.climate.copernicus.eu/api
+CDSAPI_KEY=your_ewds_api_key
+
+# ==============================================================================
 # Usage
 # ==============================================================================
 # 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env

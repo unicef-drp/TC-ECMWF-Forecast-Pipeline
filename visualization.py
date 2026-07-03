@@ -1036,6 +1036,581 @@ def show_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv=None
                                        show_plot=True, save_plot=False)
 
 
+# ─── GloFAS Riverine Discharge Visualizations ────────────────────────────────
+
+GLOFAS_DEFAULT_BOUNDS = (-180.0, 180.0, -60.0, 60.0)  # matches the pipeline's own clip
+
+
+def _setup_glofas_map(ax, bounds, regional=False, show_labels=True):
+    """
+    Map setup for GloFAS plots. Deliberately does NOT use setup_map()'s web-tile
+    basemap (Carto Positron) — that tile source is a) a live network fetch that
+    silently falls back to a near-blank map if it fails, and b) intentionally
+    very pale even when it succeeds (designed for busy data overlays, not for
+    orienting a viewer who has no other context). Instead uses solid, always
+    available Natural Earth land/ocean coloring + coastlines + borders, so the
+    map is legible even at a glance and never depends on network access.
+
+    regional=True (for zoomed views) also adds state/province boundaries and
+    lake outlines — needed for orientation once you're zoomed past country scale.
+    """
+    lon_min, lon_max, lat_min, lat_max = bounds
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    ax.add_feature(cfeature.OCEAN, facecolor='#cfe3ee', zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor='#f2efe9', zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, color='#333333', zorder=3)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.7, color='#555555', zorder=3)
+    ax.add_feature(cfeature.LAKES, facecolor='#cfe3ee', edgecolor='#333333', linewidth=0.4, zorder=1)
+
+    if regional:
+        states = cfeature.NaturalEarthFeature(
+            category='cultural', name='admin_1_states_provinces_lines',
+            scale='50m', facecolor='none')
+        ax.add_feature(states, edgecolor='#888888', linewidth=0.5, linestyle='--', zorder=3)
+
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=show_labels,
+                      linewidth=0.4, color='gray', alpha=0.4, linestyle='--')
+    if show_labels:
+        gl.top_labels = False
+        gl.right_labels = False
+        if hasattr(gl, 'geo_labels'):
+            gl.geo_labels = False
+
+
+def _load_glofas_zarr(zarr_path):
+    """Load GloFAS Zarr ZipStore, return sparse data array + cell coordinates."""
+    import zarr as _zarr
+    store = _zarr.storage.ZipStore(str(zarr_path), mode='r')
+    try:
+        root = _zarr.open_group(store=store, mode='r')
+        z = root['data']
+        attrs = dict(root.attrs)
+        data = np.asarray(z)               # (member, step, n_cells)
+        cell_lat = np.asarray(root['cell_lat'])
+        cell_lon = np.asarray(root['cell_lon'])
+    finally:
+        store.close()
+    return {
+        'data': data,
+        'cell_lat': cell_lat,
+        'cell_lon': cell_lon,
+        'leadtime_hours': attrs['leadtime_hours'],       # [24, 48, ..., 168]
+        'member_numbers': attrs.get('member_numbers', list(range(1, 52))),
+        'forecast_date': attrs.get('forecast_date', ''),
+        'n_cells_kept': attrs.get('n_cells_kept', data.shape[2]),
+        'n_cells_total': attrs.get('n_cells_total', None),
+        'filter_threshold': attrs.get('filter_threshold', ''),
+    }
+
+
+def _glofas_step_index(leadtime_hours, hour):
+    """Return Zarr step-axis index for a given forecast lead hour."""
+    arr = np.array(leadtime_hours)
+    hits = np.where(arr == hour)[0]
+    if not len(hits):
+        raise ValueError(f"Lead hour {hour} not in available steps {leadtime_hours}")
+    return int(hits[0])
+
+
+def _glofas_sparse_to_dense(cell_lat, cell_lon, values, res=0.05,
+                            lat_min=-60.0, lat_max=60.0, lon_min=-180.0, lon_max=180.0):
+    """
+    Reconstruct a dense (lat, lon) raster from GloFAS's sparse cell arrays, so it
+    can be rendered with pcolormesh/imshow instead of overlapping scatter dots.
+    Cells never kept by the sparse filter are NaN (transparent when plotted).
+
+    Native 0.05deg grid: row 0 = lat_max (grid is stored N->S, matching the
+    forecast's own latitude order), col 0 = lon_min (grid is W->E).
+
+    Returns (dense, lats_1d, lons_1d) — dense.shape == (len(lats_1d), len(lons_1d)).
+    """
+    n_lat = int(round((lat_max - lat_min) / res)) + 1
+    n_lon = int(round((lon_max - lon_min) / res)) + 1
+    dense = np.full((n_lat, n_lon), np.nan, dtype=np.float32)
+
+    row = np.round((lat_max - cell_lat) / res).astype(int)
+    col = np.round((cell_lon - lon_min) / res).astype(int)
+    in_bounds = (row >= 0) & (row < n_lat) & (col >= 0) & (col < n_lon)
+    dense[row[in_bounds], col[in_bounds]] = values[in_bounds]
+
+    lats_1d = lat_max - np.arange(n_lat) * res
+    lons_1d = lon_min + np.arange(n_lon) * res
+    return dense, lats_1d, lons_1d
+
+
+def _glofas_crop(dense, lats_1d, lons_1d, bounds):
+    """Crop a dense raster (+ its coordinate axes) to (lon_min, lon_max, lat_min, lat_max)."""
+    lon_min, lon_max, lat_min, lat_max = bounds
+    lat_idx = np.where((lats_1d >= lat_min) & (lats_1d <= lat_max))[0]
+    lon_idx = np.where((lons_1d >= lon_min) & (lons_1d <= lon_max))[0]
+    return dense[np.ix_(lat_idx, lon_idx)], lats_1d[lat_idx], lons_1d[lon_idx]
+
+
+def _lookup_threshold_at_cells(threshold_path, rp, cell_lat, cell_lon):
+    """
+    Fast nearest-neighbor lookup of an official RP threshold at many cell
+    coordinates. Uses direct integer-index arithmetic on the loaded numpy array
+    instead of xarray's per-point .sel(method='nearest') — the latter takes
+    ~100s for ~470k points against the full-resolution global threshold grid;
+    this takes well under a second, since the two grids share the same 0.05deg
+    alignment (already confirmed by the pipeline's own grid-match checks).
+    """
+    import xarray as xr
+    official = xr.open_dataset(threshold_path)
+    try:
+        thr_lat = official['lat'].values   # descending, full global domain
+        thr_lon = official['lon'].values   # ascending
+        thr_arr = official[f"rl_{rp}"].values  # (lat, lon), eager load — one bulk read
+    finally:
+        official.close()
+
+    res = abs(thr_lat[0] - thr_lat[1])
+    row = np.round((thr_lat[0] - cell_lat) / res).astype(int)
+    col = np.round((cell_lon - thr_lon[0]) / res).astype(int)
+    row = np.clip(row, 0, thr_arr.shape[0] - 1)
+    col = np.clip(col, 0, thr_arr.shape[1] - 1)
+    return thr_arr[row, col]
+
+
+def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_thresholds', rp='2.0',
+                        step_h=72, pad_deg=12.0):
+    """
+    Find a real bounding box around the strongest RP-exceedance cluster, for use
+    as the `bounds` argument to a zoomed-in visualize_glofas_* call. Returns
+    (lon_min, lon_max, lat_min, lat_max) padded by pad_deg, or None if no
+    threshold data / exceedance is found.
+    """
+    threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
+    if not threshold_path.exists():
+        print(f"  RP{rp} threshold file not found at {threshold_path} — cannot find a hotspot.")
+        return None
+
+    g = _load_glofas_zarr(zarr_path)
+    sidx = _glofas_step_index(g['leadtime_hours'], step_h)
+    disch = g['data'][:, sidx, :]
+
+    thr_at_cells = _lookup_threshold_at_cells(threshold_path, rp, g['cell_lat'], g['cell_lon'])
+
+    valid = thr_at_cells > 0
+    exceed_pct = np.zeros(len(g['cell_lat']))
+    exceed_pct[valid] = (disch[:, valid] > thr_at_cells[valid]).mean(axis=0) * 100
+
+    if not (exceed_pct > 0).any():
+        print("  No exceedance found anywhere — cannot pick a hotspot.")
+        return None
+
+    # Densest cluster of high-exceedance cells: bin into 2deg cells, find the bin
+    # with the most >50%-exceedance cells, then bound the actual cells within it.
+    hot = exceed_pct > 50
+    if not hot.any():
+        hot = exceed_pct > 0  # fall back to any exceedance at all
+    hot_lat, hot_lon = g['cell_lat'][hot], g['cell_lon'][hot]
+    bin_lat = np.round(hot_lat / 2.0).astype(int)
+    bin_lon = np.round(hot_lon / 2.0).astype(int)
+    bins, counts = np.unique(np.stack([bin_lat, bin_lon], axis=1), axis=0, return_counts=True)
+    best_bin = bins[np.argmax(counts)]
+    in_bin = (bin_lat == best_bin[0]) & (bin_lon == best_bin[1])
+
+    lat_c, lon_c = hot_lat[in_bin], hot_lon[in_bin]
+    bounds = (float(lon_c.min()) - pad_deg, float(lon_c.max()) + pad_deg,
+              float(lat_c.min()) - pad_deg, float(lat_c.max()) + pad_deg)
+    print(f"  Hotspot: {int(in_bin.sum())} cells near lat={lat_c.mean():.1f}, lon={lon_c.mean():.1f}"
+          f"  -> bounds={tuple(round(b, 1) for b in bounds)}")
+    return bounds
+
+
+def find_glofas_active_cell(zarr_path):
+    """
+    Find a single "gauge" cell with a genuinely developing signal — the cell
+    whose ensemble-max discharge rises the most from the first to the last lead
+    time (a clear, visually dramatic rising hydrograph, not just a big river that
+    happens to be uniformly high all week). Returns (cell_lat, cell_lon).
+    """
+    g = _load_glofas_zarr(zarr_path)
+    max_per_step = g['data'].max(axis=0)   # (step, n_cells)
+    rise = max_per_step[-1] - max_per_step[0]
+    idx = int(np.argmax(rise))
+    lat, lon = float(g['cell_lat'][idx]), float(g['cell_lon'][idx])
+    print(f"  Most active cell: lat={lat:.2f}, lon={lon:.2f}  "
+          f"(max discharge rises {max_per_step[0][idx]:.0f} -> {max_per_step[-1][idx]:.0f} m3/s "
+          f"over the horizon)")
+    return lat, lon
+
+
+def _glofas_thresholds_at_point(cell_lat, cell_lon, threshold_local_dir, rps):
+    """Look up official RP threshold values at one point, for each rp in rps."""
+    import xarray as xr
+    values = {}
+    for rp in rps:
+        threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
+        if not threshold_path.exists():
+            continue
+        official = xr.open_dataset(threshold_path)
+        try:
+            val = official[f"rl_{rp}"].sel(
+                lat=cell_lat, lon=cell_lon, method='nearest',
+            ).item()
+            if val > 0:
+                values[rp] = float(val)
+        finally:
+            official.close()
+    return values
+
+
+def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
+                                      threshold_local_dir='glofas_thresholds',
+                                      rps=('2.0', '5.0', '20.0'),
+                                      output_dir=DEFAULT_OUTPUT_DIR,
+                                      show_plot=True, save_plot=False):
+    """
+    Point hydrograph for a single cell: all 51 ensemble member traces across the
+    7-day lead-time horizon, an ensemble median, a min-max spread band, and
+    official RP threshold lines — matching the style of Google Flood Hub /
+    GloFAS's own single-gauge forecast view.
+
+    Args:
+        zarr_path:            Path to river_YYYYMMDD.zarr.zip
+        cell_lat, cell_lon:   Which cell to plot; if either is None, uses
+                               find_glofas_active_cell() to pick one automatically
+        threshold_local_dir:  Local dir containing rl_{rp}.nc files
+        rps:                  Which RP tiers to draw as threshold lines
+        output_dir:           Directory for saved PNG
+        show_plot:            Display interactively
+        save_plot:            Save PNG to output_dir
+    """
+    print("=" * 60)
+    print("GLOFAS — GAUGE HYDROGRAPH")
+    print("=" * 60)
+
+    g = _load_glofas_zarr(zarr_path)
+
+    if cell_lat is None or cell_lon is None:
+        cell_lat, cell_lon = find_glofas_active_cell(zarr_path)
+
+    # Nearest stored cell to the requested point (sparse array — no direct index)
+    dist2 = (g['cell_lat'] - cell_lat) ** 2 + (g['cell_lon'] - cell_lon) ** 2
+    idx = int(np.argmin(dist2))
+    actual_lat, actual_lon = float(g['cell_lat'][idx]), float(g['cell_lon'][idx])
+
+    series = g['data'][:, :, idx]              # (member, step)
+    lead_hours = g['leadtime_hours']
+    x = np.array(lead_hours)
+
+    threshold_vals = _glofas_thresholds_at_point(actual_lat, actual_lon, threshold_local_dir, rps)
+
+    print(f"  Cell: lat={actual_lat:.2f}, lon={actual_lon:.2f}")
+    print(f"  Peak across all members/days: {series.max():.0f} m3/s")
+    print(f"  Thresholds found: {', '.join(f'RP{rp}yr={v:.0f}' for rp, v in threshold_vals.items()) or 'none'}")
+
+    fig = plt.figure(figsize=(11, 6.5), dpi=DPI)
+    ax = fig.add_axes([0.08, 0.1, 0.88, 0.8])
+
+    # Locator inset — regional context map with a marker at the gauge, so the
+    # chart doesn't require already knowing what lat/lon 22.18, 113.43 means.
+    pad = 12.0
+    inset_bounds = (max(actual_lon - pad, -180), min(actual_lon + pad, 180),
+                    max(actual_lat - pad, -60), min(actual_lat + pad, 60))
+    inset_ax = fig.add_axes([0.70, 0.68, 0.27, 0.27], projection=ccrs.PlateCarree())
+    _setup_glofas_map(inset_ax, inset_bounds, regional=True, show_labels=False)
+    inset_ax.plot(actual_lon, actual_lat, marker='*', markersize=14, color='red',
+                  markeredgecolor='black', markeredgewidth=0.6,
+                  transform=ccrs.PlateCarree(), zorder=5)
+    inset_ax.set_title(f"lat={actual_lat:.2f}, lon={actual_lon:.2f}", fontsize=8, pad=3)
+    for spine in inset_ax.spines.values():
+        spine.set_edgecolor('#666666')
+        spine.set_linewidth(0.8)
+
+    for m in range(series.shape[0]):
+        ax.plot(x, series[m], color='#4C72B0', alpha=0.18, linewidth=1, zorder=2)
+
+    median = np.median(series, axis=0)
+    lo, hi = series.min(axis=0), series.max(axis=0)
+    ax.fill_between(x, lo, hi, color='#4C72B0', alpha=0.12, zorder=1, label='Member min-max range')
+    ax.plot(x, median, color='#1B3B6F', linewidth=2.5, zorder=4, label='Ensemble median')
+
+    # Threshold lines — Warning/Danger/Extreme-style palette, lightest RP first
+    threshold_colors = ['#F5A623', '#E85D4F', '#8B1A1A', '#4B0082', '#000000']
+    threshold_labels_map = {'2.0': 'Warning', '5.0': 'Danger', '20.0': 'Extreme'}
+    for i, rp in enumerate(rps):
+        if rp not in threshold_vals:
+            continue
+        color = threshold_colors[i % len(threshold_colors)]
+        label = threshold_labels_map.get(rp, f'RP{rp}yr')
+        ax.axhline(threshold_vals[rp], color=color, linewidth=2, zorder=3,
+                  label=f'{label} (RP{rp}yr, {threshold_vals[rp]:.0f} m3/s)')
+
+    ax.set_xlabel('Lead time (hours)', fontsize=11)
+    ax.set_ylabel('Discharge (m3/s)', fontsize=11)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'+{h}h' for h in x])
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.25)
+    ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
+
+    title = f"GloFAS Gauge Hydrograph — lat={actual_lat:.2f}, lon={actual_lon:.2f}"
+    title += f"\nIssued: {g['forecast_date']} | {series.shape[0]} members"
+    ax.set_title(title, fontsize=13, fontweight='bold', pad=12)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = Path(output_dir) / f"glofas_gauge_{actual_lat:.2f}_{actual_lon:.2f}.png"
+        plt.savefig(filepath, dpi=DPI, facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
+                                 threshold_local_dir='glofas_thresholds', rps=('2.0', '5.0', '20.0')):
+    """Quick function to show a single-gauge ensemble hydrograph with threshold lines."""
+    return visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=cell_lat, cell_lon=cell_lon,
+                                             threshold_local_dir=threshold_local_dir, rps=rps,
+                                             show_plot=True, save_plot=False)
+
+
+def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
+                                   output_dir=DEFAULT_OUTPUT_DIR,
+                                   show_plot=True, save_plot=False):
+    """
+    Global scatter map of ensemble mean river discharge at a given lead hour.
+
+    Args:
+        zarr_path:  Path to river_YYYYMMDD.zarr.zip
+        step_h:     Lead hour shown (24, 48, ..., 168)
+        bounds:     Optional (lon_min, lon_max, lat_min, lat_max); defaults global
+        output_dir: Directory for saved PNG
+        show_plot:  Display interactively
+        save_plot:  Save PNG to output_dir
+    """
+    print("=" * 60)
+    print("GLOFAS — ENSEMBLE MEAN DISCHARGE")
+    print("=" * 60)
+
+    g = _load_glofas_zarr(zarr_path)
+    sidx = _glofas_step_index(g['leadtime_hours'], step_h)
+
+    mean_val = g['data'][:, sidx, :].mean(axis=0)  # (n_cells,) across 51 members
+    dense, lats_1d, lons_1d = _glofas_sparse_to_dense(g['cell_lat'], g['cell_lon'], mean_val)
+
+    bounds = bounds or GLOFAS_DEFAULT_BOUNDS
+    dense, lats_1d, lons_1d = _glofas_crop(dense, lats_1d, lons_1d, bounds)
+    n_total = g['n_cells_total']
+    cells_note = f"{g['n_cells_kept']:,}" + (f" of {n_total:,} total" if n_total else "")
+    print(f"  Lead: +{step_h}h  |  Cells: {cells_note}  |  Max mean discharge: {mean_val.max():.0f} m3/s")
+
+    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    _setup_glofas_map(ax, bounds, regional=(bounds != GLOFAS_DEFAULT_BOUNDS))
+
+    # Log color scale — discharge spans <1 to >200,000 m3/s
+    from matplotlib.colors import LogNorm
+    vmax = max(float(np.nanpercentile(dense, 99)), 1.0)
+    mesh = ax.pcolormesh(lons_1d, lats_1d, np.clip(dense, 0.1, None),
+                        cmap='YlGnBu', norm=LogNorm(vmin=1, vmax=vmax),
+                        transform=ccrs.PlateCarree(), zorder=2, shading='auto')
+    plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
+                 label='Ensemble mean discharge (m3/s, log scale)', shrink=0.7)
+
+    title = f"GloFAS Ensemble Mean River Discharge — +{step_h}h"
+    title += (f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
+              f" | filtered to {g['filter_threshold']}")
+    plt.title(title, fontsize=14, fontweight='bold', pad=15)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = Path(output_dir) / f"glofas_mean_{step_h}h.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_glofas_period_panels(zarr_path, lead_hours=None,
+                                   output_dir=DEFAULT_OUTPUT_DIR,
+                                   show_plot=True, save_plot=False):
+    """
+    Small-multiples panel: ensemble MAX discharge across several lead times,
+    showing how the forecast evolves day by day.
+
+    Args:
+        zarr_path:   Path to river_YYYYMMDD.zarr.zip
+        lead_hours:  List of lead hours to show (default: first, ~1/3, ~2/3, last
+                     of the available steps — typically [24, 72, 120, 168])
+        output_dir:  Directory for saved PNG
+        show_plot:   Display interactively
+        save_plot:   Save PNG to output_dir
+    """
+    print("=" * 60)
+    print("GLOFAS — MULTI-DAY ENSEMBLE MAX PANELS")
+    print("=" * 60)
+
+    g = _load_glofas_zarr(zarr_path)
+    steps = g['leadtime_hours']
+    if lead_hours is None:
+        n = len(steps)
+        idxs = sorted(set([0, n // 3, 2 * n // 3, n - 1]))
+        lead_hours = [steps[i] for i in idxs]
+
+    from matplotlib.colors import LogNorm
+    all_max = g['data'].max(axis=0)  # (step, n_cells) — for a shared color scale
+    vmax = max(float(np.percentile(all_max, 99)), 1.0)
+
+    n_panels = len(lead_hours)
+    ncols = min(n_panels, 2)
+    nrows = (n_panels + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(FIGSIZE[0], FIGSIZE[1] * nrows / 2),
+                             dpi=DPI, subplot_kw={'projection': ccrs.PlateCarree()})
+    axes = np.atleast_1d(axes).flatten()
+
+    for i, h in enumerate(lead_hours):
+        ax = axes[i]
+        sidx = _glofas_step_index(steps, h)
+        max_val = g['data'][:, sidx, :].max(axis=0)
+        dense, lats_1d, lons_1d = _glofas_sparse_to_dense(g['cell_lat'], g['cell_lon'], max_val)
+        _setup_glofas_map(ax, GLOFAS_DEFAULT_BOUNDS)
+        mesh = ax.pcolormesh(lons_1d, lats_1d, np.clip(dense, 0.1, None),
+                            cmap='YlOrRd', norm=LogNorm(vmin=1, vmax=vmax),
+                            transform=ccrs.PlateCarree(), zorder=2, shading='auto')
+        ax.set_title(f"+{h}h  (max discharge: {max_val.max():.0f} m3/s)", fontsize=11)
+
+    for j in range(n_panels, len(axes)):
+        axes[j].axis('off')
+
+    fig.colorbar(mesh, ax=axes[:n_panels].tolist(), orientation='horizontal',
+                pad=0.05, label='Ensemble max discharge (m3/s, log scale)', shrink=0.6)
+    fig.suptitle(f"GloFAS Ensemble Max Discharge by Lead Time — issued {g['forecast_date']}",
+                fontsize=14, fontweight='bold')
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = Path(output_dir) / "glofas_period_panels.png"
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_thresholds',
+                                rp='2.0', step_h=72, bounds=None,
+                                output_dir=DEFAULT_OUTPUT_DIR,
+                                show_plot=True, save_plot=False):
+    """
+    Probability map: fraction of ensemble members exceeding the official RPx
+    threshold at a given lead hour. Requires the threshold file to already be
+    cached locally (setup_glofas_thresholds.py --local-only) — this is the same
+    file the pipeline itself depends on for its sparse cell filter.
+
+    Args:
+        zarr_path:            Path to river_YYYYMMDD.zarr.zip
+        threshold_local_dir:  Local dir containing rl_{rp}.nc
+        rp:                   Return period tier, e.g. '2.0', '5.0', '20.0'
+        step_h:               Lead hour shown
+        bounds:               Optional (lon_min, lon_max, lat_min, lat_max) to zoom
+                               in — see find_glofas_hotspot() to locate one automatically
+        output_dir:           Directory for saved PNG
+        show_plot:            Display interactively
+        save_plot:            Save PNG to output_dir
+    """
+    zoomed = bounds is not None
+    print("=" * 60)
+    print(f"GLOFAS — RP{rp}yr EXCEEDANCE PROBABILITY (+{step_h}h)" + ("  [ZOOMED]" if zoomed else ""))
+    print("=" * 60)
+
+    threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
+    if not threshold_path.exists():
+        print(f"  RP{rp} threshold file not found at {threshold_path} — skipping.")
+        print(f"  Run: python3 setup_glofas_thresholds.py --local-only {threshold_local_dir}")
+        return None
+
+    g = _load_glofas_zarr(zarr_path)
+    sidx = _glofas_step_index(g['leadtime_hours'], step_h)
+    disch = g['data'][:, sidx, :]  # (member, n_cells)
+
+    thr_at_cells = _lookup_threshold_at_cells(threshold_path, rp, g['cell_lat'], g['cell_lon'])
+
+    valid = thr_at_cells > 0
+    exceed_pct = np.zeros(len(g['cell_lat']))
+    exceed_pct[valid] = (disch[:, valid] > thr_at_cells[valid]).mean(axis=0) * 100
+
+    dense, lats_1d, lons_1d = _glofas_sparse_to_dense(g['cell_lat'], g['cell_lon'], exceed_pct)
+    plot_bounds = bounds or GLOFAS_DEFAULT_BOUNDS
+    dense, lats_1d, lons_1d = _glofas_crop(dense, lats_1d, lons_1d, plot_bounds)
+
+    print(f"  Cells with any threshold data : {valid.sum():,} of {len(g['cell_lat']):,}")
+    print(f"  Cells with >50% members exceeding RP{rp}yr : {(exceed_pct > 50).sum():,}")
+
+    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    _setup_glofas_map(ax, plot_bounds, regional=zoomed)
+
+    mesh = ax.pcolormesh(lons_1d, lats_1d, dense,
+                        cmap='YlOrRd', vmin=0, vmax=100,
+                        transform=ccrs.PlateCarree(), zorder=2, shading='auto')
+    plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
+                label=f'P(discharge > RP{rp}yr) at +{step_h}h  [%]', shrink=0.7)
+
+    title = f"GloFAS RP{rp}yr Exceedance Probability — +{step_h}h" + (" (zoomed to hotspot)" if zoomed else "")
+    title += f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
+    plt.title(title, fontsize=14, fontweight='bold', pad=15)
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        tag = "_zoomed" if zoomed else ""
+        filepath = Path(output_dir) / f"glofas_exceedance_rp{rp}_{step_h}h{tag}.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None):
+    """Quick function to show ensemble mean discharge map."""
+    return visualize_glofas_ensemble_mean(zarr_path, step_h=step_h, bounds=bounds,
+                                          show_plot=True, save_plot=False)
+
+
+def show_glofas_period_panels(zarr_path, lead_hours=None):
+    """Quick function to show multi-day ensemble max panels."""
+    return visualize_glofas_period_panels(zarr_path, lead_hours=lead_hours,
+                                          show_plot=True, save_plot=False)
+
+
+def show_glofas_exceedance(zarr_path, threshold_local_dir='glofas_thresholds', rp='2.0', step_h=72, bounds=None):
+    """Quick function to show RP exceedance probability map."""
+    return visualize_glofas_exceedance(zarr_path, threshold_local_dir=threshold_local_dir,
+                                       rp=rp, step_h=step_h, bounds=bounds,
+                                       show_plot=True, save_plot=False)
+
+
 # ─── Gust Envelope Visualizations ────────────────────────────────────────────
 
 # Gust threshold colors (oranges/reds — distinct from wind blues/greens)
