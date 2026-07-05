@@ -48,6 +48,21 @@ python web/app.py
 
 The dashboard will be available at `http://localhost:10000`
 
+### Standalone ensemble envelope visualization
+
+`visualize_ensemble_envelopes.py` is a separate script, not part of the Dash app.
+It queries `TC_ENVELOPES_COMBINED` and `TC_TRACKS` directly and produces a static
+grid of subplots, one per ensemble member, showing wind threshold envelopes
+overlaid with the track for a single storm and forecast run.
+
+```bash
+python web/visualize_ensemble_envelopes.py --storm MAILA
+python web/visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00
+python web/visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00 --out /tmp/out.png
+```
+
+`--storm` is required. Uses the same Snowflake environment variables as the main app.
+
 ## Features
 
 - **Interactive Map**: Plotly-based map with animation controls
@@ -66,7 +81,8 @@ The dashboard will be available at `http://localhost:10000`
 ### Map not loading
 - Check browser console for JavaScript errors
 - Ensure Plotly.js is loading correctly
-- Verify Mapbox/OpenStreetMap tile access
+- The map uses free OpenStreetMap tiles (no Mapbox account or token needed);
+  check network access to the tile provider if the basemap fails to load
 
 ### Performance issues
 - Large datasets may load slowly

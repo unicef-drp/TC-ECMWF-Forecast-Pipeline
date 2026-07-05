@@ -3,7 +3,8 @@
 dash>=2.14.0
 
 # Plotting and visualization
-plotly>=5.15.0
+plotly>=5.24.0  # go.Scattermap requires 5.24.0+, absent in earlier versions
+matplotlib>=3.7.0  # required by visualize_ensemble_envelopes.py
 
 # Data processing
 pandas>=2.0.0

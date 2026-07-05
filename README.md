@@ -229,8 +229,10 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 
 ## GloFAS Riverine Discharge Pipeline (standalone)
 
-A fully separate daily pipeline, **not** part of the TC forecast pipeline above —
-see `testing/RIVERINE_FLOODING_PLAN.md` for the full architecture and rationale.
+A fully separate daily pipeline, **not** part of the TC forecast pipeline above.
+GloFAS's own publication cadence (once per calendar day, driven by the 00Z IFS
+ENS cycle) and its much longer full-global download time are why it runs as
+its own independent job rather than a step inside the main pipeline.
 
 - **Entry points:** `github_actions/glofas_pipeline.py` (own workflow,
   `.github/workflows/glofas.yml`, cron `0 15 * * *` UTC) and

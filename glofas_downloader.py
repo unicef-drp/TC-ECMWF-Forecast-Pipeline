@@ -21,39 +21,25 @@ Storage format:
 Cadence — the key difference from tp/ro:
   GloFAS's operational medium-range product is driven only by the 00 UTC IFS ENS
   cycle and is published to CDS at most ONCE PER CALENDAR DAY (the `cems-glofas-
-  forecast` CDS schema has no run-hour selector — only year/month/day). The TC
+  forecast` CDS schema has no run-hour selector, only year/month/day). The TC
   pipeline runs 4x/day (00/06/12/18Z cycles), so 3 of the 4 daily runs will find a
   same-day GloFAS file already cached and skip the download entirely. The Zarr/stage
   cache key is therefore DATE-ONLY (no run_time component), unlike tp/ro's per-run key.
 
 Publication lag: a given calendar day's GloFAS forecast is not always available
-  immediately — this module falls back to the previous day if the current day's
+  immediately; this module falls back to the previous day if the current day's
   request fails, logging clearly which date was actually used.
 
 Dtype note: float32, not float16 (unlike tp/ro). Global river discharge has a far
-  larger dynamic range than precipitation-in-mm — tiny streams under 1 m3/s up to
+  larger dynamic range than precipitation-in-mm; tiny streams under 1 m3/s up to
   major rivers exceeding 100,000+ m3/s. float16's max representable value (65,504)
   risks silent overflow to inf for the world's largest rivers.
-
-Sparse cell filtering (2026-07-03): a global dense (member, step, lat, lon) array is
-  mostly non-river/no-signal cells — a representative regional test compressed only
-  2.3x (vs ro's 6.5x from ocean-zero sparsity), because a river-containing bbox has
-  far less "boring" redundancy than the global average. Rather than rely on
-  compression alone, this module drops any grid cell where NO member, on ANY of the
-  7 days, exceeds the RP2yr threshold (the loosest/most inclusive official tier) —
-  mirroring the `any_exceed` filter already validated in
-  testing/malegaon_comparison/glofas_floodhub_interactive_map.py. Kept cells retain
-  their COMPLETE, unmasked (member, step) time series — nothing is thinned within a
-  kept cell, only whole cells are dropped. This makes the Zarr's `data` array sparse:
-  shape (member=51, step=7, n_cells) instead of (member=51, step=7, lat, lon), with
-  parallel `cell_lat`/`cell_lon` arrays recording each kept cell's coordinates. This
-  requires the RP2 threshold file to already be cached (see setup_glofas_thresholds.py)
-  before this downloader can run — GLOFAS_THRESHOLD_SOURCE controls where it's read from.
 """
 
 import logging
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Union
@@ -82,9 +68,11 @@ MAX_PUBLICATION_LAG_DAYS = 1  # how many days back to retry if today's forecast 
 # Threshold tier used to decide which cells are worth storing at all
 FILTER_RP = "2.0"
 
-# Everything GloFAS-related on the stage lives under glofas/ (forecast Zarrs at
-# glofas/{date}/, thresholds at glofas/thresholds_cache/)
-THRESHOLD_STAGE_PREFIX = "glofas_thresholds"
+# Everything GloFAS-related on the stage lives under glofas/. Forecast Zarrs at
+# glofas/{date}/, thresholds at glofas/thresholds_cache/. Must be kept in sync
+# with STAGE_PREFIX in setup_glofas_thresholds.py, since there is no shared
+# import between the two entry points.
+THRESHOLD_STAGE_PREFIX = "glofas/thresholds_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -245,16 +233,33 @@ def _retrieve_glofas(client, forecast_date: datetime, product_type: str, target:
 
 def _download_for_date(client, forecast_date: datetime, raw_dir: Path) -> Optional[Dict[str, Path]]:
     """Attempt to download both products for one calendar date. Returns None (not raises)
-    if GloFAS hasn't published that date yet, so the caller can fall back a day."""
+    if GloFAS hasn't published that date yet, so the caller can fall back a day.
+
+    Submits both CDS requests concurrently — client.retrieve() blocks on the full
+    submit -> queue-wait -> download cycle, and the two requests' queue waits are
+    independent of each other, so running them sequentially means the ensemble
+    request's queue wait (often the bulk of the total time, given it's the larger
+    of the two) fully elapses before the control request is even submitted.
+    Concurrent submission lets both queue waits overlap instead of stack."""
     date_str = forecast_date.strftime("%Y%m%d")
     ens_path = raw_dir / f"glofas_ens_{date_str}.nc"
     ctrl_path = raw_dir / f"glofas_ctrl_{date_str}.nc"
 
+    jobs = []
+    if not ens_path.exists():
+        jobs.append(("ensemble_perturbed_forecasts", ens_path))
+    if not ctrl_path.exists():
+        jobs.append(("control_forecast", ctrl_path))
+
     try:
-        if not ens_path.exists():
-            _retrieve_glofas(client, forecast_date, "ensemble_perturbed_forecasts", ens_path)
-        if not ctrl_path.exists():
-            _retrieve_glofas(client, forecast_date, "control_forecast", ctrl_path)
+        if jobs:
+            with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                futures = {
+                    executor.submit(_retrieve_glofas, client, forecast_date, product_type, target): target
+                    for product_type, target in jobs
+                }
+                for future in as_completed(futures):
+                    future.result()  # re-raises here if that request failed
         return {"ens": ens_path, "ctrl": ctrl_path}
     except Exception as e:
         logger.warning(f"  GloFAS not available for {date_str}: {e}")
@@ -322,8 +327,6 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     try:
         ens = xr.open_dataset(paths["ens"])
         ctrl = xr.open_dataset(paths["ctrl"])
-        ens_arr = ens["dis24"].squeeze("forecast_reference_time").values      # (50, 7, lat, lon)
-        ctrl_arr = ctrl["dis24"].squeeze("forecast_reference_time").values    # (7, lat, lon)
         lats = ens.latitude.values
         lons = ens.longitude.values
         pf_numbers = sorted(int(n) for n in ens.number.values)
@@ -332,26 +335,61 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
            not np.allclose(ctrl.longitude.values, lons, atol=1e-4):
             raise ValueError("Control forecast grid does not match ensemble grid")
 
-        # member index 0-49 = ECMWF members 1-50 (pf); index 50 = control.
-        # Matches TC_TRACKS.ENSEMBLE_MEMBER / wind pipeline convention (51 = control).
-        arr = np.concatenate([ens_arr, ctrl_arr[np.newaxis, ...]], axis=0).astype(np.float32)
-        n_members, n_steps, n_lat, n_lon = arr.shape
+        n_pf = len(pf_numbers)
+        n_steps = len(LEADTIME_HOURS)
+        n_lat, n_lon = len(lats), len(lons)
+        n_members = n_pf + 1
         n_cells_total = n_lat * n_lon
 
-        logger.info(f"  Array shape: {arr.shape}  max discharge: {float(np.nanmax(arr)):.0f} m3/s")
-
-        # Sparse cell filtering: keep a cell only if >=1 member on >=1 day exceeds RP2.
+        # Process in latitude bands instead of materializing the whole (51, 7, 2400,
+        # 7200) dense array at once. The raw NetCDF stores dis24 as float64, and even
+        # after casting to float32 early, the full dense global array alone is ~23GB
+        # but only ~2-3% of cells ever survive the RP2 filter (see n_cells_kept/
+        # n_cells_total below), so holding the full dense grid in memory at all is
+        # wasteful by ~40x. That ~23GB dense peak is what silently OOM-killed both the
+        # very first local Docker test (Docker Desktop's VM: 7.65GB) and a later SPCS
+        # job run (58Gi container limit), no traceback either time, the kernel just
+        # SIGKILLs it. Filtering band-by-band bounds peak memory to one band's dense
+        # array (a few hundred MB) plus the small sparse output, independent of global
+        # grid size.
         rp2 = _load_rp2_grid(lats, lons, threshold_path)
-        finite = np.isfinite(arr) & np.isfinite(rp2)[np.newaxis, np.newaxis, :, :]
-        exceed = (arr > rp2[np.newaxis, np.newaxis, :, :]) & finite
-        any_exceed = exceed.any(axis=(0, 1))  # (lat, lon) bool mask
-        lat_idx, lon_idx = np.nonzero(any_exceed)
-        n_cells = len(lat_idx)
+        LAT_CHUNK = 200
+        ens_da = ens["dis24"].squeeze("forecast_reference_time")
+        ctrl_da = ctrl["dis24"].squeeze("forecast_reference_time")
 
-        sparse_data = arr[:, :, lat_idx, lon_idx]  # (member, step, n_cells)
-        cell_lat = lats[lat_idx].astype(np.float64)
-        cell_lon = lons[lon_idx].astype(np.float64)
+        sparse_parts, cell_lat_parts, cell_lon_parts = [], [], []
+        running_max = -np.inf
 
+        for lat_start in range(0, n_lat, LAT_CHUNK):
+            lat_end = min(lat_start + LAT_CHUNK, n_lat)
+            band_rows = lat_end - lat_start
+
+            # member index 0-49 = ECMWF members 1-50 (pf); index 50 = control.
+            # Matches TC_TRACKS.ENSEMBLE_MEMBER / wind pipeline convention (51 = control).
+            band = np.empty((n_members, n_steps, band_rows, n_lon), dtype=np.float32)
+            band[:n_pf] = ens_da.isel(latitude=slice(lat_start, lat_end)).values
+            band[n_pf] = ctrl_da.isel(latitude=slice(lat_start, lat_end)).values
+            running_max = max(running_max, float(np.nanmax(band)))
+
+            rp2_band = rp2[lat_start:lat_end]
+            finite = np.isfinite(band) & np.isfinite(rp2_band)[np.newaxis, np.newaxis, :, :]
+            exceed = (band > rp2_band[np.newaxis, np.newaxis, :, :]) & finite
+            any_exceed_band = exceed.any(axis=(0, 1))  # (band_rows, lon)
+            local_lat_idx, local_lon_idx = np.nonzero(any_exceed_band)
+            if len(local_lat_idx) == 0:
+                continue
+
+            sparse_parts.append(band[:, :, local_lat_idx, local_lon_idx])  # (member, step, n_local)
+            cell_lat_parts.append(lats[lat_start:lat_end][local_lat_idx])
+            cell_lon_parts.append(lons[local_lon_idx])
+
+        sparse_data = (np.concatenate(sparse_parts, axis=2) if sparse_parts
+                       else np.empty((n_members, n_steps, 0), dtype=np.float32))
+        cell_lat = (np.concatenate(cell_lat_parts) if cell_lat_parts else np.empty(0)).astype(np.float64)
+        cell_lon = (np.concatenate(cell_lon_parts) if cell_lon_parts else np.empty(0)).astype(np.float64)
+        n_cells = sparse_data.shape[2]
+
+        logger.info(f"  Max discharge: {running_max:.0f} m3/s")
         logger.info(f"  Sparse filter (RP{FILTER_RP}yr): kept {n_cells:,} of {n_cells_total:,} cells "
                     f"({100 * n_cells / n_cells_total:.2f}%)")
 

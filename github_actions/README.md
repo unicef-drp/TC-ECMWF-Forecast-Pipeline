@@ -27,10 +27,9 @@ If Step 2 finds no named storms, steps 3–5 (wind) are skipped entirely. Step 6
 
 ## GloFAS Riverine Discharge Pipeline (standalone)
 
-`glofas_pipeline.py` is a **fully separate** entry point from `main.py` — its own workflow
+`glofas_pipeline.py` is a **fully separate** entry point from `main.py`, with its own workflow
 (`.github/workflows/glofas.yml`, cron `0 15 * * *` UTC, not the main pipeline's 4x-daily
-schedule), TC-independent, once-daily cadence. See root `README.md` and
-`testing/RIVERINE_FLOODING_PLAN.md` for the full architecture.
+schedule), TC-independent, once-daily cadence. See root `README.md` for the full architecture.
 
 - Shared config/orchestration lives in `glofas_pipeline_core.py` (repo root); this file adds
   only password-auth specifics, mirroring how `main.py` adds password auth on top of

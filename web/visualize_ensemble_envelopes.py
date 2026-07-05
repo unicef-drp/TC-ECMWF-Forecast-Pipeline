@@ -7,7 +7,6 @@ subplots — one per ensemble member — showing all available wind threshold en
 overlaid with the track.
 
 Usage:
-    python visualize_ensemble_envelopes.py                        # latest run, all storms
     python visualize_ensemble_envelopes.py --storm MAILA
     python visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00
     python visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00 --out /tmp/out.png
@@ -32,7 +31,6 @@ if _env_path.is_file():
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.lines as mlines
 import snowflake.connector
 from shapely import wkt as shapely_wkt
 

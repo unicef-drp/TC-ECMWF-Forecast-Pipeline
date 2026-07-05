@@ -37,9 +37,10 @@ BASE_URL = "https://confluence.ecmwf.int/download/attachments/242067380"
 RP_LEVELS = ["2.0", "5.0", "10.0", "20.0", "50.0", "100.0", "200.0", "500.0"]
 # Same relative path as the local runtime cache (glofas_downloader.py's
 # glofas_data/thresholds_cache/) so the stage's canonical location and the local
-# GET-cache mirror each other exactly — one convention, not two. Everything
-# GloFAS-related on the stage lives under glofas/ (see THRESHOLD_STAGE_PREFIX
-# in glofas_downloader.py, which must be kept in sync with this constant).
+# GET-cache mirror each other exactly, one convention, not two. Must be kept in
+# sync with THRESHOLD_STAGE_PREFIX in glofas_downloader.py, since there is no
+# shared import between the two entry points, so this is a manually-maintained
+# constant.
 STAGE_PREFIX = "glofas/thresholds_cache"
 
 

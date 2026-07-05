@@ -347,9 +347,11 @@ Wind data download depends on TC data:
 
 ## GloFAS Riverine Discharge (Standalone Pipeline)
 
-A fully separate pipeline from everything above — not a phase of the main TC
-pipeline, not triggered alongside it. See `testing/RIVERINE_FLOODING_PLAN.md` for
-full architecture/rationale (why standalone, sparse Zarr filtering design, cadence).
+A fully separate pipeline from everything above, not a phase of the main TC
+pipeline, not triggered alongside it. GloFAS publishes once per calendar day
+(driven by the 00Z IFS ENS cycle) and a full global download takes far longer
+than the main pipeline's other steps, so it runs on its own schedule with its
+own image rather than as a step inside the main pipeline.
 
 **Entry point:** `snowflake/glofas_spcs_pipeline.py`. **Image:** built from
 `snowflake/Dockerfile.glofas` — a dedicated, leaner image (no eccodes/geos/proj/gdal;
@@ -412,7 +414,7 @@ comfortably past GloFAS's ~11h publication latency (e.g. 12-13 UTC).
 
 **Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
 (manually, not part of any recurring job) to populate
-`@{stage}/glofas/thresholds_cache/rl_*.nc` — the sparse cell filter depends on
+`@{stage}/glofas/thresholds_cache/rl_*.nc`. The sparse cell filter depends on
 these being present and will fail without them (unless `GLOFAS_THRESHOLD_SOURCE=local`
 with a pre-populated local directory instead).
 

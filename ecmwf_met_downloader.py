@@ -29,7 +29,6 @@ Member 51 (HRES control):
 """
 
 import logging
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path

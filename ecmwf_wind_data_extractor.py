@@ -152,7 +152,6 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
         # Create process-specific index directory to avoid concurrent access conflicts
         # Each process gets its own index cache, preventing race conditions
         # while still benefiting from index file caching performance
-        import multiprocessing
         import threading
         
         # Get unique identifier for this process/thread

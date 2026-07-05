@@ -10,7 +10,7 @@ The downloader processes:
 - 10m wind components (u10 and v10) — sustained wind, used for TC_ENVELOPES_*
 - 10fg (maximum 10m wind gust) — indexed as '10fg' for steps ≤ 90h, '10fg3' for steps > 90h;
   used for TC_GUST_ENVELOPES_*
-- Multiple forecast lead times (every 3-6 hours up to 360 hours for wind, 6-144 hours for gust)
+- Multiple forecast lead times (every 6 hours up to 144 hours for wind, 6-144 hours for gust)
 - Different forecast run times (00Z, 06Z, 12Z, 18Z)
 
 References:
@@ -38,7 +38,7 @@ FORECAST_STEPS = {
 }
 
 # HRES control (stream=oper, type=fc) max step per run time.
-# All run times reach T+144h; 06Z/18Z just don't extend to 360h beyond that.
+# All run times are currently capped at T+144h, matching FORECAST_STEPS above.
 CF_MAX_STEP = {0: 144, 6: 144, 12: 144, 18: 144}
 
 # ECMWF open data indexes 10m max gust as '10fg' for steps 0–90h and '10fg3'

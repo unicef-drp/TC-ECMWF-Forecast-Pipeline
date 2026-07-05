@@ -16,7 +16,6 @@ Thresholds mirror Saffir-Simpson equivalent kt categories converted to m/s:
 """
 
 import logging
-import os
 import re
 import pandas as pd
 import xarray as xr
@@ -29,7 +28,6 @@ from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     create_wind_threshold_contours,
     get_bounding_box,
-    load_track_data,
     polygon_to_wkt,
 )
 from ecmwf_tc_wind_combination import find_tc_data_files, load_tc_track_data
