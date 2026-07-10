@@ -78,10 +78,9 @@ class PipelineConfig(BasePipelineConfig):
 
     def __init__(self):
         super().__init__()
-
-        # SPCS-specific directory default (differs from github_actions default)
-        if not os.getenv('TRANSFORMED_DATA_DIR'):
-            self.transformed_data_dir = Path('tc_transformed')
+        # transformed_data_dir already defaults to 'tc_data_transformed' via
+        # BasePipelineConfig.__init__ (same as github_actions), and already
+        # respects an explicit TRANSFORMED_DATA_DIR override
 
         # Extended Snowflake auth options
         self.sf_private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
