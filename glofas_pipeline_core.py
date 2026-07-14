@@ -17,9 +17,11 @@ function itself comes from a different module per entry point
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from glofas_downloader import download_glofas_forecast
+from glofas_downloader import download_glofas_forecast, EXTENT_RP_LEVELS
+from glofas_extent_masking import run_glofas_extent_masking
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +45,36 @@ class BaseGlofasConfig:
         self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA')
         self.snowflake_stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
 
-        # RP thresholds default to Snowflake even when DATA_PIPELINE_DB=LOCAL — they're
-        # static reference files, cached independently of the per-run storage backend.
-        self.glofas_threshold_source = os.getenv('GLOFAS_THRESHOLD_SOURCE', 'snowflake').lower()
-        self.glofas_threshold_local_dir = os.getenv('GLOFAS_THRESHOLD_LOCAL_DIR', 'glofas_thresholds')
-
         self.glofas_data_dir = os.getenv('GLOFAS_DATA_DIR', 'glofas_data')
+
+        # RP thresholds default to Snowflake even when DATA_PIPELINE_DB=LOCAL
+        # they're static reference files, cached independently of the per-run storage backend.
+        # Local default lives under glofas_data_dir (not a separate top-level dir) so
+        # local storage has one root, mirroring the Snowflake stage's own single
+        # glofas/ root (thresholds_cache/, jrc_extent_cache/, and {date}/ all under it).
+        self.glofas_threshold_source = os.getenv('GLOFAS_THRESHOLD_SOURCE', 'snowflake').lower()
+        self.glofas_threshold_local_dir = os.getenv('GLOFAS_THRESHOLD_LOCAL_DIR',
+                                                     f'{self.glofas_data_dir}/thresholds_cache')
+
+        # JRC extent-masking cache: same "static, cached independently of the
+        # per-run storage backend" reasoning as the RP thresholds above. Populated
+        # by setup_jrc_extents.py (one-time, direct JRC download, run out-of-band
+        # never by the recurring pipeline itself, see glofas_extent_masking.py's docstring).
+        self.glofas_jrc_source = os.getenv('GLOFAS_JRC_SOURCE', 'snowflake').lower()
+        self.glofas_jrc_local_dir = os.getenv('GLOFAS_JRC_LOCAL_DIR',
+                                               f'{self.glofas_data_dir}/jrc_extent_cache')
+        self.glofas_extent_enabled = os.getenv('GLOFAS_EXTENT_ENABLED', 'true').lower() == 'true'
+
         self.cleanup_after_load = os.getenv('CLEANUP_AFTER_LOAD', 'true').lower() == 'true'
 
-        # Optional override — defaults to "today" (UTC). GloFAS's cache key is
+        # Optional override: defaults to "today" (UTC). GloFAS's cache key is
         # date-only; there is no TC context here to derive a date from.
         self.download_date = os.getenv('DOWNLOAD_DATE')  # YYYY-MM-DD, optional
 
     def needs_snowflake_creds(self) -> bool:
-        return self.data_pipeline_db == 'SNOWFLAKE' or self.glofas_threshold_source == 'snowflake'
+        return (self.data_pipeline_db == 'SNOWFLAKE'
+                or self.glofas_threshold_source == 'snowflake'
+                or (self.glofas_extent_enabled and self.glofas_jrc_source == 'snowflake'))
 
     def validate(self) -> bool:
         """Base validation (simple password auth). Subclasses with different auth
@@ -66,9 +84,21 @@ class BaseGlofasConfig:
                          "Must be 'snowflake' or 'local'")
             return False
 
+        # Gated on glofas_extent_enabled, matching needs_snowflake_creds()'s own
+        # gating of this same field two lines below — an unused/blank/invalid
+        # GLOFAS_JRC_SOURCE left over from before extent masking was enabled
+        # (or before setup_jrc_extents.py has ever been run, exactly the state
+        # sample_env.txt documents GLOFAS_EXTENT_ENABLED=false for) must not
+        # fail validation and take down the raw discharge pipeline over a
+        # value that's never actually consulted when extent masking is off.
+        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local'):
+            logger.error(f"Invalid GLOFAS_JRC_SOURCE: {self.glofas_jrc_source}. "
+                         "Must be 'snowflake' or 'local'")
+            return False
+
         if not self.needs_snowflake_creds():
-            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local — "
-                        "Snowflake credentials not required")
+            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local, and "
+                        "(extent disabled or GLOFAS_JRC_SOURCE=local) — Snowflake credentials not required")
             return True
 
         missing = [var for var, val in (
@@ -80,8 +110,19 @@ class BaseGlofasConfig:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
             return False
 
-        if self.data_pipeline_db == 'SNOWFLAKE' and not self.snowflake_stage_name:
-            logger.error("SNOWFLAKE_STAGE_NAME is required when DATA_PIPELINE_DB=SNOWFLAKE")
+        # needs_snowflake_creds() being True here means AT LEAST ONE of
+        # data_pipeline_db=='SNOWFLAKE', glofas_threshold_source=='snowflake',
+        # or (extent_enabled and glofas_jrc_source=='snowflake') is true
+        # one of those paths actually GETs/PUTs a file on the stage, so
+        # snowflake_stage_name is required for all of them, not just the
+        # data_pipeline_db=='SNOWFLAKE' case (that narrower check previously let
+        # a DATA_PIPELINE_DB=LOCAL run with default threshold/jrc sources pass
+        # validation with no stage name configured, only to fail later after
+        # already burning a real CDS API call).
+        if not self.snowflake_stage_name:
+            logger.error("SNOWFLAKE_STAGE_NAME is required whenever DATA_PIPELINE_DB=SNOWFLAKE, "
+                         "GLOFAS_THRESHOLD_SOURCE=snowflake, or extent masking is enabled with "
+                         "GLOFAS_JRC_SOURCE=snowflake")
             return False
 
         return True
@@ -117,3 +158,43 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None) -> Option
         return None
 
     return result
+
+
+def run_glofas_extent_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
+                                discharge_result: Optional[Dict] = None) -> List[Dict]:
+    """
+    Shared orchestration for the GloFAS x JRC extent-masking step, called
+    right after run_glofas_pipeline() succeeds, in the same daily run, using
+    the sparse cell set that step just built (discharge_result['zip_path']).
+    """
+    if not config.glofas_extent_enabled:
+        logger.info("GLOFAS_EXTENT_ENABLED=false — skipping extent-masking step")
+        return []
+
+    if discharge_result is None or not discharge_result.get('zip_path'):
+        logger.warning("No local Zarr path from the discharge step (e.g. a stage-only day-cache "
+                        "hit) — extent masking needs the local sparse cell data, skipping this run")
+        return []
+
+    logger.info(f"JRC source: {config.glofas_jrc_source}")
+    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+
+    try:
+        results = run_glofas_extent_masking(
+            zarr_path=Path(discharge_result['zip_path']),
+            forecast_date=discharge_result['forecast_date'],
+            output_dir=config.glofas_data_dir,
+            threshold_source=config.glofas_threshold_source,
+            threshold_local_dir=config.glofas_threshold_local_dir,
+            jrc_source=config.glofas_jrc_source,
+            jrc_local_dir=config.glofas_jrc_local_dir,
+            snowflake_conn=snowflake_conn,
+            snowflake_stage_name=config.snowflake_stage_name,
+            upload_to_stage=upload_to_stage,
+        )
+    except Exception as e:
+        logger.error(f"GloFAS extent-masking step failed entirely, continuing without it: {e}")
+        return []
+
+    logger.info(f"Extent masking: {len(results)} of {len(EXTENT_RP_LEVELS)} RP tiers produced output")
+    return results

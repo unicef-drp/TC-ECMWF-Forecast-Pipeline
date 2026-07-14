@@ -1,11 +1,12 @@
 # ==============================================================================
 # Dockerfile for the standalone GloFAS Riverine Discharge Pipeline (SPCS Deployment)
 # ==============================================================================
-# Deliberately SEPARATE from Dockerfile (the main TC pipeline's image) — GloFAS never
-# touches BUFR/GRIB/wind/geospatial processing, so it doesn't need eccodes, geos, proj,
-# gdal, or gfortran. Building a shared image (or reusing Dockerfile's CMD) would either
-# bloat this image with unused system packages, or require a fragile configurable
-# entrypoint. See requirements-glofas.txt for the matching lean Python dependency set.
+# Deliberately SEPARATE from Dockerfile (the main TC pipeline's image). GloFAS never
+# touches BUFR/GRIB/wind processing, so it doesn't need eccodes, geos, proj, gdal, or
+# gfortran as SYSTEM packages built from source. Building a shared image (or reusing
+# Dockerfile's CMD) would either bloat this image with unused system packages, or
+# require a fragile configurable entrypoint. See requirements-glofas.txt for the
+# matching lean Python dependency set.
 #
 # The container executes snowflake/glofas_spcs_pipeline.py and terminates when complete.
 # ==============================================================================
@@ -20,9 +21,9 @@ LABEL version="1.0"
 # Install system dependencies
 # ==============================================================================
 
-# Only what's needed to build/run netCDF4 and blosc2 wheels — no eccodes/geos/proj/gdal
-# (unlike Dockerfile, the main pipeline's image) since GloFAS never touches BUFR/GRIB/
-# geospatial processing.
+# Only what's needed to build/run netCDF4, blosc2, and rasterio's bundled-GDAL wheels
+# — no system libgdal/geos/proj build-from-source (unlike Dockerfile, the main
+# pipeline's image), since rasterio's PyPI wheel already bundles GDAL.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libhdf5-dev \
     libnetcdf-dev \
@@ -30,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     curl \
+    libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ==============================================================================
@@ -48,6 +50,7 @@ WORKDIR /app
 # Repo-root modules glofas_spcs_pipeline.py imports (via its own sys.path.insert)
 COPY glofas_downloader.py /app/
 COPY glofas_pipeline_core.py /app/
+COPY glofas_extent_masking.py /app/
 COPY setup_glofas_thresholds.py /app/
 
 # Snowflake directory (contains glofas_spcs_pipeline.py and snowflake_loader.py)
@@ -81,6 +84,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 ENV GLOFAS_DATA_DIR=/app/glofas_data
 ENV GLOFAS_THRESHOLD_SOURCE=snowflake
+ENV GLOFAS_JRC_SOURCE=snowflake
+ENV GLOFAS_EXTENT_ENABLED=true
 ENV CLEANUP_AFTER_LOAD=true
 ENV DATA_PIPELINE_DB=SNOWFLAKE
 

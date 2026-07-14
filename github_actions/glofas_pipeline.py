@@ -11,10 +11,10 @@ github_actions/main.py), NOT wired into its steps. Two reasons this is standalon
    doesn't map cleanly onto any of the TC pipeline's 4 daily run slots (03/09/15/21 UTC,
    themselves aligned to the 18Z/00Z/06Z/12Z TC cycles).
 2. A full global GloFAS fetch (60S-60N, 51 members, 7 daily steps) can take far longer
-   than the TC pipeline's other steps — bundling it in would force the whole TC
+   than the TC pipeline's other steps, bundling it in would force the whole TC
    pipeline's timeout to accommodate GloFAS's own, unrelated duration.
 
-Requires the RP2 threshold file to already be cached — see setup_glofas_thresholds.py
+Requires the RP2 threshold file to already be cached, see setup_glofas_thresholds.py
 (run once, manually, not part of any recurring schedule).
 
 Shared config/orchestration lives in glofas_pipeline_core.py (mirrors how
@@ -30,8 +30,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from glofas_pipeline_core import BaseGlofasConfig, run_glofas_pipeline
-from snowflake_loader import get_snowflake_connection, load_riverine_metadata_to_snowflake
+from glofas_pipeline_core import BaseGlofasConfig, run_glofas_pipeline, run_glofas_extent_pipeline
+from snowflake_loader import (
+    get_snowflake_connection,
+    load_riverine_metadata_to_snowflake,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,6 +102,22 @@ def main():
                     "No stage_path in result (local day-cache hit before this run's "
                     "data was ever staged) — skipping metadata load this run"
                 )
+
+        # Extent-masking step (GloFAS x JRC v2.1), best-effort, never fails this
+        # run even if it produces nothing. See run_glofas_extent_pipeline's own
+        # docstring for why (a JRC-cache hiccup must not take down the
+        # already-critical raw discharge pipeline that shares this run).
+        extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
+        if extent_results and upload_to_stage and conn:
+            metadata_rows = [{
+                'forecast_time': result['forecast_date'],
+                'param': f"extent_rp{int(float(r['rp']))}_bymember",
+                'is_standin': r['is_standin'],
+                'stage_path': r['stage_path'],
+            } for r in extent_results if r.get('stage_path')]
+            if metadata_rows:
+                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
+                logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
 
         logger.info("GloFAS pipeline completed successfully!")
         sys.exit(0)

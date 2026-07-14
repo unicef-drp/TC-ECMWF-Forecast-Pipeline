@@ -25,3 +25,7 @@ blosc2>=2.0.0      # required by zarr BloscCodec at write time (not in zarr's ow
 # Snowflake (threshold stage GET/PUT, forecast Zarr upload, RIVER_FORECASTS load)
 snowflake-connector-python[pandas]>=3.0.0
 cryptography>=41.0.0  # private-key auth (SPCS entry point)
+
+# GloFAS x JRC extent-masking (glofas_extent_masking.py) 
+rasterio>=1.3.0
+pyarrow>=14.0.0

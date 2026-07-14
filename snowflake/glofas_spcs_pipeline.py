@@ -4,16 +4,15 @@ SPCS entry point — standalone GloFAS riverine discharge pipeline (SPCS OAuth /
 private-key / password auth).
 
 A fully separate job from spcs_pipeline.py (the main TC forecast pipeline), NOT
-wired into its steps or scheduled alongside it — see github_actions/glofas_pipeline.py's
-docstring for the full reasoning (GloFAS's own ~11h publication cadence doesn't map
+wired into its steps or scheduled alongside it (GloFAS's own ~11h publication cadence doesn't map
 onto the TC pipeline's 4x-daily run slots, and a full global fetch can take far
 longer than the TC pipeline's other steps, so bundling them would force one
 unrelated schedule/timeout onto the other).
 
-Requires the RP2 threshold file to already be cached — see setup_glofas_thresholds.py
+Requires the RP2 threshold file to already be cached
 (run once, manually, not part of any recurring schedule). Trigger via a Snowflake
 TASK calling EXECUTE JOB SERVICE, scheduled once daily comfortably past GloFAS's
-~11h publication latency (e.g. 12-13 UTC) — see snowflake/README.md for the job
+~11h publication latency (e.g. 12-13 UTC), see snowflake/README.md for the job
 service execution pattern used by the main pipeline.
 
 Shared config/orchestration lives in glofas_pipeline_core.py (mirrors how
@@ -30,8 +29,11 @@ from pathlib import Path
 repo_root = Path(__file__).parent.parent
 sys.path.insert(0, str(repo_root))
 
-from glofas_pipeline_core import BaseGlofasConfig, run_glofas_pipeline
-from snowflake.snowflake_loader import get_snowflake_connection, load_riverine_metadata_to_snowflake
+from glofas_pipeline_core import BaseGlofasConfig, run_glofas_pipeline, run_glofas_extent_pipeline
+from snowflake.snowflake_loader import (
+    get_snowflake_connection,
+    load_riverine_metadata_to_snowflake,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +73,14 @@ class PipelineConfig(BaseGlofasConfig):
                          "Must be 'snowflake' or 'local'")
             return False
 
+        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local'):
+            logger.error(f"Invalid GLOFAS_JRC_SOURCE: {self.glofas_jrc_source}. "
+                         "Must be 'snowflake' or 'local'")
+            return False
+
         if not self.needs_snowflake_creds():
-            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local — "
-                        "Snowflake credentials not required")
+            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local, and "
+                        "(extent disabled or GLOFAS_JRC_SOURCE=local) — Snowflake credentials not required")
             return True
 
         if not self.sf_account:
@@ -101,8 +108,10 @@ class PipelineConfig(BaseGlofasConfig):
                 logger.error(f"Private key file not found: {self.sf_private_key_path}")
                 return False
 
-        if self.data_pipeline_db == 'SNOWFLAKE' and not self.snowflake_stage_name:
-            logger.error("SNOWFLAKE_STAGE_NAME is required when DATA_PIPELINE_DB=SNOWFLAKE")
+        if not self.snowflake_stage_name:
+            logger.error("SNOWFLAKE_STAGE_NAME is required whenever DATA_PIPELINE_DB=SNOWFLAKE, "
+                         "GLOFAS_THRESHOLD_SOURCE=snowflake, or extent masking is enabled with "
+                         "GLOFAS_JRC_SOURCE=snowflake")
             return False
 
         return True
@@ -182,6 +191,19 @@ def main():
                     "No stage_path in result (local day-cache hit before this run's "
                     "data was ever staged) — skipping metadata load this run"
                 )
+
+        # Extent-masking step (GloFAS x JRC v2.1)
+        extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
+        if extent_results and upload_to_stage and conn:
+            metadata_rows = [{
+                'forecast_time': result['forecast_date'],
+                'param': f"extent_rp{int(float(r['rp']))}_bymember",
+                'is_standin': r['is_standin'],
+                'stage_path': r['stage_path'],
+            } for r in extent_results if r.get('stage_path')]
+            if metadata_rows:
+                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
+                logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
 
         logger.info("GloFAS pipeline completed successfully!")
         sys.exit(0)

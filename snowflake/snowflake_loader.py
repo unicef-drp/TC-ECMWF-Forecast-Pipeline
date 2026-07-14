@@ -688,16 +688,14 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
 
 def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     """
-    Load GloFAS riverine discharge metadata rows into RIVER_FORECASTS table.
-
-    Separate table from MET_FORECASTS (not an extension) — GloFAS discharge is a
-    derived LISFLOOD hydrological model output, not a raw ECMWF meteorological
-    field like tp/ro. Uses staging + MERGE to deduplicate on
-    (FORECAST_TIME, PARAM) — re-runs are safe. Same pattern as
-    load_precip_metadata_to_snowflake.
+    Load GloFAS riverine metadata rows into RIVER_FORECASTS table: both raw
+    discharge (PARAM='dis24') and JRC per-member flood-extent output
+    (PARAM='extent_rp{N}_bymember', with IS_STANDIN true for the RP2/RP5
+    stand-in tiers) share this one table.
 
     Args:
-        metadata_rows: list of dicts with keys forecast_time, param, stage_path
+        metadata_rows: list of dicts with keys forecast_time, param, stage_path,
+            and optionally is_standin (only meaningful for extent_rp2/extent_rp5 rows)
         conn: active Snowflake connection
 
     Returns number of rows merged.
@@ -712,20 +710,28 @@ def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
                 FORECAST_TIME  TIMESTAMP_NTZ,
                 PARAM          VARCHAR,
                 STAGE_PATH     VARCHAR,
+                IS_STANDIN     BOOLEAN,
                 CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # IS_STANDIN was added after RIVER_FORECASTS already existed in
+        # production (raw discharge rows predate the extent-masking work)
+        # ADD COLUMN IF NOT EXISTS is idempotent, safe to run on every call.
+        cursor.execute("ALTER TABLE RIVER_FORECASTS ADD COLUMN IF NOT EXISTS IS_STANDIN BOOLEAN")
 
         cursor.execute("""
             CREATE OR REPLACE TEMPORARY TABLE RIVER_FORECASTS_STAGING (
                 FORECAST_TIME  TIMESTAMP_NTZ,
                 PARAM          VARCHAR,
-                STAGE_PATH     VARCHAR
+                STAGE_PATH     VARCHAR,
+                IS_STANDIN     BOOLEAN
             )
         """)
 
         df = pd.DataFrame(metadata_rows)
         df.columns = df.columns.str.upper()
+        if 'IS_STANDIN' not in df.columns:
+            df['IS_STANDIN'] = None
         if 'FORECAST_TIME' in df.columns:
             df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'], errors='coerce').apply(
                 lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
@@ -743,10 +749,10 @@ def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
               ON  t.FORECAST_TIME = s.FORECAST_TIME
               AND t.PARAM         = s.PARAM
             WHEN MATCHED THEN
-                UPDATE SET t.STAGE_PATH = s.STAGE_PATH
+                UPDATE SET t.STAGE_PATH = s.STAGE_PATH, t.IS_STANDIN = s.IS_STANDIN
             WHEN NOT MATCHED THEN
-                INSERT (FORECAST_TIME, PARAM, STAGE_PATH)
-                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH)
+                INSERT (FORECAST_TIME, PARAM, STAGE_PATH, IS_STANDIN)
+                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH, s.IS_STANDIN)
         """)
         rows_merged = cursor.rowcount
         conn.commit()

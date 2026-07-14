@@ -76,3 +76,11 @@ CDSAPI_KEY=your_ewds_api_key
 # Specific date to download (YYYY-MM-DD format, optional — defaults to today UTC)
 # DOWNLOAD_DATE=2026-07-02
 
+# GloFAS x JRC extent-masking (glofas_extent_masking.py, same standalone pipeline)
+GLOFAS_EXTENT_ENABLED=true
+GLOFAS_JRC_SOURCE=snowflake
+GLOFAS_JRC_LOCAL_DIR=glofas_jrc_extents
+
+# Note: setup_jrc_extents.py (the one-time JRC cache-population script) fetches
+# directly from JRC's own file server
+

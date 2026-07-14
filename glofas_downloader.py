@@ -7,14 +7,14 @@ from the Copernicus Emergency Management Service Early Warning Data Store (EWDS)
 converts to Zarr ZipStore, and uploads to a Snowflake internal stage.
 
 Data source: `cdsapi` against `cems-glofas-forecast` on
-  https://ewds.climate.copernicus.eu/api  (NOT ecmwf-opendata — GloFAS is a separate
+  https://ewds.climate.copernicus.eu/api  (NOT ecmwf-opendata; GloFAS is a separate
   CEMS product, not part of ECMWF's Open Data dissemination).
 
 Storage format:
   Zarr ZipStore (.zarr.zip) — single file, chunked (1, 1, lat, lon), float32, zstd.
   dims: (member=51, step=7, lat, lon)
   values: river discharge in the last 24h (m3/s), one value per day, not accumulated
-          (unlike tp/ro — no period-difference math needed at read time).
+          (unlike tp/ro; no period-difference math needed at read time).
   spatial: 60°S–60°N (matches ecmwf_met_downloader.py's clip, for consistency across
            all "always-on, TC-independent" hazard layers).
 
@@ -65,8 +65,18 @@ LEADTIME_HOURS = ["24", "48", "72", "96", "120", "144", "168"]
 DEFAULT_GLOFAS_DIR = 'glofas_data'
 MAX_PUBLICATION_LAG_DAYS = 1  # how many days back to retry if today's forecast isn't published yet
 
-# Threshold tier used to decide which cells are worth storing at all
+# Threshold tier used to decide which cells are worth storing at all. RP
+# thresholds are monotonic by construction (rl_2.0 < rl_5.0 < ... < rl_100.0),
+# so a cell whose discharge exceeds any higher tier's threshold necessarily
+# also exceeds this (lower) one on that same member/day
 FILTER_RP = "2.0"
+
+# Full set of RP tiers the extent-masking step (glofas_extent_masking.py)
+# computes exceedance probability for, combined with JRC's static extent maps.
+# RP2/RP5 have no native JRC map (JRC only covers RP10 and up); they use
+# RP10's own extent as a labeled upper-bound stand-in there; the probability
+# threshold lookup itself still needs each tier's own rl_{RP}.nc.
+EXTENT_RP_LEVELS = ["2.0", "5.0", "10.0", "20.0", "50.0", "100.0"]
 
 # Everything GloFAS-related on the stage lives under glofas/. Forecast Zarrs at
 # glofas/{date}/, thresholds at glofas/thresholds_cache/. Must be kept in sync
@@ -76,10 +86,31 @@ THRESHOLD_STAGE_PREFIX = "glofas/thresholds_cache"
 
 
 # ---------------------------------------------------------------------------
-# RP2 threshold loading (for sparse cell filtering)
+# RP threshold loading (for sparse cell filtering, and for the extent-masking
+# step's per-tier exceedance-probability lookups)
+#
+# IMPORTANT: this is the RP DISCHARGE threshold source only -- "does this
+# member's forecasted discharge exceed the X-year return period?" It has
+# NOTHING to do with historical flood-EXTENT geometry (depth/inundation
+# shape). That's a completely separate source: JRC's own file server
+# (jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/CEMS-GLOFAS/flood_hazard/, see
+# setup_jrc_extents.py).
+#
+# Data description / methodology:
+#   https://confluence.ecmwf.int/spaces/CEMS/pages/242067380/Auxiliary+Data
+#   ("GloFAS Flood Thresholds" section); describes the Gumbel-distribution/
+#   L-moments fit against 1979-2022 true annual maxima discharge (44 years)
+#   that produces these threshold grids.
 # ---------------------------------------------------------------------------
 
 THRESHOLD_BASE_URL = "https://confluence.ecmwf.int/download/attachments/242067380"
+
+# One static global auxiliary file (not per-RP, no RP suffix in the
+# filename). Values are raw m^2 on disk. Used only for the below_min_basin
+# flag (glofas_extent_masking.py) against that same 500km^2 cutoff.
+# https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
+UPAREA_URL = f"{THRESHOLD_BASE_URL}/uparea_glofas_v4_0.nc"
+UPAREA_STAGE_PATH = f"{THRESHOLD_STAGE_PREFIX}/uparea_glofas_v4_0.nc"
 
 
 def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
@@ -99,13 +130,9 @@ def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
 
 def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str, Path],
                            snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                           cache_dir: Optional[Path] = None) -> Path:
+                           cache_dir: Optional[Path] = None, rp: str = FILTER_RP) -> Path:
     """
-    Return a local path to the cached RP2 threshold file. Self-healing cascade —
-    setup_glofas_thresholds.py is the recommended one-time path (avoids the ~173MB
-    fallback download landing mid-pipeline-run), but is no longer a hard
-    prerequisite: a missing cache at every tier now triggers a direct ECMWF
-    download rather than failing outright.
+    Return a local path to one cached RP threshold file (rp, e.g. "2.0", "10.0").
 
     threshold_source='snowflake': local runtime cache -> Snowflake stage GET ->
       (miss) download directly from ECMWF, save locally AND PUT to the stage so
@@ -115,7 +142,7 @@ def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str,
       download directly from ECMWF, save to threshold_local_dir only (no stage
       push — 'local' means prefer to keep this run's data local).
     """
-    fname = f"rl_{FILTER_RP}.nc"
+    fname = f"rl_{rp}.nc"
 
     if threshold_source == "local":
         local_dir = Path(threshold_local_dir)
@@ -129,7 +156,7 @@ def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str,
                 return local_path
 
         local_dir.mkdir(parents=True, exist_ok=True)
-        _download_threshold_from_ecmwf(FILTER_RP, local_path)
+        _download_threshold_from_ecmwf(rp, local_path)
         return local_path
 
     if threshold_source == "snowflake":
@@ -145,14 +172,62 @@ def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str,
         if _try_stage_get(snowflake_stage_name, fname, cache_dir, snowflake_conn):
             return local_path
 
-        # Self-healing: not cached anywhere — fetch directly and populate the
+        # Self-healing: not cached anywhere: fetch directly and populate the
         # stage so future runs (this container or any other) hit the cache.
-        _download_threshold_from_ecmwf(FILTER_RP, local_path)
+        _download_threshold_from_ecmwf(rp, local_path)
         stage_path = f'{THRESHOLD_STAGE_PREFIX}/{fname}'
         upload_to_snowflake_stage(local_path, snowflake_stage_name, stage_path, snowflake_conn)
         return local_path
 
     raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local' or 'snowflake')")
+
+
+def _fetch_uparea_file(threshold_source: str, threshold_local_dir: Union[str, Path],
+                        snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
+                        cache_dir: Optional[Path] = None) -> Path:
+    """Same self-healing cascade as _fetch_threshold_file, for the single static
+    uparea auxiliary file (not per-RP) instead of a threshold grid."""
+    fname = "uparea_glofas_v4_0.nc"
+
+    if threshold_source == "local":
+        local_dir = Path(threshold_local_dir)
+        local_path = local_dir / fname
+        if local_path.exists():
+            return local_path
+        if snowflake_conn and snowflake_stage_name:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            if _try_stage_get(snowflake_stage_name, fname, local_dir, snowflake_conn):
+                return local_path
+        local_dir.mkdir(parents=True, exist_ok=True)
+        _download_uparea_from_ecmwf(local_path)
+        return local_path
+
+    if threshold_source == "snowflake":
+        if not snowflake_conn or not snowflake_stage_name:
+            raise ValueError("snowflake_conn and snowflake_stage_name required for "
+                              "GLOFAS_THRESHOLD_SOURCE=snowflake")
+        cache_dir = Path(cache_dir) if cache_dir else Path(DEFAULT_GLOFAS_DIR) / "thresholds_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / fname
+        if local_path.exists():
+            return local_path
+        if _try_stage_get(snowflake_stage_name, fname, cache_dir, snowflake_conn):
+            return local_path
+        _download_uparea_from_ecmwf(local_path)
+        upload_to_snowflake_stage(local_path, snowflake_stage_name, UPAREA_STAGE_PATH, snowflake_conn)
+        return local_path
+
+    raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local' or 'snowflake')")
+
+
+def _download_uparea_from_ecmwf(dest_path: Path) -> None:
+    import requests
+    logger.info(f"  uparea not cached anywhere — downloading directly from {UPAREA_URL} ...")
+    with requests.get(UPAREA_URL, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
 
 
 def _try_stage_get(stage_name: str, fname: str, dest_dir: Path, conn) -> bool:
@@ -201,6 +276,42 @@ def _load_rp2_grid(lats: np.ndarray, lons: np.ndarray, threshold_path: Path) -> 
                 f"({len(lats)}, {len(lons)}) — check for a resolution/version mismatch"
             )
         return np.where(thr > 0, thr, np.nan)
+    finally:
+        official.close()
+
+
+def _nearest_grid_value(cell_lat: np.ndarray, cell_lon: np.ndarray, data: np.ndarray,
+                         lat_coord: np.ndarray, lon_coord: np.ndarray) -> np.ndarray:
+    """
+    Vectorized nearest-neighbor lookup against a REGULAR lat/lon grid via
+    direct index arithmetic. Both lat_coord/lon_coord must be evenly spaced
+    (true for GloFAS's official threshold and uparea files).
+    """
+    lat_step = lat_coord[1] - lat_coord[0]
+    lon_step = lon_coord[1] - lon_coord[0]
+    row = np.clip(np.round((cell_lat - lat_coord[0]) / lat_step).astype(int), 0, len(lat_coord) - 1)
+    col = np.clip(np.round((cell_lon - lon_coord[0]) / lon_step).astype(int), 0, len(lon_coord) - 1)
+    return data[row, col]
+
+
+def _load_uparea_values(cell_lat: np.ndarray, cell_lon: np.ndarray, uparea_path: Path) -> np.ndarray:
+    """
+    Point lookup (not a dense-grid slice, unlike _load_rp2_grid). cell_lat/
+    cell_lon are the already-sparse post-RP2-filter cell coordinates, an
+    arbitrary scatter of points, not a rectangular grid. Vectorized via
+    _nearest_grid_value (direct index arithmetic, not xarray's slow
+    multi-point .sel(method="nearest").
+
+    Raw file units are m^2.
+
+    Returns NaN for any cell that lands on a genuinely nodata pixel (uparea<=0).
+    """
+    official = xr.open_dataset(uparea_path)
+    try:
+        raw_m2 = _nearest_grid_value(cell_lat, cell_lon, official["uparea"].values,
+                                      official["latitude"].values, official["longitude"].values)
+        km2 = raw_m2.astype(np.float64) / 1e6
+        return np.where(raw_m2 > 0, km2, np.nan)
     finally:
         official.close()
 
@@ -300,13 +411,16 @@ def download_with_fallback(forecast_date: datetime, raw_dir: Path,
 # ---------------------------------------------------------------------------
 
 def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_dir: Path,
-                         threshold_path: Path) -> Path:
+                         threshold_path: Path, uparea_path: Optional[Path] = None) -> Path:
     """
     Build a Zarr ZipStore from the ensemble + control NetCDFs, keeping only cells
     where at least one member on at least one day exceeds the RP2 threshold.
 
     data array:  shape (member=51, step=7, n_cells) — sparse, filtered
     cell_lat/cell_lon: shape (n_cells,) — coordinates of each kept cell
+    cell_uparea_km2: shape (n_cells,) — GloFAS's own official upstream drainage
+      area per cell (only populated if uparea_path is given); a non-destructive
+      tag, not a filter)
     dtype:  float32
     comp:   Blosc/zstd-3/bitshuffle
 
@@ -314,7 +428,11 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     Returns path to the .zarr.zip file.
     """
     date_str = actual_date.strftime("%Y%m%d")
-    zip_path = output_dir / f"river_{date_str}.zarr.zip"
+    # Nested under a {date}/ subfolder (not flat in output_dir) so local storage
+    # mirrors the Snowflake stage's own glofas/{date}/... layout exactly
+    # per-member extent Parquet (glofas_extent_masking.py) lands in this same
+    # per-date folder, not a separate "extent/" subdirectory.
+    zip_path = output_dir / date_str / f"river_{date_str}.zarr.zip"
 
     if zip_path.exists():
         logger.info(f"  {zip_path.name} already exists — skipping build")
@@ -346,12 +464,8 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
         # after casting to float32 early, the full dense global array alone is ~23GB
         # but only ~2-3% of cells ever survive the RP2 filter (see n_cells_kept/
         # n_cells_total below), so holding the full dense grid in memory at all is
-        # wasteful by ~40x. That ~23GB dense peak is what silently OOM-killed both the
-        # very first local Docker test (Docker Desktop's VM: 7.65GB) and a later SPCS
-        # job run (58Gi container limit), no traceback either time, the kernel just
-        # SIGKILLs it. Filtering band-by-band bounds peak memory to one band's dense
-        # array (a few hundred MB) plus the small sparse output, independent of global
-        # grid size.
+        # wasteful by ~40x.
+
         rp2 = _load_rp2_grid(lats, lons, threshold_path)
         LAT_CHUNK = 200
         ens_da = ens["dis24"].squeeze("forecast_reference_time")
@@ -393,6 +507,18 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
         logger.info(f"  Sparse filter (RP{FILTER_RP}yr): kept {n_cells:,} of {n_cells_total:,} cells "
                     f"({100 * n_cells / n_cells_total:.2f}%)")
 
+        cell_uparea_km2 = None
+        if uparea_path is not None and n_cells > 0:
+            try:
+                cell_uparea_km2 = _load_uparea_values(cell_lat, cell_lon, uparea_path)
+                below_500 = int(np.nansum(cell_uparea_km2 < 500.0))
+                logger.info(f"  uparea tagged: {below_500:,} of {n_cells:,} cells below 500km^2 "
+                            f"(GloFAS's own official minimum simulated-basin size, tagged only)")
+            except Exception as e:
+                logger.warning(f"  uparea tagging failed, continuing without it: {e}")
+                cell_uparea_km2 = None
+
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
         store = None
         try:
             store = zarr.storage.ZipStore(str(zip_path), mode="w")
@@ -408,6 +534,8 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
             z[:] = sparse_data
             root.create_array("cell_lat", shape=cell_lat.shape, dtype="float64")[:] = cell_lat
             root.create_array("cell_lon", shape=cell_lon.shape, dtype="float64")[:] = cell_lon
+            if cell_uparea_km2 is not None:
+                root.create_array("cell_uparea_km2", shape=cell_uparea_km2.shape, dtype="float64")[:] = cell_uparea_km2
 
             member_numbers = pf_numbers + [51]
             root.attrs.update({
@@ -434,7 +562,9 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
                     "only cells where >=1 member on >=1 day exceeded the RP2yr threshold are "
                     "included (see n_cells_kept/n_cells_total/filter_threshold attrs). Use "
                     "cell_lat/cell_lon (parallel arrays, same n_cells length) to locate each "
-                    "stored cell — do not assume a rectangular lat/lon index."
+                    "stored cell — do not assume a rectangular lat/lon index. cell_uparea_km2 "
+                    "(same length, if present) is GloFAS's own official upstream drainage area "
+                    "per cell, a non-destructive tag not a filter — NaN where lookup failed."
                 ),
             })
         except BaseException:
@@ -509,7 +639,7 @@ def download_glofas_forecast(
         cleanup_raw: bool = True,
         verbose: bool = True,
         threshold_source: str = "snowflake",
-        threshold_local_dir: Union[str, Path] = "glofas_thresholds",
+        threshold_local_dir: Union[str, Path] = f"{DEFAULT_GLOFAS_DIR}/thresholds_cache",
 ) -> Dict:
     """
     Download GloFAS discharge forecast for one date, build Zarr ZipStore, store result.
@@ -550,7 +680,7 @@ def download_glofas_forecast(
     for lag in range(MAX_PUBLICATION_LAG_DAYS + 1):
         candidate = forecast_date - timedelta(days=lag)
         candidate_str = candidate.strftime("%Y%m%d")
-        candidate_path = output_path / f'river_{candidate_str}.zarr.zip'
+        candidate_path = output_path / candidate_str / f'river_{candidate_str}.zarr.zip'
         if not candidate_path.exists():
             continue
 
@@ -599,9 +729,23 @@ def download_glofas_forecast(
         return {'success': False, 'zip_path': None, 'stage_path': None,
                  'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
 
+    # Step 1.6: Locate the cached uparea file (best-effort, a tag, not required
+    # for the sparse filter itself, so a failure here logs and continues rather
+    # than failing the whole run the way a missing RP2 threshold does).
+    uparea_path = None
+    try:
+        uparea_path = _fetch_uparea_file(
+            threshold_source, threshold_local_dir,
+            snowflake_conn=snowflake_conn, snowflake_stage_name=snowflake_stage_name,
+            cache_dir=output_path / 'thresholds_cache',
+        )
+    except Exception as e:
+        logger.warning(f'  Could not load uparea file, continuing without cell_uparea_km2 tagging: {e}')
+
     # Step 2: Build Zarr ZipStore
     try:
-        zip_path = build_zarr_zipstore(result['paths'], actual_date, output_path, threshold_path)
+        zip_path = build_zarr_zipstore(result['paths'], actual_date, output_path, threshold_path,
+                                        uparea_path=uparea_path)
     except Exception as e:
         logger.error(f'  Zarr build failed: {e}')
         return {'success': False, 'zip_path': None, 'stage_path': None,

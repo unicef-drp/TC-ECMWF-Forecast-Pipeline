@@ -12,8 +12,11 @@ Source: https://confluence.ecmwf.int/spaces/CEMS/pages/242067380/Auxiliary+Data
 Levels cached: 2, 5, 10, 20, 50, 100, 200, 500yr
 
 Usage:
-    python3 setup_glofas_thresholds.py                     # upload to Snowflake stage
-    python3 setup_glofas_thresholds.py --local-only DIR    # keep local only, for offline dev
+    python3 setup_glofas_thresholds.py                                            # upload to Snowflake stage
+    python3 setup_glofas_thresholds.py --local-only glofas_data/thresholds_cache  # keep local only, for offline dev
+                                                                                  # (this is glofas_downloader.py's
+                                                                                  # own local default, one root
+                                                                                  # dir, no separate top-level cache)
 """
 
 import argparse

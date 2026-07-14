@@ -354,12 +354,14 @@ than the main pipeline's other steps, so it runs on its own schedule with its
 own image rather than as a step inside the main pipeline.
 
 **Entry point:** `snowflake/glofas_spcs_pipeline.py`. **Image:** built from
-`snowflake/Dockerfile.glofas` — a dedicated, leaner image (no eccodes/geos/proj/gdal;
-GloFAS never touches BUFR/GRIB/wind/geospatial processing), using
-`requirements-glofas.txt` instead of `requirements-ci.txt`. This is a genuinely
-separate Docker image from `tc-ecmwf-pipeline` above — the main image's `CMD` is
-hardcoded to `spcs_pipeline.py` and never copies any GloFAS files in, so it cannot
-run this pipeline.
+`snowflake/Dockerfile.glofas`, a dedicated, leaner image (no eccodes, no system
+libgdal/geos/proj built from source; GloFAS never touches BUFR/GRIB/wind processing),
+using `requirements-glofas.txt` instead of `requirements-ci.txt`. It does include
+`rasterio` for the extent-masking step's GeoTIFF I/O, but rasterio's PyPI wheel
+bundles its own GDAL, so no system geospatial packages are needed. This is a
+genuinely separate Docker image from `tc-ecmwf-pipeline` above, the main image's
+`CMD` is hardcoded to `spcs_pipeline.py` and never copies any GloFAS files in, so it
+cannot run this pipeline.
 
 ### Building and pushing the GloFAS image
 
@@ -399,6 +401,8 @@ EXECUTE JOB SERVICE
           SNOWFLAKE_STAGE_NAME: "AOTS_ANALYSIS"
           DATA_PIPELINE_DB: "SNOWFLAKE"
           GLOFAS_THRESHOLD_SOURCE: "snowflake"
+          GLOFAS_EXTENT_ENABLED: "true"
+          GLOFAS_JRC_SOURCE: "snowflake"
           CDSAPI_URL: "https://ewds.climate.copernicus.eu/api"
           CDSAPI_KEY: "your_ewds_api_key"
      platformMonitor:
@@ -418,8 +422,21 @@ comfortably past GloFAS's ~11h publication latency (e.g. 12-13 UTC).
 these being present and will fail without them (unless `GLOFAS_THRESHOLD_SOURCE=local`
 with a pre-populated local directory instead).
 
+Extent masking (GloFAS x JRC v2.1 flood-extent, enabled by default via
+`GLOFAS_EXTENT_ENABLED`) additionally requires `setup_jrc_extents.py` to have been
+run once already (manually) to populate `@{stage}/glofas/jrc_extent_cache/v2_1/*.tif`, 
+a plain script with no credentials of its own, it fetches directly from JRC's own
+file server (unless `GLOFAS_JRC_SOURCE=local` with a pre-populated local directory
+instead).
+
 **Snowflake table:** `RIVER_FORECASTS` — same staging+MERGE pattern as the main
-pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`.
+pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`. Shared by both products:
+raw discharge rows use `PARAM='dis24'`; per-member flood-extent rows use
+`PARAM='extent_rp{2,5,10,20,50,100}_bymember'` plus an `IS_STANDIN` column (true only
+for the RP2/RP5 stand-in tiers, which reuse RP10's own extent , JRC has no native map
+below RP10). Each `_bymember` row points at a Parquet file (not a GeoTIFF), a sparse
+table, one row per pixel/member/step actually flooded for that member, not a blended
+probability across all 51 members.
 
 ---
 

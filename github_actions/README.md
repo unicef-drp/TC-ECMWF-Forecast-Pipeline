@@ -36,6 +36,9 @@ schedule), TC-independent, once-daily cadence. See root `README.md` for the full
   `pipeline_core.py`.
 - Requires `setup_glofas_thresholds.py` to have been run once, manually, first (populates the
   RP threshold cache the sparse cell filter depends on).
+- Extent masking (GloFAS x JRC v2.1 flood-extent, enabled by default via `GLOFAS_EXTENT_ENABLED`)
+  additionally requires `setup_jrc_extents.py` to have been run once, manually, first (populates
+  the JRC flood-extent + permanent-water cache).
 - Installs from `requirements-glofas.txt`, not `requirements-ci.txt` — a deliberately lean,
   separate dependency set (no eccodes/geos/proj/gdal, which this pipeline never touches).
 
@@ -63,7 +66,10 @@ Trigger `.github/workflows/glofas.yml` from the GitHub Actions UI with optional 
 |----------|---------|-------------|
 | `GLOFAS_DATA_DIR` | `glofas_data` | Local directory for GloFAS forecast Zarr files |
 | `GLOFAS_THRESHOLD_SOURCE` | `snowflake` | Where the RP threshold files are read from: `snowflake` or `local` |
-| `GLOFAS_THRESHOLD_LOCAL_DIR` | `glofas_thresholds` | Local dir for threshold files, used only when `GLOFAS_THRESHOLD_SOURCE=local` |
+| `GLOFAS_THRESHOLD_LOCAL_DIR` | `glofas_data/thresholds_cache` | Local dir for threshold files, used only when `GLOFAS_THRESHOLD_SOURCE=local` |
+| `GLOFAS_EXTENT_ENABLED` | `true` | Whether the GloFAS x JRC extent-masking step runs after raw discharge |
+| `GLOFAS_JRC_SOURCE` | `snowflake` | Where the cached JRC RP10/20/50/100 + permanent-water GeoTIFFs are read from: `snowflake` or `local` |
+| `GLOFAS_JRC_LOCAL_DIR` | `glofas_data/jrc_extent_cache` | Local dir for JRC cache files, used only when `GLOFAS_JRC_SOURCE=local` |
 | `DOWNLOAD_DATE` | today (UTC) | Specific date (YYYY-MM-DD) — note the different format from the main pipeline's YYYYMMDD |
 | `CLEANUP_AFTER_LOAD` | true | Delete temp files after load |
 

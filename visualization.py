@@ -1150,11 +1150,7 @@ def _glofas_crop(dense, lats_1d, lons_1d, bounds):
 def _lookup_threshold_at_cells(threshold_path, rp, cell_lat, cell_lon):
     """
     Fast nearest-neighbor lookup of an official RP threshold at many cell
-    coordinates. Uses direct integer-index arithmetic on the loaded numpy array
-    instead of xarray's per-point .sel(method='nearest') — the latter takes
-    ~100s for ~470k points against the full-resolution global threshold grid;
-    this takes well under a second, since the two grids share the same 0.05deg
-    alignment (already confirmed by the pipeline's own grid-match checks).
+    coordinates.
     """
     import xarray as xr
     official = xr.open_dataset(threshold_path)
@@ -1173,7 +1169,7 @@ def _lookup_threshold_at_cells(threshold_path, rp, cell_lat, cell_lon):
     return thr_arr[row, col]
 
 
-def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_thresholds', rp='2.0',
+def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_cache', rp='2.0',
                         step_h=72, pad_deg=12.0):
     """
     Find a real bounding box around the strongest RP-exceedance cluster, for use
@@ -1259,14 +1255,14 @@ def _glofas_thresholds_at_point(cell_lat, cell_lon, threshold_local_dir, rps):
 
 
 def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
-                                      threshold_local_dir='glofas_thresholds',
+                                      threshold_local_dir='glofas_data/thresholds_cache',
                                       rps=('2.0', '5.0', '20.0'),
                                       output_dir=DEFAULT_OUTPUT_DIR,
                                       show_plot=True, save_plot=False):
     """
     Point hydrograph for a single cell: all 51 ensemble member traces across the
     7-day lead-time horizon, an ensemble median, a min-max spread band, and
-    official RP threshold lines — matching the style of Google Flood Hub /
+    official RP threshold lines, matching the style of Google Flood Hub /
     GloFAS's own single-gauge forecast view.
 
     Args:
@@ -1368,7 +1364,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
 
 
 def show_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
-                                 threshold_local_dir='glofas_thresholds', rps=('2.0', '5.0', '20.0')):
+                                 threshold_local_dir='glofas_data/thresholds_cache', rps=('2.0', '5.0', '20.0')):
     """Quick function to show a single-gauge ensemble hydrograph with threshold lines."""
     return visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=cell_lat, cell_lon=cell_lon,
                                              threshold_local_dir=threshold_local_dir, rps=rps,
@@ -1511,7 +1507,7 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
     return str(filepath) if filepath else None
 
 
-def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_thresholds',
+def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thresholds_cache',
                                 rp='2.0', step_h=72, bounds=None,
                                 output_dir=DEFAULT_OUTPUT_DIR,
                                 show_plot=True, save_plot=False):
@@ -1604,11 +1600,285 @@ def show_glofas_period_panels(zarr_path, lead_hours=None):
                                           show_plot=True, save_plot=False)
 
 
-def show_glofas_exceedance(zarr_path, threshold_local_dir='glofas_thresholds', rp='2.0', step_h=72, bounds=None):
+def show_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thresholds_cache', rp='2.0', step_h=72, bounds=None):
     """Quick function to show RP exceedance probability map."""
     return visualize_glofas_exceedance(zarr_path, threshold_local_dir=threshold_local_dir,
                                        rp=rp, step_h=step_h, bounds=bounds,
                                        show_plot=True, save_plot=False)
+
+
+def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cache', rp='100.0',
+                                 step_h=168, threshold_local_dir='glofas_data/thresholds_cache',
+                                 bounds=None, compare_naive=True,
+                                 output_dir=DEFAULT_OUTPUT_DIR, show_plot=True, save_plot=False):
+    """
+    GloFAS x JRC extent-masking demo: calls the REAL production functions from
+    glofas_extent_masking.py directly (compute_tier_probabilities, resolve_jrc_cache,
+    combine_tier), not a reimplementation, so this shows the actual pipeline step.
+
+    Naively multiplying a whole GloFAS 0.05deg (~5km) cell's population by its raw
+    exceedance probability overstates exposure. A GloFAS cell is a channel/discharge
+    property, not a locally-uniform hazard the way a rain cell is. combine_naive=True
+    shows why, side by side: the naive whole-cell probability vs. the same probability
+    masked down to JRC's actual flood-extent footprint within each cell.
+
+    RP2/RP5 have no native JRC map (JRC only covers RP10 and up), they use RP10's
+    own extent as a labeled upper-bound stand-in, noted in the title when applicable.
+
+    Requires: the RP threshold file for `rp` cached locally (setup_glofas_thresholds.py)
+    AND the JRC cache for this tier + permanent-water populated in jrc_local_dir
+    (setup_jrc_extents.py --local-only, or GLOFAS_JRC_LOCAL_DIR default location).
+    """
+    from glofas_downloader import EXTENT_RP_LEVELS
+    from glofas_extent_masking import (
+        compute_tier_probabilities, resolve_jrc_cache, combine_tier, EXTENT_SOURCE_TIER, IS_STANDIN,
+    )
+    import rasterio as _rasterio
+
+    standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
+    print("=" * 60)
+    print(f"GLOFAS x JRC — EXTENT-MASKED RP{rp}yr (+{step_h}h){standin_note}")
+    print("=" * 60)
+
+    if rp not in EXTENT_RP_LEVELS:
+        print(f"  rp must be one of {EXTENT_RP_LEVELS}")
+        return None
+
+    jrc_paths = resolve_jrc_cache('local', jrc_local_dir)
+    source_tier = EXTENT_SOURCE_TIER[rp]
+    if source_tier not in jrc_paths or 'water' not in jrc_paths:
+        print(f"  JRC cache for RP{source_tier} depth and/or permanent-water not found in {jrc_local_dir}.")
+        print(f"  Run: python3 setup_jrc_extents.py --local-only {jrc_local_dir} "
+              f"(or point jrc_local_dir at an existing cache)")
+        return None
+
+    g = _load_glofas_zarr(zarr_path)
+    sidx = _glofas_step_index(g['leadtime_hours'], step_h)
+
+    # Pre-filter to cells within the JRC cache's own raster bounds (+0.05deg pad)
+    # BEFORE computing probabilities
+    with _rasterio.open(jrc_paths[source_tier]) as _src:
+        jb = _src.bounds
+    pad = 0.05  # one GloFAS cell width
+                # right at the raster edge to still have part of their own
+                # footprint inside it; a looser pad only adds cells that
+                # combine_tier will (correctly) skip anyway, noisily
+    in_jrc = ((g['cell_lat'] >= jb.bottom - pad) & (g['cell_lat'] <= jb.top + pad) &
+              (g['cell_lon'] >= jb.left - pad) & (g['cell_lon'] <= jb.right + pad))
+    cell_lat = g['cell_lat'][in_jrc]
+    cell_lon = g['cell_lon'][in_jrc]
+    data = g['data'][:, :, in_jrc]
+    print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
+          f"cached JRC coverage ({jrc_local_dir}) — restricting to those before combining")
+
+    prob_by_tier = compute_tier_probabilities(
+        cell_lat, cell_lon, data, len(g['member_numbers']),
+        threshold_source='local', threshold_local_dir=threshold_local_dir,
+    )
+    prob = prob_by_tier[rp]  # (n_steps, n_cells), fraction of members exceeding RP{rp}
+    keep_mask = (prob > 0).any(axis=0)
+    if not keep_mask.any():
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast — try a lower tier or a different date.")
+        return None
+
+    out_path = Path(output_dir) / f"_demo_extent_rp{rp}.tif"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    info = combine_tier(rp, cell_lat, cell_lon, prob, keep_mask, jrc_paths,
+                        g['leadtime_hours'], out_path)
+    print(f"  Extent-masked: {info['n_cells']} GloFAS cells, {info['n_pixels']:,} combined pixels "
+          f"(using JRC RP{source_tier} extent + permanent-water mask)")
+
+    with _rasterio.open(out_path) as src:
+        band = src.read(sidx + 1)
+        transform = src.transform
+    h, w = band.shape
+    lons_1d = transform.c + transform.a * (np.arange(w) + 0.5)
+    lats_1d = transform.f + transform.e * (np.arange(h) + 0.5)
+    plot_bounds = bounds or (float(lons_1d.min()), float(lons_1d.max()),
+                             float(lats_1d.min()), float(lats_1d.max()))
+
+    lat_idx = np.where((lats_1d >= plot_bounds[2]) & (lats_1d <= plot_bounds[3]))[0]
+    lon_idx = np.where((lons_1d >= plot_bounds[0]) & (lons_1d <= plot_bounds[1]))[0]
+    masked_pct = np.where(band > 0, band * 100, np.nan)[np.ix_(lat_idx, lon_idx)]
+    lats_crop, lons_crop = lats_1d[lat_idx], lons_1d[lon_idx]
+
+    if compare_naive:
+        exceed_pct = np.zeros(len(cell_lat))
+        exceed_pct[keep_mask] = prob[sidx][keep_mask] * 100
+        naive_dense, naive_lats, naive_lons = _glofas_sparse_to_dense(cell_lat, cell_lon, exceed_pct)
+        naive_dense, naive_lats, naive_lons = _glofas_crop(naive_dense, naive_lats, naive_lons, plot_bounds)
+
+        naive_pixels = int(np.nansum(~np.isnan(naive_dense) & (naive_dense > 0)))
+        masked_pixels = int(np.nansum(~np.isnan(masked_pct) & (masked_pct > 0)))
+        print(f"  Naive whole-cell footprint: {naive_pixels:,} pixels at 0.05deg native resolution "
+              f"(not directly comparable pixel-for-pixel to the {masked_pixels:,} JRC-resolution "
+              f"pixels above -- different grids -- but illustrates the same 'whole cell vs. real "
+              f"extent' gap the README's 84x/2x overstatement numbers quantify precisely)")
+
+    fig = plt.figure(figsize=(FIGSIZE[0] * (1.8 if compare_naive else 1), FIGSIZE[1]), dpi=DPI)
+
+    if compare_naive:
+        ax1 = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree())
+        _setup_glofas_map(ax1, plot_bounds, regional=True)
+        mesh1 = ax1.pcolormesh(naive_lons, naive_lats, naive_dense, cmap='YlOrRd', vmin=0, vmax=100,
+                               transform=ccrs.PlateCarree(), zorder=2, shading='auto')
+        plt.colorbar(mesh1, ax=ax1, orientation='horizontal', pad=0.05, shrink=0.8,
+                    label=f'Naive whole-cell P(exceed RP{rp}yr)  [%]')
+        ax1.set_title("Naive: whole 5km GloFAS cell\n(overstates exposure)", fontsize=11)
+        ax2 = fig.add_subplot(1, 2, 2, projection=ccrs.PlateCarree())
+    else:
+        ax2 = plt.axes(projection=ccrs.PlateCarree())
+
+    _setup_glofas_map(ax2, plot_bounds, regional=True)
+    mesh2 = ax2.pcolormesh(lons_crop, lats_crop, masked_pct, cmap='YlOrRd', vmin=0, vmax=100,
+                           transform=ccrs.PlateCarree(), zorder=2, shading='auto')
+    plt.colorbar(mesh2, ax=ax2, orientation='horizontal', pad=0.05, shrink=0.8,
+                label=f'Extent-masked P(exceed RP{rp}yr)  [%]')
+    ax2.set_title(f"GloFAS x JRC extent-masked (RP{source_tier} extent)\nreal flood-prone area only", fontsize=11)
+
+    suptitle = f"GloFAS x JRC Flood-Extent Masking — RP{rp}yr — +{step_h}h{standin_note}"
+    plt.suptitle(suptitle, fontsize=14, fontweight='bold')
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = Path(output_dir) / f"glofas_extent_mask_rp{rp}_{step_h}h.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cache', rp='100.0', step_h=168,
+                            threshold_local_dir='glofas_data/thresholds_cache', bounds=None, compare_naive=True):
+    """Quick function to show the GloFAS x JRC extent-masked result."""
+    return visualize_glofas_extent_mask(zarr_path, jrc_local_dir=jrc_local_dir, rp=rp, step_h=step_h,
+                                        threshold_local_dir=threshold_local_dir, bounds=bounds,
+                                        compare_naive=compare_naive, show_plot=True, save_plot=False)
+
+
+def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cache', rp='100.0',
+                                    step_h=168, members=(1, 2), threshold_local_dir='glofas_data/thresholds_cache',
+                                    bounds=None, output_dir=DEFAULT_OUTPUT_DIR, show_plot=True, save_plot=False):
+    """
+    GloFAS x JRC PER-MEMBER flood-extent demo
+
+    Shows 2+ specific ensemble members' own flood-extent footprints side by
+    side
+
+    Requires: the RP threshold file for `rp` cached locally
+    (setup_glofas_thresholds.py) AND the JRC cache for this tier +
+    permanent-water populated in jrc_local_dir (setup_jrc_extents.py
+    --local-only, or GLOFAS_JRC_LOCAL_DIR default location).
+    """
+    from glofas_downloader import EXTENT_RP_LEVELS
+    from glofas_extent_masking import (
+        compute_tier_member_exceedance, resolve_jrc_cache, combine_tier_per_member_parquet,
+        EXTENT_SOURCE_TIER, IS_STANDIN,
+    )
+    import rasterio as _rasterio
+
+    standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
+    print("=" * 60)
+    print(f"GLOFAS x JRC — PER-MEMBER FLOOD EXTENT RP{rp}yr (+{step_h}h){standin_note}")
+    print("=" * 60)
+
+    if rp not in EXTENT_RP_LEVELS:
+        print(f"  rp must be one of {EXTENT_RP_LEVELS}")
+        return None
+
+    jrc_paths = resolve_jrc_cache('local', jrc_local_dir)
+    source_tier = EXTENT_SOURCE_TIER[rp]
+    if source_tier not in jrc_paths or 'water' not in jrc_paths:
+        print(f"  JRC cache for RP{source_tier} depth and/or permanent-water not found in {jrc_local_dir}.")
+        print(f"  Run: python3 setup_jrc_extents.py --local-only {jrc_local_dir} "
+              f"(or point jrc_local_dir at an existing cache)")
+        return None
+
+    g = _load_glofas_zarr(zarr_path)
+
+    # Same pre-filter as visualize_glofas_extent_mask() and for the same reason
+    # restrict to cells within the cached JRC raster's own bounds before
+    # computing anything, since cells outside it can never combine anyway.
+    with _rasterio.open(jrc_paths[source_tier]) as _src:
+        jb = _src.bounds
+    pad = 0.05  # one GloFAS cell width
+    in_jrc = ((g['cell_lat'] >= jb.bottom - pad) & (g['cell_lat'] <= jb.top + pad) &
+              (g['cell_lon'] >= jb.left - pad) & (g['cell_lon'] <= jb.right + pad))
+    cell_lat = g['cell_lat'][in_jrc]
+    cell_lon = g['cell_lon'][in_jrc]
+    data = g['data'][:, :, in_jrc]
+    print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
+          f"cached JRC coverage ({jrc_local_dir}) — restricting to those before combining")
+
+    exceed_by_tier = compute_tier_member_exceedance(
+        cell_lat, cell_lon, data, threshold_source='local', threshold_local_dir=threshold_local_dir,
+    )
+    exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
+    keep_mask = exceed.any(axis=(0, 1))
+    if not keep_mask.any():
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast — try a lower tier or a different date.")
+        return None
+
+    member_numbers = np.asarray(g['member_numbers'])
+    out_path = Path(output_dir) / f"_demo_extent_rp{rp}_bymember.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    info = combine_tier_per_member_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
+                                            jrc_paths, g['leadtime_hours'], member_numbers, out_path)
+    print(f"  Per-member extent: {info['n_cells']} GloFAS cells, {info['n_rows']:,} flooded "
+          f"pixel/member/step rows (using JRC RP{source_tier} extent + permanent-water mask)")
+
+    table = pd.read_parquet(out_path)
+    step_rows = table[table['step_h'] == step_h]
+
+    plot_bounds = bounds or (float(cell_lon.min()), float(cell_lon.max()),
+                             float(cell_lat.min()), float(cell_lat.max()))
+
+    n_members = len(members)
+    fig = plt.figure(figsize=(FIGSIZE[0] * n_members * 0.9, FIGSIZE[1]), dpi=DPI)
+    for i, member_no in enumerate(members):
+        ax = fig.add_subplot(1, n_members, i + 1, projection=ccrs.PlateCarree())
+        _setup_glofas_map(ax, plot_bounds, regional=True)
+        member_rows = step_rows[step_rows['member'] == member_no]
+        n_px = len(member_rows)
+        if n_px:
+            ax.scatter(member_rows['pixel_lon'], member_rows['pixel_lat'], s=1.5, c='#c0392b',
+                       marker='s', transform=ccrs.PlateCarree(), zorder=2, alpha=0.8)
+        ax.set_title(f"Member {member_no}\n{n_px:,} flooded pixels", fontsize=11)
+
+    suptitle = f"GloFAS x JRC Per-Member Flood Extent — RP{rp}yr — +{step_h}h{standin_note}"
+    plt.suptitle(suptitle, fontsize=14, fontweight='bold')
+
+    filepath = None
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = Path(output_dir) / f"glofas_member_extent_rp{rp}_{step_h}h.png"
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {filepath}")
+
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+    return str(filepath) if filepath else None
+
+
+def show_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cache', rp='100.0', step_h=168,
+                               members=(1, 2), threshold_local_dir='glofas_data/thresholds_cache', bounds=None):
+    """Quick function to show per-member GloFAS x JRC flood extent, side by side."""
+    return visualize_glofas_member_extent(zarr_path, jrc_local_dir=jrc_local_dir, rp=rp, step_h=step_h,
+                                          members=members, threshold_local_dir=threshold_local_dir,
+                                          bounds=bounds, show_plot=True, save_plot=False)
 
 
 # ─── Gust Envelope Visualizations ────────────────────────────────────────────

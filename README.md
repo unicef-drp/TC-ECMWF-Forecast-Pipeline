@@ -37,6 +37,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `tp` total precipitation (global) |
 | `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `ro` total runoff (land-only) |
 | `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24') — GloFAS riverine discharge, standalone pipeline, see below |
+| `glofas/{date}/river_extent_rp{N}_bymember_*.parquet` | `RIVER_FORECASTS` | One row per (forecast_time, param='extent_rp{2,5,10,20,50,100}_bymember'), GloFAS x JRC v2.1 per-member flood extent (sparse table, one row per pixel/member/step flooded), same table as raw discharge, see below |
 
 ## Prerequisites
 
@@ -225,7 +226,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygons per forecast step (10fg, m/s) |
 | `TC_GUST_ENVELOPES_COMBINED` | Combined gust threshold polygons across all forecast steps |
 | `MET_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
-| `RIVER_FORECASTS` | Metadata: one row per (forecast_time, param='dis24') with GloFAS Zarr stage path |
+| `RIVER_FORECASTS` | Metadata: one row per (forecast_time, param) with stage path — `param='dis24'` for raw discharge, `param='extent_rp{2,5,10,20,50,100}_bymember'` (plus `IS_STANDIN`) for GloFAS x JRC per-member flood extent |
 
 ## GloFAS Riverine Discharge Pipeline (standalone)
 
@@ -245,13 +246,23 @@ its own independent job rather than a step inside the main pipeline.
 - **One-time setup required first:** `setup_glofas_thresholds.py` — caches the
   official RP threshold files the sparse filter depends on; run manually once, not
   part of any recurring schedule
+- **Extent masking (enabled by default):** `glofas_extent_masking.py` — combines the
+  raw discharge-exceedance probability above with [JRC's Global River Flood Hazard
+  Maps v2.1](https://data.jrc.ec.europa.eu/), a static per-return-period flood-extent
+  raster, to correct for GloFAS's 0.05° cell overstating exposure across a whole
+  cell rather than just its real channel/floodplain footprint. Requires its own
+  one-time cache first: `setup_jrc_extents.py`, fetches directly from JRC's own
+  file server, run manually once. Toggle
+  with `GLOFAS_EXTENT_ENABLED`; output uploads to the same
+  `@{stage}/glofas/{date}/` folder as the raw discharge Zarr.
 - **Why separate from the main pipeline:** GloFAS's ~11h publication latency
   doesn't align with the main pipeline's 4 daily run slots, and a full global
   fetch can take far longer than the main pipeline's other steps — bundling them
   would force one pipeline's schedule/timeout onto the other
 - **Demo notebook:** `pipeline_demonstration_glofas.ipynb` — download, sparse Zarr
   inspection, and visualizations (raster maps, RP exceedance hotspot zoom, single-gauge
-  ensemble hydrograph)
+  ensemble hydrograph, plus a GloFAS x JRC extent-masking demo using a small
+  Bangladesh-scale cache)
 
 ## Quick Start
 
