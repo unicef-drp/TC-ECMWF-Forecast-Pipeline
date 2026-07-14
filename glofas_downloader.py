@@ -107,7 +107,14 @@ THRESHOLD_BASE_URL = "https://confluence.ecmwf.int/download/attachments/24206738
 
 # One static global auxiliary file (not per-RP, no RP suffix in the
 # filename). Values are raw m^2 on disk. Used only for the below_min_basin
-# flag (glofas_extent_masking.py) against that same 500km^2 cutoff.
+# flag (glofas_extent_masking.py)
+
+# IMPORTANT: that flag is about JRC's
+# flood-EXTENT map coverage, not GloFAS discharge/threshold confidence (both
+# of which are dense, unrestricted, global products, confirmed directly
+# every cell has a real RP threshold value down to ~28km^2 catchments). The
+# 500km^2 cutoff is JRC's own minimum-catchment scope for its LISFLOOD-FP
+# flood-extent simulation, a matching-availability gap, not a forecast one.
 # https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
 UPAREA_URL = f"{THRESHOLD_BASE_URL}/uparea_glofas_v4_0.nc"
 UPAREA_STAGE_PATH = f"{THRESHOLD_STAGE_PREFIX}/uparea_glofas_v4_0.nc"
@@ -513,7 +520,7 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
                 cell_uparea_km2 = _load_uparea_values(cell_lat, cell_lon, uparea_path)
                 below_500 = int(np.nansum(cell_uparea_km2 < 500.0))
                 logger.info(f"  uparea tagged: {below_500:,} of {n_cells:,} cells below 500km^2 "
-                            f"(GloFAS's own official minimum simulated-basin size, tagged only)")
+                            f"(JRC's own flood-extent-map catchment cutoff, tagged only")
             except Exception as e:
                 logger.warning(f"  uparea tagging failed, continuing without it: {e}")
                 cell_uparea_km2 = None

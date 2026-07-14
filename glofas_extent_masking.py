@@ -11,8 +11,16 @@ glofas_downloader.py with JRC v2.1's static, pre-cached flood-extent rasters
   - Nearest-cell "hard" assignment: each JRC pixel within a GloFAS cell's
     0.05deg footprint inherits that cell's own probability.
   - Permanent water excluded (JRC's own permanent_water_class band).
-  - uparea < 500km^2 (GloFAS v4+'s own official minimum simulated-basin size) 
-    is flagged via a `below_min_basin` column, NOT excluded. 
+  - uparea < 500km^2 is flagged via a `below_min_basin` column, NOT excluded.
+    IMPORTANT: this is NOT a confidence flag on the GloFAS discharge forecast
+    or the RP threshold comparison, both are dense, global, unrestricted
+    products (confirmed directly: every cell has a real RP threshold value,
+    even down to ~28km^2 catchments). 500km^2 is specifically JRC's own
+    minimum-catchment cutoff for generating the flood-EXTENT map itself (the
+    LISFLOOD-FP hydraulic simulation), below it, there may be no flood
+    geometry to combine with at all, a matching-availability gap, not a
+    forecast-quality one. See
+    https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
 
 Output: one tiled GeoTIFF per RP tier per forecast date, 7 bands (one per
 lead step, 24h-168h), globally scoped (60S-60N, no country/region split,
@@ -56,7 +64,9 @@ IS_STANDIN = {"2.0": True, "5.0": True, "10.0": False,
 
 DEPTH_THRESHOLD_M = 0.1  # NOT a indication of not harmful, but used as a noise floor
 
-MIN_BASIN_KM2 = 500.0    # GloFAS v4+'s own official minimum simulated-basin size
+MIN_BASIN_KM2 = 500.0    # JRC's own minimum-catchment cutoff for generating the flood-EXTENT
+                          # map (LISFLOOD-FP simulation), NOT a GloFAS discharge/threshold
+                          # confidence cutoff, see module docstring
 # https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
 
 JRC_VERSION = "v2_1"
@@ -370,8 +380,10 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
     are NOT flooded, so only writing the positive case keeps this small).
     
     Columns: pixel_lat, pixel_lon, member (real ECMWF member id, 1-50 pf /
-    51 control), step_h, below_min_basin (True if this cell's own uparea is 
-    known to be below GloFAS v4+'s official 500km^2 minimum simulated-basin size.
+    51 control), step_h, below_min_basin (True if this cell's own uparea is
+    known to be below JRC's own 500km^2 minimum-catchment cutoff for
+    generating flood-extent maps, a matching-availability flag, not a
+    statement about this cell's discharge forecast being less trustworthy;
     `below_min_basin` is per-cell (shape (n_cells,), aligned to cell_lat/
     cell_lon), broadcast onto every row a given cell contributes. None (the
     default) means "not evaluated", every row gets False, same as an
@@ -532,7 +544,8 @@ def run_glofas_extent_masking(
     extent + permanent-water rasters, writes one Parquet file per RP tier
     (one row per pixel/member/step that's flooded for that member, JRC
     pixel-matched, plus a `below_min_basin` column flagging cells under
-    GloFAS's own 500km^2 minimum simulated-basin size, and (if upload_to_stage) PUTs each to
+    JRC's own 500km^2 minimum-catchment cutoff for generating flood-extent
+    maps, and (if upload_to_stage) PUTs each to
     the Snowflake stage. Best-effort per tier, so one tier's failure is logged
     and skipped, never aborts the others or the raw-discharge upload that
     already succeeded upstream.
@@ -571,7 +584,7 @@ def run_glofas_extent_masking(
     if cell_uparea_km2 is not None:
         n_flagged = int(below_min_basin.sum())
         logger.info(f"  uparea flag (< {min_basin_km2:.0f}km^2): {n_flagged:,} of {n_cells:,} cells flagged "
-                    f"below GloFAS v4+'s own minimum simulated-basin size")
+                    f"below JRC's own minimum-catchment cutoff for flood-extent maps")
     else:
         logger.warning("  No cell_uparea_km2 in this Zarr, below_min_basin will be False for every cell this run")
 
