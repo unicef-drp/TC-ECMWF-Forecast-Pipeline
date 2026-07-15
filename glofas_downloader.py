@@ -65,6 +65,11 @@ LEADTIME_HOURS = ["24", "48", "72", "96", "120", "144", "168"]
 DEFAULT_GLOFAS_DIR = 'glofas_data'
 MAX_PUBLICATION_LAG_DAYS = 1  # how many days back to retry if today's forecast isn't published yet
 
+# CDS submit/process split: submit_glofas_requests()
+# fires the 2 real CDS requests (wait_until_complete=False) and returns immediately;
+# resume_glofas_download() comes back later and waits-then-downloads.
+CDS_PROCESS_DELAY_MINUTES = 40
+
 # Threshold tier used to decide which cells are worth storing at all. RP
 # thresholds are monotonic by construction (rl_2.0 < rl_5.0 < ... < rl_100.0),
 # so a cell whose discharge exceeds any higher tier's threshold necessarily
@@ -329,22 +334,12 @@ def _load_uparea_values(cell_lat: np.ndarray, cell_lon: np.ndarray, uparea_path:
 
 def _retrieve_glofas(client, forecast_date: datetime, product_type: str, target: Path) -> None:
     """One CDS request for cems-glofas-forecast. product_type is 'ensemble_perturbed_forecasts'
-    (50 members) or 'control_forecast' (1 member)."""
+    (50 members) or 'control_forecast' (1 member). Shares its request body with
+    submit_glofas_requests() via _glofas_request_dict() (defined further below) so the
+    two paths can never drift apart."""
     client.retrieve(
         "cems-glofas-forecast",
-        {
-            "system_version": "operational",
-            "hydrological_model": "lisflood",
-            "product_type": product_type,
-            "variable": "river_discharge_in_the_last_24_hours",
-            "year": forecast_date.strftime("%Y"),
-            "month": forecast_date.strftime("%m"),
-            "day": forecast_date.strftime("%d"),
-            "leadtime_hour": LEADTIME_HOURS,
-            "data_format": "netcdf",
-            "download_format": "unarchived",
-            "area": AREA,
-        },
+        _glofas_request_dict(forecast_date, product_type),
         str(target),
     )
 
@@ -411,6 +406,144 @@ def download_with_fallback(forecast_date: datetime, raw_dir: Path,
     logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
                  f"and {max_lag_days} day(s) prior — skipping")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Submit/resume split: lets a cheap, short-lived step fire the 2 real CDS
+# requests without paying for compute during the queue wait, and a separate,
+# later step come back to collect the result. See CDS_PROCESS_DELAY_MINUTES.
+# ---------------------------------------------------------------------------
+
+def _glofas_request_dict(forecast_date: datetime, product_type: str) -> Dict:
+    """The exact request body _retrieve_glofas() already sends, factored out so
+    submit_glofas_requests() can build the identical request without waiting."""
+    return {
+        "system_version": "operational",
+        "hydrological_model": "lisflood",
+        "product_type": product_type,
+        "variable": "river_discharge_in_the_last_24_hours",
+        "year": forecast_date.strftime("%Y"),
+        "month": forecast_date.strftime("%m"),
+        "day": forecast_date.strftime("%d"),
+        "leadtime_hour": LEADTIME_HOURS,
+        "data_format": "netcdf",
+        "download_format": "unarchived",
+        "area": AREA,
+    }
+
+
+def submit_glofas_requests(forecast_date: datetime,
+                            max_lag_days: int = MAX_PUBLICATION_LAG_DAYS) -> Optional[Dict]:
+    """
+    Submit-only: fires both real CDS requests (ensemble_perturbed_forecasts,
+    control_forecast) via cdsapi.Client(wait_until_complete=False), which returns
+    immediately after the initial POST instead of blocking through the queue wait.
+
+    IMPORTANT: Real observed status values are "accepted" -> "running" ->
+    "successful" (NOT "queued"/"completed" as cdsapi.api.Client._api() assumes),
+    and the real polling endpoint is /retrieve/v1/jobs/{id} (NOT /tasks/{id}).
+    See resume_glofas_download() for how this is actually resumed correctly.
+    """
+    import cdsapi
+    client = cdsapi.Client(url=os.getenv('CDSAPI_URL'), key=os.getenv('CDSAPI_KEY'),
+                           wait_until_complete=False)
+
+    for lag in range(max_lag_days + 1):
+        candidate = forecast_date - timedelta(days=lag)
+        if lag > 0:
+            logger.info(f"  Falling back to {candidate.strftime('%Y-%m-%d')} "
+                        f"(requested date not yet published)")
+        request_ids = {}
+        remotes = {}
+        try:
+            for product_type in ("ensemble_perturbed_forecasts", "control_forecast"):
+                remote = client.retrieve("cems-glofas-forecast",
+                                         _glofas_request_dict(candidate, product_type))
+                request_ids[product_type] = remote.request_id
+                remotes[product_type] = remote
+                logger.info(f"  Submitted {product_type} for {candidate.strftime('%Y%m%d')}: "
+                            f"request_id={remote.request_id}")
+            return {"actual_date": candidate, "requests": request_ids}
+        except Exception as e:
+            logger.warning(f"  GloFAS not available for {candidate.strftime('%Y%m%d')}: {e}")
+            if remotes:
+                logger.error(f"  {len(remotes)} CDS request(s) already submitted for "
+                             f"{candidate.strftime('%Y%m%d')} before this failure "
+                             f"({list(request_ids.values())}) -- cancelling to avoid leaking "
+                             f"running jobs")
+                for product_type, remote in remotes.items():
+                    try:
+                        remote.delete()
+                    except Exception as cancel_err:
+                        logger.error(f"  Failed to cancel orphaned {product_type} request "
+                                     f"{remote.request_id}: {cancel_err} -- it will keep running "
+                                     f"server-side, unreferenced, until it expires on its own")
+            continue
+
+    logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
+                 f"and {max_lag_days} day(s) prior — skipping submit")
+    return None
+
+
+def resume_glofas_download(requests: Dict[str, str], actual_date: datetime,
+                            raw_dir: Path) -> Optional[Dict[str, Path]]:
+    """
+    Given request_id strings from a prior submit_glofas_requests() call, wait for
+    each CDS request to complete and download it.
+
+    Concurrent across both products (same reasoning as _download_for_date(): don't
+    let one request's remaining wait fully elapse before even checking the other).
+    Returns {'ens': path, 'ctrl': path} or None on failure (mirrors _download_for_date()).
+    """
+    import cdsapi
+    client = cdsapi.Client(url=os.getenv('CDSAPI_URL'), key=os.getenv('CDSAPI_KEY'),
+                           wait_until_complete=False)
+    if not hasattr(client, 'client'):
+        raise RuntimeError(
+            f"resume_glofas_download() requires cdsapi.Client(...) to resolve to a "
+            f"LegacyClient (needs a token-format CDSAPI_KEY, not the legacy "
+            f"'UID:APIKEY' format) -- got {type(client).__name__} instead, which has "
+            f"no .client attribute for get_remote(). Fix CDSAPI_KEY's format; this is "
+            f"a configuration problem, not a transient CDS unavailability."
+        )
+
+    date_str = actual_date.strftime("%Y%m%d")
+    targets = {
+        "ensemble_perturbed_forecasts": raw_dir / f"glofas_ens_{date_str}.nc",
+        "control_forecast": raw_dir / f"glofas_ctrl_{date_str}.nc",
+    }
+
+    def _wait_and_download(product_type: str, request_id: str, target: Path) -> Path:
+        if target.exists():
+            return target
+        remote = client.client.get_remote(request_id)
+        remote.download(str(target))  # blocks internally until "successful", then downloads
+        return target
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+            futures = {
+                executor.submit(_wait_and_download, product_type, request_id, targets[product_type]): product_type
+                for product_type, request_id in requests.items()
+            }
+            errors = []
+            for future in as_completed(futures):
+                product_type = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append((product_type, e))
+            if errors:
+                for product_type, e in errors:
+                    logger.warning(f"  {product_type} failed while resuming: {e}")
+                raise RuntimeError(f"{len(errors)} of {len(requests)} product(s) failed to "
+                                   f"resume: {[p for p, _ in errors]}")
+        return {"ens": targets["ensemble_perturbed_forecasts"], "ctrl": targets["control_forecast"]}
+    except Exception as e:
+        logger.warning(f"  Resuming GloFAS download failed for {date_str}: {e}")
+        for target in targets.values():
+            target.unlink(missing_ok=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +780,7 @@ def download_glofas_forecast(
         verbose: bool = True,
         threshold_source: str = "snowflake",
         threshold_local_dir: Union[str, Path] = f"{DEFAULT_GLOFAS_DIR}/thresholds_cache",
+        pre_submitted: Optional[Dict] = None,
 ) -> Dict:
     """
     Download GloFAS discharge forecast for one date, build Zarr ZipStore, store result.
@@ -665,6 +799,14 @@ def download_glofas_forecast(
                                RP2 threshold file from for sparse cell filtering (see
                                setup_glofas_thresholds.py; GLOFAS_THRESHOLD_SOURCE env var)
         threshold_local_dir:  Local dir containing rl_2.0.nc, used when threshold_source='local'
+        pre_submitted:        Optional {'actual_date', 'requests'} from an earlier
+                               submit_glofas_requests() call (GLOFAS_MODE=submit, see
+                               glofas_pipeline_core.py). When given, skips a fresh
+                               download_with_fallback() submission and instead calls
+                               resume_glofas_download() to wait-then-download the
+                               already-submitted requests, the cost-saving submit/
+                               process split. When None (default), behaves exactly as
+                               before: submits fresh and blocks through the full wait.
 
     Returns dict: success, zip_path, stage_path, forecast_date (date actually used,
                   may lag the requested date — see module docstring), param.
@@ -717,11 +859,47 @@ def download_glofas_forecast(
                 return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
                          'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
-    # Step 1: Download (with same-day/prior-day fallback)
-    result = download_with_fallback(forecast_date, raw_dir)
-    if result is None:
-        return {'success': False, 'zip_path': None, 'stage_path': None,
-                 'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
+    # Step 1: Download. Two paths:
+    #  - pre_submitted given (GLOFAS_MODE=process, resuming an earlier submit step):
+    #    wait-then-download the already-submitted requests, date fallback already
+    #    resolved at submit time.
+    #  - pre_submitted=None (default, and GLOFAS_MODE=submit's own fallback when it
+    #    finds nothing to resume from): today's original submit-and-block-through-
+    #    the-full-wait behavior, unchanged.
+    if pre_submitted is not None:
+        actual_date = pre_submitted['actual_date']
+        try:
+            paths = resume_glofas_download(pre_submitted['requests'], actual_date, raw_dir)
+        except RuntimeError as e:
+            # resume_glofas_download()'s own config-format guard (e.g. a legacy
+            # 'UID:APIKEY'-format CDSAPI_KEY) raises rather than returning None, so
+            # this is surfaced loudly and distinctly here instead of being silently
+            # retried as an ordinary transient resume failure below.
+            logger.error(f"  Resuming pre-submitted CDS requests for "
+                         f"{actual_date.strftime('%Y-%m-%d')} hit a configuration problem, not a "
+                         f"transient failure: {e} -- falling back to a fresh submit-and-block "
+                         f"for this run, but the underlying CDSAPI_KEY format issue should be "
+                         f"fixed so future GLOFAS_MODE=submit/process runs work as intended")
+            paths = None
+        if paths is None:
+            # Resuming failed (e.g. a transient network blip reattaching, or the
+            # request expired/errored during the submit->process gap), fall back
+            # to a fresh submit-and-block, same resilience the original single-step
+            # flow always had for an equivalent transient failure.
+            logger.warning(f"  Resuming pre-submitted CDS requests for "
+                            f"{actual_date.strftime('%Y-%m-%d')} failed -- falling back to a "
+                            f"fresh submit-and-block")
+            result = download_with_fallback(forecast_date, raw_dir)
+            if result is None:
+                return {'success': False, 'zip_path': None, 'stage_path': None,
+                         'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
+        else:
+            result = {'paths': paths, 'actual_date': actual_date}
+    else:
+        result = download_with_fallback(forecast_date, raw_dir)
+        if result is None:
+            return {'success': False, 'zip_path': None, 'stage_path': None,
+                     'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
     actual_date = result['actual_date']
 
     # Step 1.5: Locate the cached RP2 threshold file (required for sparse filtering)

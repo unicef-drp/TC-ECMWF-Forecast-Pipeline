@@ -10,6 +10,8 @@ import os
 import sys
 import logging
 from pathlib import Path
+from datetime import timedelta
+from typing import Optional
 import pandas as pd
 import numpy as np
 import snowflake.connector
@@ -765,6 +767,129 @@ def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
         return 0
     finally:
         cursor.close()
+
+
+def save_cds_request_ids(actual_date, requests: dict, conn) -> int:
+    """
+    Persist the request_id from a submit_glofas_requests() call (GLOFAS_MODE=submit,
+    see glofas_pipeline_core.py) so a later, separate process step can resume
+    waiting on it via resume_glofas_download() without paying compute for the CDS
+    queue wait in between.
+
+    Args:
+        actual_date: datetime, the date submit_glofas_requests() actually
+            resolved to (may lag the originally-requested date)
+        requests: {product_type: request_id} as returned by submit_glofas_requests()
+        conn: active Snowflake connection
+
+    Returns number of rows merged (one per product type, normally 2).
+    """
+    if not requests:
+        return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS GLOFAS_CDS_REQUESTS (
+                FORECAST_DATE  DATE,
+                PRODUCT_TYPE   VARCHAR,
+                REQUEST_ID     VARCHAR,
+                SUBMITTED_AT   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        rows = [{'FORECAST_DATE': actual_date.strftime('%Y-%m-%d'),
+                 'PRODUCT_TYPE': product_type, 'REQUEST_ID': request_id}
+                for product_type, request_id in requests.items()]
+        df = pd.DataFrame(rows)
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE GLOFAS_CDS_REQUESTS_STAGING (
+                FORECAST_DATE  DATE,
+                PRODUCT_TYPE   VARCHAR,
+                REQUEST_ID     VARCHAR
+            )
+        """)
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='GLOFAS_CDS_REQUESTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write CDS request IDs to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO GLOFAS_CDS_REQUESTS t
+            USING GLOFAS_CDS_REQUESTS_STAGING s
+              ON  t.FORECAST_DATE = s.FORECAST_DATE
+              AND t.PRODUCT_TYPE  = s.PRODUCT_TYPE
+            WHEN MATCHED THEN
+                UPDATE SET t.REQUEST_ID = s.REQUEST_ID, t.SUBMITTED_AT = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_DATE, PRODUCT_TYPE, REQUEST_ID)
+                VALUES (s.FORECAST_DATE, s.PRODUCT_TYPE, s.REQUEST_ID)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} CDS request ID(s) into GLOFAS_CDS_REQUESTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error saving CDS request IDs: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
+
+
+def load_cds_request_ids(forecast_date, conn, max_lag_days: int) -> Optional[dict]:
+    """
+    Look up previously-saved CDS request IDs (from save_cds_request_ids()) for
+    GLOFAS_MODE=process to resume from. Searches forecast_date first, then earlier
+    days up to max_lag_days, same day-fallback order submit_glofas_requests()
+    itself already resolved against, so this finds whichever date actually has a
+    saved submission, not necessarily the literal date requested.
+
+    max_lag_days has no default deliberately: it must be MAX_PUBLICATION_LAG_DAYS
+    (from glofas_downloader.py) passed explicitly by the caller, not a second,
+    independently-hardcoded literal here that could silently drift out of sync
+    with submit_glofas_requests()'s own fallback window.
+
+    Returns {'actual_date': datetime, 'requests': {product_type: request_id}} for
+    the most recent date with a complete (both product types) saved submission,
+    or None if nothing usable was found, the caller (download_glofas_forecast())
+    treats None exactly like "no pre_submitted given" and falls back to a fresh
+    submit-and-block, so a missed/failed submit step never blocks the pipeline.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT TO_VARCHAR(FORECAST_DATE, 'YYYY-MM-DD'), PRODUCT_TYPE, REQUEST_ID
+            FROM GLOFAS_CDS_REQUESTS
+            WHERE FORECAST_DATE BETWEEN DATEADD(day, %s, %s) AND %s
+            ORDER BY FORECAST_DATE DESC
+        """, (-max_lag_days, forecast_date.strftime('%Y-%m-%d'), forecast_date.strftime('%Y-%m-%d')))
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f'  Could not look up saved CDS request IDs (table may not exist yet): {e}')
+        return None
+    finally:
+        cursor.close()
+
+    if not rows:
+        return None
+
+    by_date = {}
+    for date_str, product_type, request_id in rows:
+        by_date.setdefault(date_str, {})[product_type] = request_id
+
+    for lag in range(max_lag_days + 1):
+        candidate = forecast_date - timedelta(days=lag)
+        candidate_str = candidate.strftime('%Y-%m-%d')
+        requests = by_date.get(candidate_str)
+        if requests and {'ensemble_perturbed_forecasts', 'control_forecast'} <= requests.keys():
+            logger.info(f'  Resuming from saved CDS request IDs for {candidate_str}: {requests}')
+            return {'actual_date': candidate, 'requests': requests}
+
+    return None
 
 
 def main():

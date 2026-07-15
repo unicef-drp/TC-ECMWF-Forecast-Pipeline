@@ -236,9 +236,17 @@ ENS cycle) and its much longer full-global download time are why it runs as
 its own independent job rather than a step inside the main pipeline.
 
 - **Entry points:** `github_actions/glofas_pipeline.py` (own workflow,
-  `.github/workflows/glofas.yml`, cron `0 15 * * *` UTC) and
-  `snowflake/glofas_spcs_pipeline.py` (SPCS, triggered separately from the main
-  SPCS job)
+  `.github/workflows/glofas.yml`) and `snowflake/glofas_spcs_pipeline.py` (SPCS,
+  triggered separately from the main SPCS job)
+- **CDS idle-wait-time cost fix — submit/process split:** each entry point
+  runs as either `GLOFAS_MODE=submit` (fires the 2 real CDS requests, exits in
+  seconds, saves the request IDs to `GLOFAS_CDS_REQUESTS`) or `GLOFAS_MODE=process`
+  (default; resumes those requests, patient wait-then-download, or falls back to
+  a fresh submit-and-block if nothing was saved). GHA schedules both: `cron: '0 15 * * *'`
+  (submit) and `cron: '40 15 * * *'` (process, `CDS_PROCESS_DELAY_MINUTES` later).
+  This avoids paying for compute sitting idle through CDS's ~12-40+ min queue wait,
+  while staying fully backward-compatible (a deployment with only one trigger, or no
+  `GLOFAS_MODE` set at all, just gets the original submit-and-block behavior).
 - **Core module:** `glofas_downloader.py` — downloads the GloFAS v4.0
   51-member ensemble discharge forecast via `cdsapi` (a different API from
   `ecmwf-opendata`), builds a sparse Zarr ZipStore filtered to cells that cross the

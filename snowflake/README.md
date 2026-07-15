@@ -403,6 +403,7 @@ EXECUTE JOB SERVICE
           GLOFAS_THRESHOLD_SOURCE: "snowflake"
           GLOFAS_EXTENT_ENABLED: "true"
           GLOFAS_JRC_SOURCE: "snowflake"
+          GLOFAS_MODE: "process"
           CDSAPI_URL: "https://ewds.climate.copernicus.eu/api"
           CDSAPI_KEY: "your_ewds_api_key"
      platformMonitor:
@@ -413,8 +414,16 @@ EXECUTE JOB SERVICE
    $$;
 ```
 
-Schedule via a Snowflake TASK calling this `EXECUTE JOB SERVICE`, once daily
-comfortably past GloFAS's ~11h publication latency (e.g. 12-13 UTC).
+**CDS idle-wait-time cost fix — submit/process split:** schedule via **two**
+Snowflake TASKs calling this `EXECUTE JOB SERVICE`, not one: one with `GLOFAS_MODE: "submit"`
+at the original once-daily time (past GloFAS's ~11h publication latency, e.g.
+12-13 UTC), and a second with `GLOFAS_MODE: "process"` `CDS_PROCESS_DELAY_MINUTES` later
+(currently 40 min, see `glofas_downloader.py`). `submit` fires the 2 real CDS requests and exits
+in seconds, saving the returned request IDs to a new `GLOFAS_CDS_REQUESTS` table; `process`
+resumes those requests (patient wait-then-download, same behavior the original single-step flow
+always had), falling back to a fresh submit-and-block if nothing was saved. This is what makes
+`GLOFAS_MODE` default to `process` and safe to omit entirely for a deployment that only wants
+one task, at the cost of not benefiting from the split. 
 
 **Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
 (manually, not part of any recurring job) to populate
@@ -437,6 +446,12 @@ for the RP2/RP5 stand-in tiers, which reuse RP10's own extent , JRC has no nativ
 below RP10). Each `_bymember` row points at a Parquet file (not a GeoTIFF), a sparse
 table, one row per pixel/member/step actually flooded for that member, not a blended
 probability across all 51 members.
+
+**Snowflake table (submit/process split):** `GLOFAS_CDS_REQUESTS`: key
+`(FORECAST_DATE, PRODUCT_TYPE)`, columns `REQUEST_ID`, `SUBMITTED_AT`. Written by the
+`submit` task, read by the `process` task (`save_cds_request_ids()`/`load_cds_request_ids()`
+in `snowflake_loader.py`). Not consumed downstream of this pipeline, purely an
+internal handoff between the two tasks.
 
 ---
 

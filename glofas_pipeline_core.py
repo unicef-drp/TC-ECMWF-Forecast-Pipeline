@@ -16,11 +16,17 @@ function itself comes from a different module per entry point
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from glofas_downloader import download_glofas_forecast, EXTENT_RP_LEVELS
+from glofas_downloader import (
+    download_glofas_forecast,
+    submit_glofas_requests,
+    stage_file_exists,
+    MAX_PUBLICATION_LAG_DAYS,
+    EXTENT_RP_LEVELS,
+)
 from glofas_extent_masking import run_glofas_extent_masking
 
 logger = logging.getLogger(__name__)
@@ -71,14 +77,36 @@ class BaseGlofasConfig:
         # date-only; there is no TC context here to derive a date from.
         self.download_date = os.getenv('DOWNLOAD_DATE')  # YYYY-MM-DD, optional
 
-    def needs_snowflake_creds(self) -> bool:
+        # Idle-wait-time cost fix: 'submit' fires the 2 CDS requests
+        # (fast, no queue wait) and exits; 'process' resumes a prior submit's
+        # request IDs, waiting-then-downloading.
+        self.glofas_mode = os.getenv('GLOFAS_MODE', 'process').lower()
+
+    def _needs_stage_operations(self) -> bool:
+        """True if at least one of these paths actually GETs/PUTs a *file* on the
+        Snowflake stage (as opposed to just needing a connection for table
+        reads/writes) -- used to scope the SNOWFLAKE_STAGE_NAME requirement in
+        validate() separately from the broader needs_snowflake_creds()."""
         return (self.data_pipeline_db == 'SNOWFLAKE'
                 or self.glofas_threshold_source == 'snowflake'
                 or (self.glofas_extent_enabled and self.glofas_jrc_source == 'snowflake'))
 
+    def needs_snowflake_creds(self) -> bool:
+        # glofas_mode == 'submit' needs a connection too: save_cds_request_ids()
+        # is how a submit run's whole result reaches the later process step. A
+        # submit run with no connection would still fire 2 real, billable CDS
+        # requests and then just discard their request. Unlike the
+        # other three conditions, this one only needs a connection for a plain
+        # table MERGE (GLOFAS_CDS_REQUESTS).
+        return self._needs_stage_operations() or self.glofas_mode == 'submit'
+
     def validate(self) -> bool:
         """Base validation (simple password auth). Subclasses with different auth
         requirements (e.g. SPCS OAuth/private-key) should override this."""
+        if self.glofas_mode not in ('submit', 'process'):
+            logger.error(f"Invalid GLOFAS_MODE: {self.glofas_mode}. Must be 'submit' or 'process'")
+            return False
+
         if self.glofas_threshold_source not in ('snowflake', 'local'):
             logger.error(f"Invalid GLOFAS_THRESHOLD_SOURCE: {self.glofas_threshold_source}. "
                          "Must be 'snowflake' or 'local'")
@@ -110,16 +138,19 @@ class BaseGlofasConfig:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
             return False
 
-        # needs_snowflake_creds() being True here means AT LEAST ONE of
-        # data_pipeline_db=='SNOWFLAKE', glofas_threshold_source=='snowflake',
-        # or (extent_enabled and glofas_jrc_source=='snowflake') is true
-        # one of those paths actually GETs/PUTs a file on the stage, so
-        # snowflake_stage_name is required for all of them, not just the
+        # _needs_stage_operations() (a narrower check than needs_snowflake_creds()
+        # above, which also covers glofas_mode=='submit', that path only does a
+        # plain table MERGE, not stage file GETs/PUTs) being True here means AT
+        # LEAST ONE of data_pipeline_db=='SNOWFLAKE', glofas_threshold_source==
+        # 'snowflake', or (extent_enabled and glofas_jrc_source=='snowflake') is
+        # true, so snowflake_stage_name is required for all of them, not just the
         # data_pipeline_db=='SNOWFLAKE' case (that narrower check previously let
         # a DATA_PIPELINE_DB=LOCAL run with default threshold/jrc sources pass
         # validation with no stage name configured, only to fail later after
-        # already burning a real CDS API call).
-        if not self.snowflake_stage_name:
+        # already burning a real CDS API call). A GLOFAS_MODE=submit-only config
+        # (DATA_PIPELINE_DB=LOCAL, thresholds/JRC local or disabled) correctly
+        # does NOT require a stage name, it never touches the stage.
+        if self._needs_stage_operations() and not self.snowflake_stage_name:
             logger.error("SNOWFLAKE_STAGE_NAME is required whenever DATA_PIPELINE_DB=SNOWFLAKE, "
                          "GLOFAS_THRESHOLD_SOURCE=snowflake, or extent masking is enabled with "
                          "GLOFAS_JRC_SOURCE=snowflake")
@@ -128,11 +159,78 @@ class BaseGlofasConfig:
         return True
 
 
-def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None) -> Optional[Dict]:
+def _glofas_already_downloaded(config: BaseGlofasConfig, forecast_date: datetime,
+                                snowflake_conn=None) -> Optional[datetime]:
+    """
+    Returns the matched date if forecast_date's raw discharge Zarr already exists
+    locally or on the Snowflake stage, checked across the same
+    MAX_PUBLICATION_LAG_DAYS fallback window submit_glofas_requests()/
+    download_with_fallback() themselves use; None otherwise.
+
+    Guards GLOFAS_MODE=submit against firing a redundant, wasted pair of CDS
+    requests when its own scheduled trigger runs late (GitHub Actions gives no
+    execution-order guarantee between separate schedule entries) after the
+    process trigger's own submit-and-block fallback has already completed the
+    day.
+    """
+    for lag in range(MAX_PUBLICATION_LAG_DAYS + 1):
+        candidate = forecast_date - timedelta(days=lag)
+        candidate_str = candidate.strftime("%Y%m%d")
+        local_path = Path(config.glofas_data_dir) / candidate_str / f'river_{candidate_str}.zarr.zip'
+        if local_path.exists():
+            return candidate
+        if snowflake_conn and config.snowflake_stage_name:
+            stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
+            if stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn):
+                return candidate
+    return None
+
+
+def run_glofas_submit_pipeline(config: BaseGlofasConfig, snowflake_conn=None) -> Optional[Dict]:
+    """
+    GLOFAS_MODE=submit: fire the 2 CDS requests and return immediately (no queue
+    wait), the fast half of the idle-wait-time cost fix. Persisting the
+    returned {'actual_date', 'requests'} dict (via each entry point's own
+    save_cds_request_ids(), see snowflake_loader.py) is deliberately left to the
+    entry point, matching how Snowflake LOADING already stays out of this shared
+    core module (see module docstring).
+
+    If today's discharge data is already fully downloaded/staged (see
+    _glofas_already_downloaded()), skips submission entirely and returns
+    {'actual_date': ..., 'requests': {}}, an empty requests dict, which the
+    entry point should treat as "nothing to persist, already done", not a
+    failure.
+
+    Returns None if GloFAS wasn't available within the publication-lag window
+    (already logged by submit_glofas_requests() itself), the entry point should
+    treat that exactly like a failed run of the original blocking path.
+    """
+    forecast_date_str = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    forecast_date = datetime.strptime(forecast_date_str, '%Y-%m-%d')
+    logger.info(f"Forecast date: {forecast_date_str}  (GLOFAS_MODE=submit)")
+
+    already = _glofas_already_downloaded(config, forecast_date, snowflake_conn)
+    if already is not None:
+        logger.info(f"  {already.strftime('%Y-%m-%d')} already fully downloaded/staged -- "
+                    f"skipping submission (this trigger likely ran after the process trigger's "
+                    f"own fallback had already completed the day)")
+        return {"actual_date": already, "requests": {}}
+
+    return submit_glofas_requests(forecast_date)
+
+
+def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
+                         pre_submitted: Optional[Dict] = None) -> Optional[Dict]:
     """
     Shared orchestration: determine the forecast date, download/build/upload via
     glofas_downloader, log progress. Returns the result dict from
     download_glofas_forecast(), or None if it failed (already logged).
+
+    pre_submitted: optional {'actual_date', 'requests'} from a prior submit step
+    (GLOFAS_MODE=process resuming via each entry point's own
+    load_cds_request_ids()), forwarded to download_glofas_forecast() to resume
+    waiting on those requests instead of submitting fresh. None (default): behaves
+    exactly as before, submits fresh and blocks through the full wait.
     """
     forecast_date = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
     logger.info(f"Forecast date: {forecast_date}")
@@ -151,6 +249,7 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None) -> Option
         verbose=True,
         threshold_source=config.glofas_threshold_source,
         threshold_local_dir=config.glofas_threshold_local_dir,
+        pre_submitted=pre_submitted,
     )
 
     if not result['success']:

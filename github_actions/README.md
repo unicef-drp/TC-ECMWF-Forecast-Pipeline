@@ -28,8 +28,8 @@ If Step 2 finds no named storms, steps 3–5 (wind) are skipped entirely. Step 6
 ## GloFAS Riverine Discharge Pipeline (standalone)
 
 `glofas_pipeline.py` is a **fully separate** entry point from `main.py`, with its own workflow
-(`.github/workflows/glofas.yml`, cron `0 15 * * *` UTC, not the main pipeline's 4x-daily
-schedule), TC-independent, once-daily cadence. See root `README.md` for the full architecture.
+(`.github/workflows/glofas.yml`), TC-independent, once-daily cadence. See root `README.md` for
+the full architecture.
 
 - Shared config/orchestration lives in `glofas_pipeline_core.py` (repo root); this file adds
   only password-auth specifics, mirroring how `main.py` adds password auth on top of
@@ -41,6 +41,31 @@ schedule), TC-independent, once-daily cadence. See root `README.md` for the full
   the JRC flood-extent + permanent-water cache).
 - Installs from `requirements-glofas.txt`, not `requirements-ci.txt` — a deliberately lean,
   separate dependency set (no eccodes/geos/proj/gdal, which this pipeline never touches).
+
+### CDS idle-wait-time cost fix — submit/process split
+
+`.github/workflows/glofas.yml` has **two schedule triggers**, not two workflows: `cron: '0 15 * * *'`
+(submit) and `cron: '40 15 * * *'` (process), both on the same job. Each cron entry starts its own
+independent, short-lived runner — there is no runner staying alive across the 40-minute gap, and
+nothing is billed during it.
+
+- **submit** (15:00 UTC): fires the 2 real CDS requests (`wait_until_complete=False`) and exits in
+  seconds, no CDS queue wait. Saves the returned request IDs to the `GLOFAS_CDS_REQUESTS`
+  Snowflake table via `save_cds_request_ids()`. Skips submitting if a request was already saved
+  for today or if today's data is already fully downloaded/staged (handles a
+  late-running submit trigger after process already completed the day via its own fallback).
+- **process** (15:40 UTC): loads any request IDs `submit` saved for today and resumes waiting on
+  them via `resume_glofas_download()`, patiently, with wait/retry behavior. If nothing was saved 
+  (submit never ran, failed, or a fresh deployment hasn't added the submit trigger yet), 
+  falls back to submitting fresh and blocks through the full wait.
+- `CDS_PROCESS_DELAY_MINUTES` (a plain constant in `glofas_downloader.py`, currently `40`) is the
+  intended gap between the two triggers, a cost-optimization target only, not a correctness
+  requirement, tune freely as more real queue-time data accumulates. Must match the second cron
+  string in `glofas.yml` if changed.
+- `GLOFAS_MODE` env var controls which mode a given run operates in. Set via the workflow's 
+  `GLOFAS_MODE: ${{ github.event.inputs.mode ||
+  (github.event.schedule == '0 15 * * *' && 'submit') || 'process' }}` expression, which also
+  respects the manual `mode` dispatch input below.
 
 ### GitHub Secrets (GloFAS)
 
@@ -58,6 +83,7 @@ Trigger `.github/workflows/glofas.yml` from the GitHub Actions UI with optional 
 | Input | Description |
 |-------|-------------|
 | `download_date` | Specific date (YYYY-MM-DD, leave empty for today UTC) |
+| `mode` | `GLOFAS_MODE` override, `submit` (fire CDS requests, exit) or `process` (resume/full run, waits for CDS if needed). Default: `process` |
 | `cleanup` | Clean up temporary files after load (default: true) |
 
 ### Environment Variables (GloFAS)
@@ -70,6 +96,7 @@ Trigger `.github/workflows/glofas.yml` from the GitHub Actions UI with optional 
 | `GLOFAS_EXTENT_ENABLED` | `true` | Whether the GloFAS x JRC extent-masking step runs after raw discharge |
 | `GLOFAS_JRC_SOURCE` | `snowflake` | Where the cached JRC RP10/20/50/100 + permanent-water GeoTIFFs are read from: `snowflake` or `local` |
 | `GLOFAS_JRC_LOCAL_DIR` | `glofas_data/jrc_extent_cache` | Local dir for JRC cache files, used only when `GLOFAS_JRC_SOURCE=local` |
+| `GLOFAS_MODE` | `process` | `submit` (fire CDS requests, save request IDs, exit) or `process` (resume saved requests, or submit-and-block fresh if nothing saved) |
 | `DOWNLOAD_DATE` | today (UTC) | Specific date (YYYY-MM-DD) — note the different format from the main pipeline's YYYYMMDD |
 | `CLEANUP_AFTER_LOAD` | true | Delete temp files after load |
 
