@@ -137,6 +137,12 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
             logger.warning("  No data to load")
             return 0
 
+        if table_type == 'TC_TRACKS':
+            df = df.drop(
+                columns=['storm_identifier', 'long_storm_name'],
+                errors='ignore',
+            )
+
         # Prepare data
         df_upload = prepare_dataframe(df)
 

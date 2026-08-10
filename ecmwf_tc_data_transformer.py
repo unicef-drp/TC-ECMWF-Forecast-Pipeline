@@ -512,7 +512,13 @@ def transform_tc_data(raw_csv_path: str,
 
     try:
         # Read raw data
-        raw_df = pd.read_csv(raw_csv_path)
+        raw_df = pd.read_csv(
+            raw_csv_path,
+            converters={
+                'storm_identifier': str,
+                'long_storm_name': str,
+            },
+        )
         if verbose:
             print(f"  Loaded {len(raw_df)} rows")
 
@@ -524,8 +530,13 @@ def transform_tc_data(raw_csv_path: str,
 
         # Split into forecast data and wind radii data
         # Core forecast columns (appear once per forecast point)
+        identity_cols = [
+            column
+            for column in ('storm_identifier', 'long_storm_name')
+            if column in raw_df.columns
+        ]
         forecast_cols = [
-            'storm_id', 'ensemble_member', 'step', 'datetime',
+            'storm_id', *identity_cols, 'ensemble_member', 'step', 'datetime',
             'latitude', 'longitude', 'pressure', 'wlatitude', 'wlongitude', 'wind'
         ]
 
@@ -660,6 +671,8 @@ def transform_tc_data(raw_csv_path: str,
         standard_columns = [
             'forecast_time',
             'track_id',
+            'storm_identifier',
+            'long_storm_name',
             'ensemble_member',
             'valid_time',
             'lead_time',

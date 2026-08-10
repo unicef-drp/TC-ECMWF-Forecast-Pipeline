@@ -39,6 +39,43 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24') — GloFAS riverine discharge, standalone pipeline, see below |
 | `glofas/{date}/river_extent_rp{N}_bymember_*.parquet` | `RIVER_FORECASTS` | One row per (forecast_time, param='extent_rp{2,5,10,20,50,100}_bymember'), GloFAS x JRC v2.1 per-member flood extent (sparse table, one row per pixel/member/step flooded), same table as raw discharge, see below |
 
+### Storm identity and provisional lineage
+
+The extracted per-storm CSV and transformed track CSV retain three distinct
+provider-facing fields:
+
+- `storm_id`: the existing display/track value. It is the trimmed ECMWF
+  `longStormName` when present, otherwise the raw ECMWF `stormIdentifier`.
+  Transformation may continue to override this value as `track_id` from the
+  filename; that existing behavior is unchanged.
+- `storm_identifier`: the raw ECMWF BUFR `stormIdentifier`, retained without
+  trimming, case conversion, or substitution by the storm name.
+- `long_storm_name`: the ECMWF BUFR `longStormName`, trimmed as before and
+  retained separately; it may be empty.
+
+Normal non-verbose transformation does not log `storm_identifier`. The
+extractor's verbose message-level identifier output is internal debugging only
+and must not be treated as publication output.
+
+`canonical_episode_key(basin=..., season=..., storm_identifier=...)` in
+`ecmwf_tc_lineage.py` prepares, but does not persist or hash, the provisional
+lineage tuple `(producer, basin, season, normalized_storm_identifier)`.
+`producer` is fixed to `ecmwf-ifs-tc-track`; `basin` must be supplied explicitly
+as `AL`, `EP`, or `CP`; and `season` must be supplied explicitly as an `int`
+from 2000 through 9999, inclusive.
+The identifier is normalized with Unicode NFKC, checked for control and
+non-ASCII characters, trimmed, converted to ASCII uppercase, and required to
+match `^[A-Z0-9]+(?:-[A-Z0-9]+)*$`. The tuple intentionally excludes storm
+name and forecast time, so those mutable/run-specific values cannot alter the
+candidate episode key.
+
+This is identity-retention readiness only: no episode ID is generated and no
+Snowflake schema stores these fields yet. Before operational activation,
+ECMWF `stormIdentifier` stability across forecast runs and non-reuse across
+storms/seasons must be validated with historical data and/or authoritative
+provider evidence. Until that evidence exists, the tuple is provisional and
+must not be treated as an operational episode identity.
+
 ## Prerequisites
 
 1. **Python 3.11+** installed
