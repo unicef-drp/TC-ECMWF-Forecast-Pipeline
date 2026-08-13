@@ -2,7 +2,7 @@
 
 # TC-ECMWF-Forecast-Pipeline – Data Pipeline Setup Guide
 
-This repository contains the pipeline for processing ECMWF tropical cyclone and wind forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications.
+This repository contains the pipeline for processing ECMWF tropical cyclone, wind, and precipitation forecast data. The pipeline downloads, extracts, transforms, and loads TC forecast data into Snowflake for use by downstream applications. It also includes a fully separate, standalone GloFAS riverine discharge pipeline (see the dedicated section below).
 
 ## Related Repositories
 
@@ -16,9 +16,14 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 1. **Download TC Data**: Downloads one combined BUFR4 file per forecast run (all storms, all 51 ensemble members) from ECMWF Open Data via the `ecmwf-opendata` client (`type="tf"`)
 2. **Extract TC Data**: Parses BUFR Template 316082, filters to named storms, splits into per-storm CSVs
 3. **Transform TC Data**: Standardises units, computes wind radii, creates WKT polygons for Snowflake
-4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files matching the TC forecast run time
+4. **Download Wind Data**: Downloads ensemble 10 m wind GRIB files (`u10`/`v10`) matching the TC forecast run time
+4b. **Download Gust Data**: Downloads ensemble 10fg (maximum wind gust) GRIB files for the same run time and lead times as Step 4
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
-6. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
+5b. **Extract Gust Envelopes**: Creates gust threshold envelope polygons from 10fg GRIB files (step 0 skipped — no accumulation period at T+0)
+6. **Download Gridded Parameters** *(optional)*: Downloads global GRIB files for `tp` (total precipitation) and `ro` (total runoff), converts each to a Zarr ZipStore, and uploads to a Snowflake internal stage. Runs regardless of whether named storms were found.
+7. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
+
+> **No named storms**: If Step 2 finds no named storms, Steps 3–5 (wind) are skipped. Step 6 (precipitation) still runs when `PROCESS_MET=true`, then the pipeline exits cleanly.
 
 ### Output Data
 
@@ -27,6 +32,12 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_transformed.csv` | `TC_TRACKS` | One row per member × step, with wind radii and WKT polygons |
 | `*_envelopes_individual.csv` | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygon per member × step |
 | `*_envelopes_combined.csv` | `TC_ENVELOPES_COMBINED` | Unioned polygon per member × threshold |
+| `*_gust_envelopes_individual.csv` | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygon per member × step (10fg, m/s thresholds) |
+| `*_gust_envelopes_combined.csv` | `TC_GUST_ENVELOPES_COMBINED` | Unioned gust polygon per member × threshold |
+| `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `tp` total precipitation (global) |
+| `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param) — `ro` total runoff (land-only) |
+| `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24') — GloFAS riverine discharge, standalone pipeline, see below |
+| `glofas/{date}/river_extent_rp{N}_bymember_*.parquet` | `RIVER_FORECASTS` | One row per (forecast_time, param='extent_rp{2,5,10,20,50,100}_bymember'), GloFAS x JRC v2.1 per-member flood extent (sparse table, one row per pixel/member/step flooded), same table as raw discharge, see below |
 
 ## Prerequisites
 
@@ -71,7 +82,11 @@ pip install -r requirements.txt
 | `DOWNLOAD_DATE` | latest | Specific date to download (YYYYMMDD) |
 | `RUN_TIME` | latest | Forecast run time: 00, 06, 12, or 18 |
 | `DOWNLOAD_LIMIT` | 1 | Number of latest forecast runs to download |
-| `PROCESS_WIND_DATA` | true | Enable wind envelope processing |
+| `NAMED_STORMS_ONLY` | true | Filter to named storms only (skips unnamed disturbances like "92W") |
+| `PROCESS_WIND_DATA` | true | Enable wind envelope processing (Steps 4–5) |
+| `PROCESS_MET` | true | Enable met parameter download and stage upload (Step 6) |
+| `SNOWFLAKE_STAGE_NAME` | — | Snowflake internal stage for Zarr upload — **required when `PROCESS_MET=true`** |
+| `MET_DATA_DIR` | `met_data` | Local directory for met Zarr files |
 | `CLEANUP_AFTER_LOAD` | true | Delete temporary files after successful load |
 | `SKIP_EXISTING` | true | Skip already-processed files |
 
@@ -82,26 +97,40 @@ pip install -r requirements.txt
 ```
 ECMWF Open Data (ecmwf-opendata client, type="tf")
     ↓  one combined BUFR4 file per run (all storms, all 51 members)
-ecmwf_tc_data_downloader.py   ← Step 1: download
+ecmwf_tc_data_downloader.py      ← Step 1: download
     ↓
-ecmwf_tc_data_extractor.py    ← Step 2: parse BUFR, filter named storms, split per-storm CSVs
-    ↓
-ecmwf_tc_data_transformer.py  ← Step 3: transform + WKT polygons
+ecmwf_tc_data_extractor.py       ← Step 2: parse BUFR, filter named storms, split per-storm CSVs
+    ↓ (if named storms found)
+ecmwf_tc_data_transformer.py     ← Step 3: transform + WKT polygons
 
 ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
-    ↓  ensemble 10m wind GRIB files
-ecmwf_wind_data_downloader.py ← Step 4: download
+    ↓  ensemble 10m wind GRIB files (u10/v10)
+ecmwf_wind_data_downloader.py    ← Step 4: download  (skipped if no named storms)
     ↓
-ecmwf_tc_wind_combination.py  ← Step 5: wind threshold contours + union
+ecmwf_tc_wind_combination.py     ← Step 5: wind threshold contours + union  (skipped if no named storms)
 
-github_actions/snowflake_loader.py  ← Step 6: MERGE into Snowflake
+ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
+    ↓  ensemble 10fg (max wind gust) GRIB files
+ecmwf_wind_data_downloader.py    ← Step 4b: download gust files  (skipped if no named storms)
+    ↓
+ecmwf_gust_envelope_extractor.py ← Step 5b: gust threshold contours + union  (skipped if no named storms)
+                                             produces: *_gust_envelopes_individual.csv + *_gust_envelopes_combined.csv
+
+ECMWF Open Data (ecmwf-opendata client, type="pf"/"cf")
+    ↓  global GRIB files — tp (total precipitation) and ro (total runoff)
+ecmwf_met_downloader.py  ← Step 6: download + convert to Zarr + PUT to Snowflake stage
+                                     (always runs when PROCESS_MET=true, even with no named storms)
+                                     produces: tp_YYYYMMDD_HH.zarr.zip + ro_YYYYMMDD_HH.zarr.zip
+
+github_actions/snowflake_loader.py  ← Step 7: MERGE into Snowflake
 ```
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `pipeline_core.py` | Shared steps 1–5, `BasePipelineConfig`, `PipelineStats` |
+| `pipeline_core.py` | Shared steps 1–6, `BasePipelineConfig`, `PipelineStats` |
+| `ecmwf_met_downloader.py` | GRIB download (`tp`, `ro`), Zarr conversion, stage upload |
 | `github_actions/main.py` | Sequential entry point — imports from `pipeline_core`, password auth |
 | `snowflake/spcs_pipeline.py` | Concurrent entry point — ProcessPool/SPCS OAuth |
 | `github_actions/snowflake_loader.py` | Snowflake loader for GitHub Actions (password auth) |
@@ -115,6 +144,8 @@ Uses a **staging table → MERGE** pattern:
 3. Executes MERGE into the production table using a compound key to skip duplicates
 
 **Wind field polygons** are stored as VARCHAR (WKT strings) in `TC_TRACKS`. `TRY_TO_GEOGRAPHY()` is applied during MERGE for `TC_ENVELOPES_INDIVIDUAL` and `TC_ENVELOPES_COMBINED`.
+
+**Precipitation** is stored as Zarr ZipStore files in a Snowflake internal stage. `MET_FORECASTS` records one metadata row per `(FORECAST_TIME, PARAM)` pointing to the stage path. The Zarr is global (not per-storm), so there is no `TRACK_ID` in this table.
 
 ## Running the Pipeline
 
@@ -140,7 +171,7 @@ DOWNLOAD_DATE=20250929 RUN_TIME=12 python github_actions/main.py
 
 **Publication schedule** — ECMWF publishes TC forecasts at 00, 06, 12, 18 UTC. Data is typically available 4–9 hours after the model run time.
 
-**Setup:** Configure GitHub Secrets with the six `SNOWFLAKE_*` variables listed above.
+**Setup:** Configure GitHub Secrets with the six `SNOWFLAKE_*` variables plus `SNOWFLAKE_STAGE_NAME` (see `github_actions/README.md`).
 
 ### Containerized (SPCS)
 
@@ -164,6 +195,10 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 - Ensure wind data download completed successfully for the correct run time
 - Wind data downloads forecast hours 0–144h in 6-hour increments
 
+### "SNOWFLAKE_STAGE_NAME is required"
+- Set `SNOWFLAKE_STAGE_NAME` to your Snowflake internal stage name (e.g. `AOTS_ANALYSIS`)
+- Required when `PROCESS_MET=true` and `DATA_PIPELINE_DB=SNOWFLAKE`
+
 ### Import errors
 - Ensure you are in the virtual environment: `source .venv/bin/activate`
 - Reinstall dependencies: `pip install -r requirements.txt`
@@ -178,6 +213,8 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `tc_data_transformed/` | Transformed TC CSVs |
 | `wind_data/` | Wind GRIB files |
 | `wind_extracted/` | Envelope CSV files |
+| `met_data/` | Precipitation Zarr ZipStore files |
+| `glofas_data/` | GloFAS riverine discharge Zarr ZipStore files (standalone pipeline — see below) |
 
 ### Snowflake Tables
 
@@ -186,6 +223,54 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_TRACKS` | Storm positions, wind speeds, pressure, wind radii |
 | `TC_ENVELOPES_INDIVIDUAL` | Wind threshold polygons per forecast step |
 | `TC_ENVELOPES_COMBINED` | Combined wind threshold polygons across all forecast steps |
+| `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygons per forecast step (10fg, m/s) |
+| `TC_GUST_ENVELOPES_COMBINED` | Combined gust threshold polygons across all forecast steps |
+| `MET_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
+| `RIVER_FORECASTS` | Metadata: one row per (forecast_time, param) with stage path — `param='dis24'` for raw discharge, `param='extent_rp{2,5,10,20,50,100}_bymember'` (plus `IS_STANDIN`) for GloFAS x JRC per-member flood extent |
+
+## GloFAS Riverine Discharge Pipeline (standalone)
+
+A fully separate daily pipeline, **not** part of the TC forecast pipeline above.
+GloFAS's own publication cadence (once per calendar day, driven by the 00Z IFS
+ENS cycle) and its much longer full-global download time are why it runs as
+its own independent job rather than a step inside the main pipeline.
+
+- **Entry points:** `github_actions/glofas_pipeline.py` (own workflow,
+  `.github/workflows/glofas.yml`) and `snowflake/glofas_spcs_pipeline.py` (SPCS,
+  triggered separately from the main SPCS job)
+- **CDS idle-wait-time cost fix — submit/process split:** each entry point
+  runs as either `GLOFAS_MODE=submit` (fires the 2 real CDS requests, exits in
+  seconds, saves the request IDs to `GLOFAS_CDS_REQUESTS`) or `GLOFAS_MODE=process`
+  (default; resumes those requests, patient wait-then-download, or falls back to
+  a fresh submit-and-block if nothing was saved). GHA schedules both: `cron: '0 15 * * *'`
+  (submit) and `cron: '40 15 * * *'` (process, `CDS_PROCESS_DELAY_MINUTES` later).
+  This avoids paying for compute sitting idle through CDS's ~12-40+ min queue wait,
+  while staying fully backward-compatible (a deployment with only one trigger, or no
+  `GLOFAS_MODE` set at all, just gets the original submit-and-block behavior).
+- **Core module:** `glofas_downloader.py` — downloads the GloFAS v4.0
+  51-member ensemble discharge forecast via `cdsapi` (a different API from
+  `ecmwf-opendata`), builds a sparse Zarr ZipStore filtered to cells that cross the
+  RP2yr threshold, uploads to `@{stage}/glofas/{date}/river_{date}.zarr.zip`
+- **One-time setup required first:** `setup_glofas_thresholds.py` — caches the
+  official RP threshold files the sparse filter depends on; run manually once, not
+  part of any recurring schedule
+- **Extent masking (enabled by default):** `glofas_extent_masking.py` — combines the
+  raw discharge-exceedance probability above with [JRC's Global River Flood Hazard
+  Maps v2.1](https://data.jrc.ec.europa.eu/), a static per-return-period flood-extent
+  raster, to correct for GloFAS's 0.05° cell overstating exposure across a whole
+  cell rather than just its real channel/floodplain footprint. Requires its own
+  one-time cache first: `setup_jrc_extents.py`, fetches directly from JRC's own
+  file server, run manually once. Toggle
+  with `GLOFAS_EXTENT_ENABLED`; output uploads to the same
+  `@{stage}/glofas/{date}/` folder as the raw discharge Zarr.
+- **Why separate from the main pipeline:** GloFAS's ~11h publication latency
+  doesn't align with the main pipeline's 4 daily run slots, and a full global
+  fetch can take far longer than the main pipeline's other steps — bundling them
+  would force one pipeline's schedule/timeout onto the other
+- **Demo notebook:** `pipeline_demonstration_glofas.ipynb` — download, sparse Zarr
+  inspection, and visualizations (raster maps, RP exceedance hotspot zoom, single-gauge
+  ensemble hydrograph, plus a GloFAS x JRC extent-masking demo using a small
+  Bangladesh-scale cache)
 
 ## Quick Start
 
@@ -197,7 +282,6 @@ pip install -r requirements.txt
 
 # 2. Configure credentials
 cp sample_env.txt .env
-# Edit .env with your Snowflake credentials
 
 # 3. Test locally
 jupyter notebook pipeline_demonstration.ipynb
@@ -211,3 +295,5 @@ jupyter notebook pipeline_demonstration.ipynb
 - [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
 - [ECMWF BUFR Format Documentation](https://confluence.ecmwf.int/display/ECC/BUFR+examples)
 - [eccodes Library](https://pypi.org/project/eccodes/)
+- [CDS/EWDS API (cdsapi)](https://pypi.org/project/cdsapi/) — used by the standalone GloFAS pipeline
+- [GloFAS — Global Flood Awareness System](https://global-flood.emergency.copernicus.eu/)

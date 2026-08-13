@@ -10,6 +10,8 @@ import os
 import sys
 import logging
 from pathlib import Path
+from datetime import timedelta
+from typing import Optional
 import pandas as pd
 import numpy as np
 import snowflake.connector
@@ -249,9 +251,19 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
     Args:
         csv_file: Path to CSV file
         conn: Snowflake connection
-        table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL', 'TC_ENVELOPES_COMBINED')
+        table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL',
+                    'TC_ENVELOPES_COMBINED', 'TC_GUST_ENVELOPES_INDIVIDUAL',
+                    'TC_GUST_ENVELOPES_COMBINED')
         use_staging: If True, use staging table + MERGE (handles duplicates)
                      If False, direct INSERT (faster but no deduplication)
+
+    Returns:
+        int: rows actually loaded/merged (0 is a legitimate, non-error result
+             for a genuinely empty input CSV).
+        None: the load itself failed (Snowflake error, write_pandas failure,
+             etc.) — distinct from a real 0, so callers can tell "nothing to
+             load" apart from "the load broke" and record the latter as a
+             real error instead of silently treating it as zero rows.
     """
     logger.info(f"Loading {csv_file.name}...")
 
@@ -327,6 +339,56 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         ENVELOPE_REGION VARCHAR
                     )
                 """)
+            elif table_type == 'TC_GUST_ENVELOPES_INDIVIDUAL':
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_GUST_ENVELOPES_INDIVIDUAL (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        VALID_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Valid time for this forecast point',
+                        LEAD_TIME INTEGER NOT NULL COMMENT 'Forecast lead time in hours',
+                        GUST_THRESHOLD INTEGER NOT NULL COMMENT 'Gust speed threshold in m/s',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing the area where gusts exceed the threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, LEAD_TIME, GUST_THRESHOLD)
+                    )
+                    COMMENT = 'Individual gust field envelopes for specific forecast times'
+                """)
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME INTEGER,
+                        GUST_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_GUST_ENVELOPES_COMBINED (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        LEAD_TIME_RANGE INTEGER NOT NULL COMMENT 'Starting lead time for the range in hours (e.g., 0, 6, 12)',
+                        GUST_THRESHOLD INTEGER NOT NULL COMMENT 'Gust speed threshold in m/s',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing cumulative area where gusts exceed threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, GUST_THRESHOLD)
+                    )
+                    COMMENT = 'Combined gust field envelopes across time ranges for impact analysis'
+                """)
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
+                        GUST_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
             logger.info(f"  Created staging table with proper column types")
 
             # Bulk upload to staging table
@@ -340,7 +402,8 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
 
             if not success:
                 logger.error(f"  Failed to write to staging table")
-                return 0
+                cursor.close()
+                return None  # real failure, distinct from a legitimate 0 rows
 
             logger.info(f"  Uploaded {nrows} rows to staging table")
 
@@ -432,19 +495,19 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_ENVELOPES_COMBINED t
                     USING (
-                        SELECT 
+                        SELECT
                             FORECAST_TIME,
                             TRACK_ID,
                             ENSEMBLE_MEMBER,
-                            CASE 
-                                WHEN LEAD_TIME LIKE '%-%' THEN 
+                            CASE
+                                WHEN LEAD_TIME LIKE '%-%' THEN
                                     CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
                                 ELSE CAST(LEAD_TIME AS INTEGER)
                             END AS LEAD_TIME_RANGE,
                             WIND_THRESHOLD,
-                            CASE 
-                                WHEN ENVELOPE_REGION IS NOT NULL 
-                                     AND ENVELOPE_REGION != '' 
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
                                      AND ENVELOPE_REGION != 'None'
                                      AND ENVELOPE_REGION != 'null'
                                 THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
@@ -468,6 +531,89 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     )
                 """
 
+            elif table_type == 'TC_GUST_ENVELOPES_INDIVIDUAL':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+
+                merge_sql = f"""
+                    MERGE INTO TC_GUST_ENVELOPES_INDIVIDUAL t
+                    USING (
+                        SELECT
+                            FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                            GUST_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.LEAD_TIME = s.LEAD_TIME
+                        AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                        GUST_THRESHOLD, ENVELOPE_REGION, LOADED_AT
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
+                    )
+                """
+                # LOADED_AT is set explicitly here (not via a table DEFAULT,
+                # unlike the wind tables). Snowflake's ALTER TABLE ADD
+                # COLUMN doesn't support a computed DEFAULT the way CREATE
+                # TABLE does ("Invalid column default expression"), and this
+                # column was added to the already-live gust tables via
+                # ALTER TABLE, not CREATE TABLE, so no working DEFAULT
+                # exists on the real table.
+
+            elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+                logger.info(f"  LEAD_TIME will be parsed from VARCHAR to INTEGER during MERGE")
+
+                merge_sql = f"""
+                    MERGE INTO TC_GUST_ENVELOPES_COMBINED t
+                    USING (
+                        SELECT
+                            FORECAST_TIME,
+                            TRACK_ID,
+                            ENSEMBLE_MEMBER,
+                            CASE
+                                WHEN LEAD_TIME LIKE '%-%' THEN
+                                    CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
+                                ELSE CAST(LEAD_TIME AS INTEGER)
+                            END AS LEAD_TIME_RANGE,
+                            GUST_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        LEAD_TIME_RANGE = s.LEAD_TIME_RANGE
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
+                        GUST_THRESHOLD, ENVELOPE_REGION, LOADED_AT
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
+                    )
+                """
+
             cursor.execute(merge_sql)
             rows_merged = cursor.rowcount
             logger.info(f"  Merged {rows_merged} rows into {table_type}")
@@ -487,7 +633,8 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
 
             if not success:
                 logger.error(f"  Failed to write to {table_type}")
-                return 0
+                cursor.close()
+                return None  # real failure, distinct from a legitimate 0 rows
 
             logger.info(f"  Inserted {nrows} rows directly")
             rows_merged = nrows
@@ -501,7 +648,290 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
     except Exception as e:
         logger.error(f"Error loading {csv_file.name}: {e}")
         conn.rollback()
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        return None  # real failure, distinct from a legitimate 0 rows
+
+
+def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
+    """
+    Load met forecast metadata rows into MET_FORECASTS table.
+
+    Creates the table if it does not exist. Uses staging + MERGE to deduplicate
+    on (FORECAST_TIME, PARAM) — re-runs are safe.
+
+    The zarr is a global file (one per model run), so there is one row per
+    (FORECAST_TIME, PARAM), not one per storm.
+
+    Args:
+        metadata_rows: list of dicts with keys forecast_time, param, stage_path
+        conn: active Snowflake connection
+
+    Returns number of rows merged.
+    """
+    if not metadata_rows:
         return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS MET_FORECASTS (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR,
+                CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE MET_FORECASTS_STAGING (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR
+            )
+        """)
+
+        df = pd.DataFrame(metadata_rows)
+        df.columns = df.columns.str.upper()
+        if 'FORECAST_TIME' in df.columns:
+            df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'], errors='coerce').apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
+            )
+
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='MET_FORECASTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write precip metadata to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO MET_FORECASTS t
+            USING MET_FORECASTS_STAGING s
+              ON  t.FORECAST_TIME = s.FORECAST_TIME
+              AND t.PARAM         = s.PARAM
+            WHEN MATCHED THEN
+                UPDATE SET t.STAGE_PATH = s.STAGE_PATH
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_TIME, PARAM, STAGE_PATH)
+                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} rows into MET_FORECASTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error loading precip metadata: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
+
+
+def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
+    """
+    Load GloFAS riverine metadata rows into RIVER_FORECASTS table: both raw
+    discharge (PARAM='dis24') and JRC per-member flood-extent output
+    (PARAM='extent_rp{N}_bymember', with IS_STANDIN true for the RP2/RP5
+    stand-in tiers) share this one table.
+
+    Args:
+        metadata_rows: list of dicts with keys forecast_time, param, stage_path,
+            and optionally is_standin (only meaningful for extent_rp2/extent_rp5 rows)
+        conn: active Snowflake connection
+
+    Returns number of rows merged.
+    """
+    if not metadata_rows:
+        return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS RIVER_FORECASTS (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR,
+                IS_STANDIN     BOOLEAN,
+                CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # IS_STANDIN was added after RIVER_FORECASTS already existed in
+        # production (raw discharge rows predate the extent-masking work)
+        # ADD COLUMN IF NOT EXISTS is idempotent, safe to run on every call.
+        cursor.execute("ALTER TABLE RIVER_FORECASTS ADD COLUMN IF NOT EXISTS IS_STANDIN BOOLEAN")
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE RIVER_FORECASTS_STAGING (
+                FORECAST_TIME  TIMESTAMP_NTZ,
+                PARAM          VARCHAR,
+                STAGE_PATH     VARCHAR,
+                IS_STANDIN     BOOLEAN
+            )
+        """)
+
+        df = pd.DataFrame(metadata_rows)
+        df.columns = df.columns.str.upper()
+        if 'IS_STANDIN' not in df.columns:
+            df['IS_STANDIN'] = None
+        if 'FORECAST_TIME' in df.columns:
+            df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'], errors='coerce').apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else None
+            )
+
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='RIVER_FORECASTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write riverine metadata to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO RIVER_FORECASTS t
+            USING RIVER_FORECASTS_STAGING s
+              ON  t.FORECAST_TIME = s.FORECAST_TIME
+              AND t.PARAM         = s.PARAM
+            WHEN MATCHED THEN
+                UPDATE SET t.STAGE_PATH = s.STAGE_PATH, t.IS_STANDIN = s.IS_STANDIN
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_TIME, PARAM, STAGE_PATH, IS_STANDIN)
+                VALUES (s.FORECAST_TIME, s.PARAM, s.STAGE_PATH, s.IS_STANDIN)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} rows into RIVER_FORECASTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error loading riverine metadata: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
+
+
+def save_cds_request_ids(actual_date, requests: dict, conn) -> int:
+    """
+    Persist the request_id from a submit_glofas_requests() call (GLOFAS_MODE=submit,
+    see glofas_pipeline_core.py) so a later, separate process step can resume
+    waiting on it via resume_glofas_download() without paying compute for the CDS
+    queue wait in between.
+
+    Args:
+        actual_date: datetime, the date submit_glofas_requests() actually
+            resolved to (may lag the originally-requested date)
+        requests: {product_type: request_id} as returned by submit_glofas_requests()
+        conn: active Snowflake connection
+
+    Returns number of rows merged (one per product type, normally 2).
+    """
+    if not requests:
+        return 0
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS GLOFAS_CDS_REQUESTS (
+                FORECAST_DATE  DATE,
+                PRODUCT_TYPE   VARCHAR,
+                REQUEST_ID     VARCHAR,
+                SUBMITTED_AT   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        rows = [{'FORECAST_DATE': actual_date.strftime('%Y-%m-%d'),
+                 'PRODUCT_TYPE': product_type, 'REQUEST_ID': request_id}
+                for product_type, request_id in requests.items()]
+        df = pd.DataFrame(rows)
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE GLOFAS_CDS_REQUESTS_STAGING (
+                FORECAST_DATE  DATE,
+                PRODUCT_TYPE   VARCHAR,
+                REQUEST_ID     VARCHAR
+            )
+        """)
+        success, _, _, _ = write_pandas(conn=conn, df=df, table_name='GLOFAS_CDS_REQUESTS_STAGING',
+                                        auto_create_table=False, quote_identifiers=False)
+        if not success:
+            logger.error('  Failed to write CDS request IDs to staging table')
+            return 0
+
+        cursor.execute("""
+            MERGE INTO GLOFAS_CDS_REQUESTS t
+            USING GLOFAS_CDS_REQUESTS_STAGING s
+              ON  t.FORECAST_DATE = s.FORECAST_DATE
+              AND t.PRODUCT_TYPE  = s.PRODUCT_TYPE
+            WHEN MATCHED THEN
+                UPDATE SET t.REQUEST_ID = s.REQUEST_ID, t.SUBMITTED_AT = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN
+                INSERT (FORECAST_DATE, PRODUCT_TYPE, REQUEST_ID)
+                VALUES (s.FORECAST_DATE, s.PRODUCT_TYPE, s.REQUEST_ID)
+        """)
+        rows_merged = cursor.rowcount
+        conn.commit()
+        logger.info(f'  Merged {rows_merged} CDS request ID(s) into GLOFAS_CDS_REQUESTS')
+        return rows_merged
+
+    except Exception as e:
+        logger.error(f'Error saving CDS request IDs: {e}')
+        conn.rollback()
+        return 0
+    finally:
+        cursor.close()
+
+
+def load_cds_request_ids(forecast_date, conn, max_lag_days: int) -> Optional[dict]:
+    """
+    Look up previously-saved CDS request IDs (from save_cds_request_ids()) for
+    GLOFAS_MODE=process to resume from. Searches forecast_date first, then earlier
+    days up to max_lag_days, same day-fallback order submit_glofas_requests()
+    itself already resolved against, so this finds whichever date actually has a
+    saved submission, not necessarily the literal date requested.
+
+    max_lag_days has no default deliberately: it must be MAX_PUBLICATION_LAG_DAYS
+    (from glofas_downloader.py) passed explicitly by the caller, not a second,
+    independently-hardcoded literal here that could silently drift out of sync
+    with submit_glofas_requests()'s own fallback window.
+
+    Returns {'actual_date': datetime, 'requests': {product_type: request_id}} for
+    the most recent date with a complete (both product types) saved submission,
+    or None if nothing usable was found, the caller (download_glofas_forecast())
+    treats None exactly like "no pre_submitted given" and falls back to a fresh
+    submit-and-block, so a missed/failed submit step never blocks the pipeline.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT TO_VARCHAR(FORECAST_DATE, 'YYYY-MM-DD'), PRODUCT_TYPE, REQUEST_ID
+            FROM GLOFAS_CDS_REQUESTS
+            WHERE FORECAST_DATE BETWEEN DATEADD(day, %s, %s) AND %s
+            ORDER BY FORECAST_DATE DESC
+        """, (-max_lag_days, forecast_date.strftime('%Y-%m-%d'), forecast_date.strftime('%Y-%m-%d')))
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f'  Could not look up saved CDS request IDs (table may not exist yet): {e}')
+        return None
+    finally:
+        cursor.close()
+
+    if not rows:
+        return None
+
+    by_date = {}
+    for date_str, product_type, request_id in rows:
+        by_date.setdefault(date_str, {})[product_type] = request_id
+
+    for lag in range(max_lag_days + 1):
+        candidate = forecast_date - timedelta(days=lag)
+        candidate_str = candidate.strftime('%Y-%m-%d')
+        requests = by_date.get(candidate_str)
+        if requests and {'ensemble_perturbed_forecasts', 'control_forecast'} <= requests.keys():
+            logger.info(f'  Resuming from saved CDS request IDs for {candidate_str}: {requests}')
+            return {'actual_date': candidate, 'requests': requests}
+
+    return None
 
 
 def main():

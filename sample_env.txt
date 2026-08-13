@@ -21,6 +21,59 @@ SNOWFLAKE_DATABASE=your_database
 SNOWFLAKE_SCHEMA=your_schema
 
 # ==============================================================================
+# Pipeline-specific (see github_actions/sample_env.txt for full reference)
+# ==============================================================================
+
+# Download tp + ro as Zarr to Snowflake stage (true/false, default: true)
+PROCESS_MET=true
+
+# Snowflake internal stage for met Zarr — REQUIRED when PROCESS_MET=true
+SNOWFLAKE_STAGE_NAME=your_stage_name
+
+# Filter to named storms only (true/false, default: true)
+NAMED_STORMS_ONLY=true
+
+# ==============================================================================
+# GloFAS riverine discharge (standalone pipeline)
+# ==============================================================================
+
+# Local dir for GloFAS forecast Zarr files
+GLOFAS_DATA_DIR=glofas_data
+
+# Where the RP2 threshold file is read from: snowflake (default, works even when
+# DATA_PIPELINE_DB=LOCAL) or local (fully offline dev — requires
+# setup_glofas_thresholds.py --local-only to have been run first)
+GLOFAS_THRESHOLD_SOURCE=snowflake
+
+# Local dir containing rl_2.0.nc, used only when GLOFAS_THRESHOLD_SOURCE=local
+GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
+
+# CDS/EWDS API credentials for cems-glofas-forecast (separate from ecmwf-opendata,
+# no auth needed elsewhere in this pipeline). Format: https://cds.climate.copernicus.eu
+# account page. Omit to fall back to a local ~/.cdsapirc file instead.
+CDSAPI_URL=https://ewds.climate.copernicus.eu/api
+CDSAPI_KEY=your_ewds_api_key
+
+# ==============================================================================
+# GloFAS x JRC extent-masking
+# ==============================================================================
+
+# Set to false to disable the extent-masking step entirely and only run raw
+# discharge
+GLOFAS_EXTENT_ENABLED=true
+
+# Where the cached JRC RP10/20/50/100 + permanent-water GeoTIFFs are read
+# from: snowflake (default) or local (fully offline dev — requires
+# setup_jrc_extents.py --local-only to have been run first)
+GLOFAS_JRC_SOURCE=snowflake
+
+# Local dir containing jrc_rp10.tif etc., used only when GLOFAS_JRC_SOURCE=local
+GLOFAS_JRC_LOCAL_DIR=glofas_jrc_extents
+
+# Note: setup_jrc_extents.py (the one-time JRC cache-population script) fetches
+# directly from JRC's own file server
+
+# ==============================================================================
 # Usage
 # ==============================================================================
 # 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env

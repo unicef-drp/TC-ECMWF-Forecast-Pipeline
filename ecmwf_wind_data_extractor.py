@@ -23,7 +23,7 @@ References:
 import os
 import logging
 import warnings
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 DEFAULT_OUTPUT_DIR = "wind_extracted"
-BUFFER_RADIUS_KM = 500  # Fixed buffer radius around tracks in km
 
 # Wind thresholds in knots and m/s
 WIND_THRESHOLDS = {
@@ -54,32 +53,133 @@ WIND_THRESHOLDS = {
 }
 
 
-def load_track_data(csv_file: str, member_number: int, verbose: bool = True) -> pd.DataFrame:
+def _unwrap_track_longitudes(track_data: pd.DataFrame) -> pd.DataFrame:
     """
-    Load tropical cyclone track data for a specific ensemble member.
+    Return a copy of track_data with 'longitude' unwrapped into a continuous
+    coordinate space, independently per ensemble member when that column is
+    present.
 
-    Args:
-        csv_file (str): Path to transformed TC track CSV file
-        member_number (int): Ensemble member number
-        verbose (bool): Whether to print progress information
+    Fixes the antimeridian-crossing bug: a single member's own track can
+    legitimately jump from just under +180 to just over -180 between
+    consecutive lead times as the storm crosses the dateline. Naive min/max
+    bounding-box math over the raw values misreads that as a near-global
+    span (e.g. NANGKA 2026-08-12 12Z member 34: 179.1 deg -> -179.5 deg
+    read as a ~359 deg-wide box instead of the true ~1 deg step). Sorting
+    each member's own points by time and applying np.unwrap(period=360)
+    turns that into a continuous, physically correct sequence (179.1 ->
+    180.5) with no discontinuity for the union/bounding-box math to trip
+    over.
 
-    Returns:
-        pd.DataFrame: Track data for the specified member
+    A track with no dateline crossing is returned with 'longitude'
+    numerically unchanged: np.unwrap is a no-op whenever no consecutive gap
+    exceeds the wrap period, so this is a verified zero-behavior-change
+    path for the overwhelming majority of real storms.
+
+    This function only feeds the internal buffered-polygon/bounding-box
+    computation used to size the GRIB extraction window (see
+    get_longitude_windows below) — it is never itself stored as an
+    envelope, so no corresponding "wrap back into [-180, 180]" step is
+    needed here.
     """
-    df = pd.read_csv(csv_file)
+    df = track_data.copy()
 
-    # Filter for specific member
-    member_data = df[df['ensemble_member'] == member_number].copy()
+    sort_col = None
+    for candidate in ('valid_time', 'lead_time'):
+        if candidate in df.columns:
+            sort_col = candidate
+            break
 
-    # Sort by valid_time
-    member_data = member_data.sort_values('valid_time')
+    def _unwrap_group(g: pd.DataFrame) -> pd.DataFrame:
+        if sort_col is not None:
+            g = g.sort_values(sort_col)
+        g = g.copy()
+        g['longitude'] = np.unwrap(g['longitude'].to_numpy(dtype=float), period=360.0)
+        return g
 
-    if verbose:
-        print(f"  Loaded {len(member_data)} track points for member {member_number}")
-        if not member_data.empty:
-            print(f"  Time range: {member_data['valid_time'].min()} to {member_data['valid_time'].max()}")
+    if 'ensemble_member' in df.columns and df['ensemble_member'].nunique() > 1:
+        df = df.groupby('ensemble_member', group_keys=False).apply(_unwrap_group)
+    else:
+        df = _unwrap_group(df)
 
-    return member_data
+    return _reconcile_cross_member_longitudes(df)
+
+
+def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Second pass, after per-member unwrapping: reconcile a GROUP-level
+    antimeridian straddle that no single member's own trajectory exhibits.
+
+    _unwrap_track_longitudes above only fixes a jump within one member's
+    own time-ordered sequence. It is a correct no-op when, say, member A's
+    entire track sits at raw longitudes ~176-177.5 deg and member B's
+    entire track sits at ~-176 to -177.5 deg, neither member individually
+    crosses the seam, so per-member np.unwrap never fires for either, but
+    the true physical positions are only ~5 deg apart (both hugging the
+    dateline from opposite sides), while the raw combined min/max reads as
+    ~353 deg wide. That corrupted-looking bbox is real: it was reproduced
+    directly from this exact scenario during a real council review.
+
+    Uses the standard "largest circular gap" method: sort every point's
+    longitude, find the widest gap between consecutive values, including
+    the wraparound gap (from the highest value back to the lowest value
+    + 360). If the wraparound gap is itself the widest, the points are
+    genuinely not antimeridian-adjacent as a group, this is the ordinary
+    case (including the already-correct single-member NANGKA-style crossing
+    handled above, which per-member unwrap already leaves as one dense,
+    gap-free cluster) and this function is a verified no-op. If some other
+    gap is wider, the true cluster wraps through +/-180 at that gap
+    instead, so every value up to and including it gets shifted by +360 to
+    make the whole group numerically contiguous.
+
+    Sanity bound: only applies the shift if doing so actually produces a
+    plausibly-sized (<90 deg, matching this project's own established "no
+    real single-storm envelope is wider than this" convention used
+    elsewhere) reconciled cluster. A real council review found that,
+    without this bound, the largest-gap method would also fire on
+    genuinely scattered, non-antimeridian data whenever a group's total
+    spread happens to approach 360 deg, confirmed not reachable by any
+    real TC ensemble (tested clean against real, genuinely wide-spread
+    storms), but with no guard to distinguish that from a real upstream
+    data anomaly (e.g. a parsing bug placing one member on the wrong side
+    of the planet).
+    """
+    lons = df['longitude'].to_numpy(dtype=float)
+    if len(lons) < 2:
+        return df
+
+    sorted_lons = np.sort(np.unique(lons))
+    if len(sorted_lons) < 2:
+        return df
+
+    internal_gaps = np.diff(sorted_lons)
+    wrap_gap = (sorted_lons[0] + 360.0) - sorted_lons[-1]
+
+    widest_internal_idx = int(np.argmax(internal_gaps))
+    if internal_gaps[widest_internal_idx] <= wrap_gap:
+        # The wraparound gap is the widest (or tied) -- not antimeridian-
+        # adjacent as a group. No-op.
+        return df
+
+    cutoff = sorted_lons[widest_internal_idx]
+    shifted = np.where(lons <= cutoff, lons + 360.0, lons)
+    reconciled_span = float(shifted.max() - shifted.min())
+
+    _SANITY_MAX_SPAN_DEG = 90.0
+    if reconciled_span > _SANITY_MAX_SPAN_DEG:
+        logger.warning(
+            f"_reconcile_cross_member_longitudes: widest internal "
+            f"gap ({internal_gaps[widest_internal_idx]:.2f} deg) exceeds the "
+            f"wraparound gap ({wrap_gap:.2f} deg), but shifting would still "
+            f"leave a {reconciled_span:.2f} deg-wide cluster -- too wide to "
+            f"plausibly be a real antimeridian-hugging storm ensemble. "
+            f"Leaving longitudes unchanged rather than risk mis-reprojecting "
+            f"genuinely scattered/anomalous data."
+        )
+        return df
+
+    df = df.copy()
+    df['longitude'] = shifted
+    return df
 
 
 def create_buffered_track_polygon(track_data: pd.DataFrame, buffer_radius_km: float) -> Polygon:
@@ -91,8 +191,15 @@ def create_buffered_track_polygon(track_data: pd.DataFrame, buffer_radius_km: fl
         buffer_radius_km (float): Buffer radius in kilometers
 
     Returns:
-        Polygon: Buffered track polygon
+        Polygon: Buffered track polygon. May extend beyond the valid
+            [-180, 180] longitude range when the track (or ensemble spread)
+            crosses the antimeridian — see _unwrap_track_longitudes above
+            and get_longitude_windows below, which is how callers turn this
+            back into real, native-range GRIB extraction window(s). This
+            polygon itself is never stored as an envelope.
     """
+    track_data = _unwrap_track_longitudes(track_data)
+
     lats = track_data['latitude'].values
     lons = track_data['longitude'].values
 
@@ -118,7 +225,11 @@ def get_bounding_box(polygon: Polygon, buffer: float = 2.0) -> Dict[str, float]:
         buffer (float): Buffer distance in degrees
 
     Returns:
-        dict: Bounding box coordinates
+        dict: Bounding box coordinates. 'lon_min'/'lon_max' may fall outside
+            [-180, 180] when the input polygon was built from unwrapped,
+            antimeridian-crossing track data (see create_buffered_track_polygon)
+            — pass this dict through get_longitude_windows() before using it
+            to slice a real GRIB file's longitude coordinate.
     """
     bounds = polygon.bounds  # (minx, miny, maxx, maxy)
     return {
@@ -129,15 +240,120 @@ def get_bounding_box(polygon: Polygon, buffer: float = 2.0) -> Dict[str, float]:
     }
 
 
+def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
+    """
+    Convert a bbox (possibly with lon_min/lon_max outside [-180, 180], from
+    an antimeridian-crossing track's unwrapped bounding box) into one or two
+    real, native-range windows suitable for slicing a GRIB file's own
+    longitude coordinate, which is always within [-180, 180].
+
+    Returns [bbox] unchanged, a single window, identical to the input,
+    whenever lon_min/lon_max already fall within [-180, 180]. This is the
+    overwhelming majority case (any storm that doesn't cross the
+    antimeridian) and is a verified no-op: callers looping over this
+    function's output process exactly one window with exactly the original
+    bounds, so existing non-crossing behavior is unchanged.
+
+    When the bbox does extend past one edge, returns two windows that
+    together cover the same real span: the part already inside
+    [-180, 180], and the overflowing part shifted back by 360 degrees into
+    its real native-range position on the other side of the antimeridian.
+
+    Handles both edges overflowing at once (e.g. lon_min=-184, lon_max=184)
+    by returning the FULL native range as a single window, not two
+    partial slivers. This is mathematically forced, not a judgment call:
+    lon_max > 180 and lon_min < -180 together guarantee lon_max - lon_min
+    > 360, and since longitude is periodic with period 360, any request
+    spanning more than a full circle covers every native value at least
+    once -- the correct window really is the whole globe. An earlier
+    version of this function got this backwards (returned two ~4deg-wide
+    slivers, silently dropping ~96% of the real requested area with no
+    error) -- caught by a real council review that reproduced it directly
+    against the real code. Reaching this branch at all should be rare in
+    practice once the caller's own bbox has been through
+    _reconcile_cross_member_longitudes() first (which keeps a real
+    storm's reconciled span well under 360 -- confirmed via a real,
+    realistic-scale reproduction), so hitting it is itself a signal of an
+    anomalously wide upstream input, not a normal antimeridian case.
+    """
+    lon_min = bbox['lon_min']
+    lon_max = bbox['lon_max']
+
+    if lon_min >= -180.0 and lon_max <= 180.0:
+        return [dict(bbox)]
+
+    overflow_east = lon_max > 180.0
+    overflow_west = lon_min < -180.0
+
+    if overflow_east and overflow_west:
+        logger.warning(
+            f"get_longitude_windows: bbox spans >360 deg "
+            f"(lon_min={lon_min:.2f}, lon_max={lon_max:.2f}, "
+            f"width={lon_max - lon_min:.2f}) -- returning the full native "
+            f"longitude range as a single window. This indicates an "
+            f"anomalously wide upstream input, not a normal antimeridian case."
+        )
+        return [{**bbox, 'lon_min': -180.0, 'lon_max': 180.0}]
+
+    windows = []
+    if overflow_east:
+        windows.append({**bbox, 'lon_min': max(lon_min, -180.0), 'lon_max': 180.0})
+        windows.append({**bbox, 'lon_min': -180.0, 'lon_max': lon_max - 360.0})
+    elif overflow_west:
+        windows.append({**bbox, 'lon_min': lon_min + 360.0, 'lon_max': 180.0})
+        windows.append({**bbox, 'lon_min': -180.0, 'lon_max': min(lon_max, 180.0)})
+
+    return windows
+
+
+def merge_contour_dicts(
+        dicts: List[Dict[int, Optional[Polygon]]]) -> Dict[int, Optional[Polygon]]:
+    """
+    Union same-threshold-key polygons across multiple per-window contour
+    dicts (see get_longitude_windows) into the final combined per-threshold
+    result.
+
+    A single-element input list is returned as that one dict, unchanged —
+    the common non-antimeridian-crossing case (one window) is therefore a
+    verified no-op: the exact same dict create_wind_threshold_contours
+    already produced today, with no extra union/copy step.
+    """
+    if len(dicts) == 1:
+        return dicts[0]
+
+    all_keys = set()
+    for d in dicts:
+        all_keys.update(d.keys())
+
+    merged: Dict[int, Optional[Polygon]] = {}
+    for key in all_keys:
+        polys = [d[key] for d in dicts if d.get(key) is not None]
+        if not polys:
+            merged[key] = None
+        elif len(polys) == 1:
+            merged[key] = polys[0]
+        else:
+            combined = unary_union(polys)
+            if combined.geom_type not in ('Polygon', 'MultiPolygon'):
+                combined = combined.buffer(0)
+            merged[key] = combined
+
+    return merged
+
+
 def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
-                   verbose: bool = True, indexpath: Optional[str] = None) -> xr.DataArray:
+                   verbose: bool = True, indexpath: Optional[str] = None) -> List[xr.DataArray]:
     """
     Load ensemble wind data for specific member and region.
 
     Args:
         grib_file (str): Path to wind GRIB file
         member_number (int): Ensemble member number
-        bbox (dict): Bounding box coordinates
+        bbox (dict): Bounding box coordinates. May have lon_min/lon_max
+            outside [-180, 180] (see get_bounding_box) — this function
+            slices the real GRIB longitude range once per real window
+            returned by get_longitude_windows(bbox), rather than assuming
+            a single contiguous slice.
         verbose (bool): Whether to print progress information
         indexpath (str, optional): Directory path for GRIB index files (.idx).
                                    If provided, index files will be stored here instead
@@ -145,14 +361,20 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
                                    to avoid concurrent index file conflicts.
 
     Returns:
-        xr.DataArray: Wind speed data
+        List[xr.DataArray]: One DataArray per real longitude window — length
+            1 for the overwhelming majority (non-antimeridian-crossing) case,
+            identical to what this function used to return directly; length
+            2 only when bbox straddles the antimeridian. Callers must run
+            contour extraction once per element and merge results (see
+            merge_contour_dicts) rather than concatenating these arrays —
+            a raw concat would reintroduce a coordinate discontinuity at the
+            180/-180 seam that contour tracing can't interpret correctly.
     """
     # Open dataset with optional custom index path
     if indexpath:
         # Create process-specific index directory to avoid concurrent access conflicts
         # Each process gets its own index cache, preventing race conditions
         # while still benefiting from index file caching performance
-        import multiprocessing
         import threading
         
         # Get unique identifier for this process/thread
@@ -180,54 +402,71 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
     else:
         ds = xr.open_dataset(grib_file, engine='cfgrib')
 
-    # Extract u and v components
-    u10 = ds['u10']
-    v10 = ds['v10']
-
-    # Compute wind speed
-    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
-
     # Select specific ensemble member, mapping control member 51 to GRIB number 0
-    if 'number' in wind_speed.dims:
-        desired_number = 0 if member_number == 51 else member_number
+    try:
+        # Extract u and v components (inside try so ds.close() fires on KeyError etc.)
+        u10 = ds['u10']
+        v10 = ds['v10']
+        wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+        if 'number' in wind_speed.dims:
+            desired_number = 0 if member_number == 51 else member_number
+            if verbose:
+                print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
+            try:
+                wind_speed = wind_speed.sel(number=desired_number)
+            except Exception as e:
+                logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data: {e}")
+                return [xr.DataArray()]  # outer finally: ds.close() still fires
+        else:
+            if verbose:
+                print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
+
+        # Subset to bounding box — one real native-range window in the
+        # overwhelming majority of cases, two only when bbox straddles the
+        # antimeridian (see get_longitude_windows)
+        windows = get_longitude_windows(bbox)
+        wind_regions = []
+        for window in windows:
+            region = wind_speed.sel(
+                latitude=slice(bbox['lat_max'], bbox['lat_min']),
+                longitude=slice(window['lon_min'], window['lon_max'])
+            )
+            region.load()  # materialise into RAM before closing the file handle
+            wind_regions.append(region)
+
         if verbose:
-            print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
-        try:
-            wind_speed = wind_speed.sel(number=desired_number)
-        except Exception as e:
-            logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data; proceeding without selection: {e}")
-    else:
-        if verbose:
-            print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
+            for region in wind_regions:
+                print(f"    Wind data shape: {region.shape}")
+                try:
+                    max_ms = float(region.max())
+                    print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
+                except Exception:
+                    pass
 
-    # Subset to bounding box
-    wind_region = wind_speed.sel(
-        latitude=slice(bbox['lat_max'], bbox['lat_min']),
-        longitude=slice(bbox['lon_min'], bbox['lon_max'])
-    )
-
-    if verbose:
-        print(f"    Wind data shape: {wind_region.shape}")
-        try:
-            max_ms = float(wind_region.max())
-            print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
-        except Exception:
-            pass
-
-    return wind_region
+        return wind_regions
+    finally:
+        ds.close()
 
 
 def load_wind_data_all_members(
     grib_file: str,
     bbox: Dict[str, float],
     indexpath: Optional[str] = None,
-) -> xr.DataArray:
+) -> List[xr.DataArray]:
     """
     Load wind speed for ALL ensemble members from a GRIB file in a single open.
 
-    Returns a DataArray with dims (number, latitude, longitude) for PF files,
-    or (latitude, longitude) for CF files (control forecast, no number dim).
-    Clipped to the given bounding box.
+    Each returned DataArray has dims (number, latitude, longitude) for PF
+    files, or (latitude, longitude) for CF files (control forecast, no
+    number dim).
+
+    Returns:
+        List[xr.DataArray]: One DataArray per real longitude window — length
+            1 (bbox clipped exactly as before) for the overwhelming majority
+            of storms; length 2 only when bbox straddles the antimeridian
+            (see get_bounding_box / get_longitude_windows). Callers must
+            extract contours once per element and merge results (see
+            merge_contour_dicts), never concatenate these arrays directly.
     """
     if indexpath:
         import pathlib
@@ -239,24 +478,42 @@ def load_wind_data_all_members(
     else:
         ds = xr.open_dataset(grib_file, engine='cfgrib')
 
-    wind_speed = np.sqrt(ds['u10'] ** 2 + ds['v10'] ** 2)
-
-    return wind_speed.sel(
-        latitude=slice(bbox['lat_max'], bbox['lat_min']),
-        longitude=slice(bbox['lon_min'], bbox['lon_max']),
-    )
+    try:
+        wind_speed = np.sqrt(ds['u10'] ** 2 + ds['v10'] ** 2)
+        windows = get_longitude_windows(bbox)
+        wind_regions = []
+        for window in windows:
+            region = wind_speed.sel(
+                latitude=slice(bbox['lat_max'], bbox['lat_min']),
+                longitude=slice(window['lon_min'], window['lon_max']),
+            )
+            region.load()  # materialise into RAM before closing the file handle
+            wind_regions.append(region)
+        return wind_regions
+    finally:
+        ds.close()
 
 
 def create_wind_threshold_contours(wind_data: xr.DataArray,
                                    thresholds: Dict[int, float],
-                                   verbose: bool = True) -> Dict[int, Optional[Polygon]]:
+                                   verbose: bool = True,
+                                   unit_label: str = 'kt') -> Dict[int, Optional[Polygon]]:
     """
     Create contour polygons for each wind threshold.
 
     Args:
         wind_data (xr.DataArray): Wind speed data
-        thresholds (dict): Wind thresholds (kt: m/s)
+        thresholds (dict): Wind thresholds (key: m/s) — the dict key's own unit
+            depends on the caller: wind passes real kt values (34, 40, 50...),
+            gust passes integer m/s labels (17, 21, 26...); see
+            ecmwf_gust_envelope_extractor.py's own GUST_THRESHOLDS_MS docstring.
         verbose (bool): Whether to print progress information
+        unit_label (str): Unit to print next to the threshold key in the
+            progress log (default 'kt', matching wind's own convention).
+            Gust's own caller passes 'm/s' here so the progress log doesn't
+            mislabel gust's m/s-keyed thresholds as knots — this is
+            display-only, it never affects the stored contour/envelope data,
+            which always keys off the same dict key passed in either way.
 
     Returns:
         dict: Polygons for each threshold
@@ -287,12 +544,21 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
     for i, (threshold_kt, threshold_ms) in enumerate(sorted_thresholds):
         if verbose:
-            print(f"    {threshold_kt} kt ({threshold_ms:.2f} m/s)...", end='', flush=True)
+            print(f"    {threshold_kt} {unit_label} ({threshold_ms:.2f} m/s)...", end='', flush=True)
 
         polygons = []
         try:
-            if i < len(cs.allsegs) and len(cs.allsegs[i]) > 0:
-                for segment in cs.allsegs[i]:
+            # cs.allsegs is the stable per-level segments API (confirmed matplotlib 3.11).
+            # cs.collections was removed in matplotlib 3.9 and must not be used.
+            # If allsegs is ever removed, fall back to contourpy (bundled with matplotlib).
+            try:
+                level_segs = cs.allsegs[i] if i < len(cs.allsegs) else []
+            except AttributeError:
+                from contourpy import contour_generator
+                gen = contour_generator(x=lons, y=lats, z=winds)
+                level_segs = gen.lines(threshold_ms) or []
+            if len(level_segs) > 0:
+                for segment in level_segs:
                     if len(segment) > 3:
                         try:
                             poly = Polygon(segment)
@@ -309,6 +575,10 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
         if polygons:
             combined = unary_union(polygons)
+            # unary_union can return GEOMETRYCOLLECTION when inputs share edges;
+            # buffer(0) normalises it back to a (Multi)Polygon
+            if combined.geom_type not in ('Polygon', 'MultiPolygon'):
+                combined = combined.buffer(0)
             contour_polygons[threshold_kt] = combined
             if verbose:
                 area_km2 = combined.area * 111 * 104
@@ -319,6 +589,45 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
                 print(" - No area")
 
     return contour_polygons
+
+
+_ANTIMERIDIAN_EPS = 1e-7  # degrees; far below GRIB grid spacing (0.25 deg), zero real-world effect
+
+
+def _nudge_antimeridian_vertices(geom):
+    """
+    Shift any vertex sitting at exactly +180 or -180 longitude inward by a
+    negligible epsilon.
+
+    A window from get_longitude_windows() can legitimately end at exactly
+    -180.0 (a real native GRIB grid coordinate, not an artifact), and
+    contour tracing can place a real vertex there. Snowflake's GEOGRAPHY
+    parser rejects that exact value outright ("Invalid Lng/Lat pair:
+    '-180,...'"), even though it's valid WKT and valid to shapely. Nudging
+    by 1e-7 degrees (~1cm) has no real-world effect and avoids the
+    rejection at storage time. A no-op for the overwhelming majority of
+    polygons, which never touch the antimeridian at all.
+
+    shapely.ops.transform (shapely 2.x) calls its callback once per
+    coordinate *ring*, passing all of that ring's x values (and y, and
+    optionally z) as a single batched array/tuple, not scalar-per-call —
+    the nudge must be vectorized, not a plain Python `if x == 180.0`.
+    """
+    from shapely.ops import transform
+
+    def _nudge(x, y, z=None):
+        x = np.asarray(x, dtype=float).copy()
+        # Clamp, not exact-match: upstream window/buffer arithmetic can
+        # overshoot the boundary by float noise (e.g. -180.00000000000003,
+        # seen in real NANGKA data) which is itself already out of the
+        # valid [-180, 180] range and would also fail Snowflake's parser
+        # an exact == -180.0 check misses that. Anything at or past the
+        # boundary gets pulled back in.
+        x[x <= -180.0] = -180.0 + _ANTIMERIDIAN_EPS
+        x[x >= 180.0] = 180.0 - _ANTIMERIDIAN_EPS
+        return (x, y, z) if z is not None else (x, y)
+
+    return transform(_nudge, geom)
 
 
 def polygon_to_wkt(polygon: Optional[Polygon]) -> Optional[str]:
@@ -335,422 +644,9 @@ def polygon_to_wkt(polygon: Optional[Polygon]) -> Optional[str]:
         return None
 
     try:
+        polygon = _nudge_antimeridian_vertices(polygon)
         return polygon.wkt
     except Exception as e:
         logger.warning(f"Could not convert polygon to WKT: {e}")
         return None
-
-
-def extract_wind_polygons_for_member(
-        track_csv: str,
-        wind_grib: str,
-        member_number: int,
-        buffer_radius_km: float = BUFFER_RADIUS_KM,
-        thresholds: Dict[int, float] = WIND_THRESHOLDS,
-        verbose: bool = True ) -> Dict[str, Union[Dict, pd.DataFrame, bool]]:
-    """
-    Extract wind threshold polygons for a single ensemble member.
-
-    Args:
-        track_csv (str): Path to transformed TC track CSV
-        wind_grib (str): Path to wind GRIB file
-        member_number (int): Ensemble member number
-        buffer_radius_km (float): Buffer radius in km
-        thresholds (dict): Wind thresholds to extract
-        verbose (bool): Whether to print progress information
-
-    Returns:
-        dict: Extraction results with polygons and validation metrics
-    """
-    if verbose:
-        print(f"\n{'=' * 60}")
-        print(f"EXTRACTING MEMBER {member_number}")
-        print(f"Track: {os.path.basename(track_csv)}")
-        print(f"Wind: {os.path.basename(wind_grib)}")
-        print(f"{'=' * 60}")
-
-    try:
-        # Load track data
-        if verbose:
-            print("\nStep 1: Loading track data...")
-        track_data = load_track_data(track_csv, member_number, verbose)
-
-        if track_data.empty:
-            if verbose:
-                print(f"  WARNING: No track data for member {member_number}")
-            return {'success': False, 'error': 'No track data'}
-
-        # Create buffered polygon
-        if verbose:
-            print(f"\nStep 2: Creating buffer ({buffer_radius_km} km)...")
-        buffered_polygon = create_buffered_track_polygon(track_data, buffer_radius_km)
-        bbox = get_bounding_box(buffered_polygon)
-
-        if verbose:
-            print(
-                f"  Bounding box: [{bbox['lon_min']:.1f}, {bbox['lon_max']:.1f}] × [{bbox['lat_min']:.1f}, {bbox['lat_max']:.1f}]")
-
-        # Load wind data
-        if verbose:
-            print("\nStep 3: Loading wind data...")
-        wind_data = load_wind_data(wind_grib, member_number, bbox, verbose)
-
-        # Extract contours
-        if verbose:
-            print("\nStep 4: Extracting wind threshold contours...")
-        contours = create_wind_threshold_contours(wind_data, thresholds, verbose)
-
-        # Prepare output
-        result = {
-            'success': True,
-            'member': member_number,
-            'contours': contours,
-            'track_data': track_data,
-            'bbox': bbox
-        }
-
-        return result
-
-    except Exception as e:
-        if verbose:
-            print(f"\n Error extracting member {member_number}: {e}")
-        return {'success': False, 'error': str(e), 'member': member_number}
-
-
-def extract_multiple_storms(
-        storm_configs: List[Dict[str, str]],
-        wind_grib: str,
-        output_dir: Optional[str] = None,
-        buffer_radius_km: float = BUFFER_RADIUS_KM,
-        thresholds: Dict[int, float] = WIND_THRESHOLDS,
-        verbose: bool = True) -> Dict[str, Union[int, List[str], Dict]]:
-    """
-    Extract wind threshold polygons for multiple storms from a single wind GRIB file.
-    
-    This function efficiently processes multiple hurricane tracks using the same
-    wind forecast data, avoiding repeated file I/O operations.
-    
-    Args:
-        storm_configs (List[Dict]): List of storm configurations, each containing:
-            - 'track_csv': Path to transformed TC track CSV
-            - 'storm_name': Name of the storm (optional, for output naming)
-        wind_grib (str): Path to wind GRIB file
-        output_dir (str, optional): Output directory for envelope files
-        buffer_radius_km (float): Buffer radius in km
-        thresholds (dict): Wind thresholds to extract
-        verbose (bool): Whether to print detailed progress information
-        
-    Returns:
-        dict: Summary with results for all storms
-        
-    Example:
-        storm_configs = [
-            {'track_csv': 'JERRY_transformed.csv', 'storm_name': 'JERRY'},
-            {'track_csv': 'RAYMOND_transformed.csv', 'storm_name': 'RAYMOND'},
-            {'track_csv': 'NAKRI_transformed.csv', 'storm_name': 'NAKRI'}
-        ]
-        result = extract_multiple_storms(storm_configs, 'wind_ens_2025-10-10_r00_f024h.grib2')
-    """
-    if verbose:
-        print("=" * 70)
-        print("MULTI-STORM WIND EXTRACTION")
-        print("=" * 70)
-        print(f"Processing {len(storm_configs)} storms from single wind file")
-        print(f"Wind file: {os.path.basename(wind_grib)}")
-        print(f"Buffer radius: {buffer_radius_km} km")
-        print(f"Wind thresholds: {list(thresholds.keys())} kt")
-        print("=" * 70)
-    
-    # Load wind data once
-    if verbose:
-        print("\nLoading wind data (shared across all storms)...")
-    
-    try:
-        # Open wind dataset once
-        wind_ds = xr.open_dataset(wind_grib, engine='cfgrib')
-        u10 = wind_ds['u10']
-        v10 = wind_ds['v10']
-        
-        if verbose:
-            print(f"  Wind data loaded: {wind_ds.dims}")
-            print(f"  Available ensemble members: {wind_ds.number.values if 'number' in wind_ds.dims else 'N/A'}")
-            
-    except Exception as e:
-        if verbose:
-            print(f"   Error loading wind data: {e}")
-        return {'success': False, 'error': f'Failed to load wind data: {e}'}
-    
-    # Process each storm
-    all_envelope_records = []
-    storm_summaries = {}
-    
-    for i, storm_config in enumerate(storm_configs):
-        track_csv = storm_config['track_csv']
-        storm_name = storm_config.get('storm_name', f'STORM_{i+1}')
-        
-        if verbose:
-            print(f"\n{'=' * 50}")
-            print(f"PROCESSING STORM {i+1}/{len(storm_configs)}: {storm_name}")
-            print(f"Track file: {os.path.basename(track_csv)}")
-            print(f"{'=' * 50}")
-        
-        try:
-            # Load track data for this storm
-            track_df = pd.read_csv(track_csv)
-            storm_members = sorted(track_df['ensemble_member'].unique())
-            
-            if verbose:
-                print(f"  Found {len(storm_members)} ensemble members for {storm_name}")
-            
-            # Get storm metadata
-            track_id = track_df['track_id'].iloc[0] if 'track_id' in track_df.columns else storm_name
-            forecast_time = track_df['forecast_time'].iloc[0] if 'forecast_time' in track_df.columns else None
-            
-            # Process each member for this storm
-            storm_envelope_records = []
-            
-            for member in storm_members:
-                if verbose:
-                    print(f"    Processing member {member}...", end='', flush=True)
-                
-                try:
-                    # Load track data for this member
-                    member_track_data = track_df[track_df['ensemble_member'] == member].copy()
-                    member_track_data = member_track_data.sort_values('valid_time')
-                    
-                    if member_track_data.empty:
-                        if verbose:
-                            print("  No track data")
-                        continue
-                    
-                    # Create buffered polygon for this member
-                    buffered_polygon = create_buffered_track_polygon(member_track_data, buffer_radius_km)
-                    bbox = get_bounding_box(buffered_polygon)
-                    
-                    # Extract wind data for this member and region (reuse loaded data)
-                    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
-                    
-                    # Select specific ensemble member
-                    if 'number' in wind_speed.dims:
-                        member_wind_data = wind_speed.sel(number=member)
-                    else:
-                        if verbose:
-                            print("  No ensemble dimension")
-                        continue
-                    
-                    # Subset to bounding box
-                    wind_region = member_wind_data.sel(
-                        latitude=slice(bbox['lat_max'], bbox['lat_min']),
-                        longitude=slice(bbox['lon_min'], bbox['lon_max'])
-                    )
-                    
-                    # Create contours for this member
-                    contours = create_wind_threshold_contours(wind_region, thresholds, verbose=False)
-                    
-                    # Create envelope records for this member (only for thresholds with polygons)
-                    for threshold_kt, polygon in contours.items():
-                        if polygon is not None:  # Only add rows with actual polygons
-                            storm_envelope_records.append({
-                                'forecast_time': forecast_time,
-                                'track_id': track_id,
-                                'ensemble_member': member,
-                                'wind_threshold': threshold_kt,
-                                'envelope_region': polygon_to_wkt(polygon)
-                            })
-                    
-                    if verbose:
-                        n_polygons = sum(1 for p in contours.values() if p is not None)
-                        print(f"  {n_polygons} polygons")
-                        
-                except Exception as e:
-                    if verbose:
-                        print(f"  Error: {e}")
-                    continue
-            
-            # Save envelope file for this storm
-            if storm_envelope_records:
-                storm_envelopes_df = pd.DataFrame(storm_envelope_records)
-                
-                # Generate output filename
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                    output_csv = os.path.join(output_dir, f"{storm_name}_envelopes.csv")
-                else:
-                    output_csv = f"{storm_name}_envelopes.csv"
-                
-                storm_envelopes_df.to_csv(output_csv, index=False)
-                
-                if verbose:
-                    print(f"   Saved {len(storm_envelope_records)} envelope records to {output_csv}")
-                
-                # Add to overall results
-                all_envelope_records.extend(storm_envelope_records)
-                
-                # Store summary
-                storm_summaries[storm_name] = {
-                    'envelope_file': output_csv,
-                    'records': len(storm_envelope_records),
-                    'members_processed': len(storm_members)
-                }
-            else:
-                if verbose:
-                    print(f"   No envelope records created for {storm_name}")
-                storm_summaries[storm_name] = {
-                    'envelope_file': None,
-                    'records': 0,
-                    'members_processed': 0
-                }
-                
-        except Exception as e:
-            if verbose:
-                print(f"   Error processing {storm_name}: {e}")
-            storm_summaries[storm_name] = {
-                'envelope_file': None,
-                'records': 0,
-                'members_processed': 0,
-                'error': str(e)
-            }
-    
-    # Close wind dataset
-    wind_ds.close()
-    
-    # Overall summary
-    if verbose:
-        print("\n" + "=" * 70)
-        print("MULTI-STORM EXTRACTION SUMMARY")
-        print("=" * 70)
-        print(f"Storms processed: {len(storm_configs)}")
-        print(f"Total envelope records: {len(all_envelope_records)}")
-        
-        successful_storms = sum(1 for s in storm_summaries.values() if s['records'] > 0)
-        print(f"Successful extractions: {successful_storms}/{len(storm_configs)}")
-        
-        print(f"\nPer-storm results:")
-        for storm_name, summary in storm_summaries.items():
-            status = "✓" if summary['records'] > 0 else "✗"
-            print(f"  {status} {storm_name}: {summary['records']} records, {summary['members_processed']} members")
-        
-        print("=" * 70)
-    
-    return {
-        'success': len(all_envelope_records) > 0,
-        'total_records': len(all_envelope_records),
-        'storm_summaries': storm_summaries,
-        'processed_storms': len(storm_configs)
-    }
-
-
-def extract_all_members(
-        track_csv: str,
-        wind_grib: str,
-        output_csv: Optional[str] = None,
-        buffer_radius_km: float = BUFFER_RADIUS_KM,
-        thresholds: Dict[int, float] = WIND_THRESHOLDS,
-        verbose: bool = True) -> Dict[str, Union[str, int, pd.DataFrame]]:
-    """
-    Extract wind threshold polygons for all ensemble members.
-
-    Output format matches TC envelope file structure:
-    - forecast_time, track_id, ensemble_member, wind_threshold, envelope_region
-    - One row per member per threshold
-
-    Args:
-        track_csv (str): Path to transformed TC track CSV
-        wind_grib (str): Path to wind GRIB file
-        output_csv (str, optional): Path to save output CSV (will auto-generate with _envelopes.csv suffix)
-        buffer_radius_km (float): Buffer radius in km
-        thresholds (dict): Wind thresholds to extract
-        verbose (bool): Whether to print progress information
-
-    Returns:
-        dict: Summary with results DataFrame and statistics
-    """
-    if verbose:
-        print("=" * 70)
-        print("ECMWF ENSEMBLE WIND EXTRACTION")
-        print("=" * 70)
-        print(f"Track file: {track_csv}")
-        print(f"Wind file: {wind_grib}")
-        print(f"Buffer radius: {buffer_radius_km} km")
-        print(f"Wind thresholds: {list(thresholds.keys())} kt")
-        print("=" * 70)
-
-    # Get list of members from track data
-    track_df = pd.read_csv(track_csv)
-    all_members = sorted(track_df['ensemble_member'].unique())
-
-    if verbose:
-        print(f"\nFound {len(all_members)} ensemble members in track data")
-        print(f"Processing members: {all_members[0]} to {all_members[-1]}")
-
-    # Get forecast metadata
-    track_id = track_df['track_id'].iloc[0] if 'track_id' in track_df.columns else 'UNKNOWN'
-    forecast_time = track_df['forecast_time'].iloc[0] if 'forecast_time' in track_df.columns else None
-
-    # Process each member
-    envelope_records = []
-
-    for member in all_members:
-        result = extract_wind_polygons_for_member(
-            track_csv=track_csv,
-            wind_grib=wind_grib,
-            member_number=member,
-            buffer_radius_km=buffer_radius_km,
-            thresholds=thresholds,
-            verbose=verbose
-        )
-
-        if result['success']:
-            # Create envelope records (only for thresholds with polygons)
-            for threshold_kt, polygon in result['contours'].items():
-                if polygon is not None:  # Only add rows with actual polygons
-                    envelope_records.append({
-                        'forecast_time': forecast_time,
-                        'track_id': track_id,
-                        'ensemble_member': member,
-                        'wind_threshold': threshold_kt,
-                        'envelope_region': polygon_to_wkt(polygon)
-                    })
-
-    # Create DataFrames
-    envelopes_df = pd.DataFrame(envelope_records)
-
-    # Auto-generate output filename if not provided
-    if output_csv is None:
-        # Extract base name from input files
-        track_base = os.path.splitext(os.path.basename(track_csv))[0]
-        # Remove _transformed suffix if present
-        track_base = track_base.replace('_transformed', '')
-        output_csv = f"{track_base}_envelopes.csv"
-
-    # Save envelope file (main output)
-    envelopes_df.to_csv(output_csv, index=False)
-    if verbose:
-        print(f"\n Saved envelope polygons to: {output_csv}")
-
-    # Print summary statistics
-    if verbose and not envelopes_df.empty:
-        print("\n" + "=" * 70)
-        print("EXTRACTION SUMMARY")
-        print("=" * 70)
-        print(f"Successfully processed: {len(all_members)} members")
-        print(f"Total envelope records: {len(envelopes_df)} (members × thresholds)")
-
-        # Count polygons per threshold
-        print(f"\nPolygons extracted per threshold:")
-        for threshold in sorted(thresholds.keys()):
-            n_polygons = envelopes_df[
-                (envelopes_df['wind_threshold'] == threshold) &
-                (envelopes_df['envelope_region'].notna())
-                ].shape[0]
-            print(f"  {threshold:>3d} kt: {n_polygons}/{len(all_members)}")
-
-        print("=" * 70)
-
-    return {
-        'success': len(envelopes_df) > 0,
-        'envelopes_df': envelopes_df,
-        'n_processed': len(all_members),
-        'envelope_file': output_csv
-    }
 

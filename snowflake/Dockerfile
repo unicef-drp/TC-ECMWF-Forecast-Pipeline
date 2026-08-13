@@ -22,6 +22,7 @@
 # - TC data download from ECMWF
 # - BUFR extraction and transformation
 # - Wind data download and processing
+# - Met data download and zarr storage
 # - Snowflake data loading
 #
 # The container will execute snowflake/spcs_pipeline.py and terminate when complete.
@@ -45,10 +46,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # BUFR/GRIB processing
     libeccodes-dev \
     libeccodes-tools \
+    # HDF5/NetCDF — required by zarr/cfgrib
+    libhdf5-dev \
+    libnetcdf-dev \
     # Geospatial libraries
     libgeos-dev \
     libproj-dev \
     libgdal-dev \
+    pkg-config \
     # Compilation tools
     build-essential \
     gcc \
@@ -67,6 +72,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Python environment
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+# Headless matplotlib backend — required for wind isoline extraction (ax.contour())
+ENV MPLBACKEND=Agg
 
 # Set working directory
 WORKDIR /app
@@ -82,8 +89,8 @@ COPY pipeline_core.py /app/
 # Copy snowflake directory (contains spcs_pipeline.py and snowflake_loader.py)
 COPY snowflake/ /app/snowflake/
 
-# Copy requirements
-COPY requirements.txt /app/requirements.txt
+# Copy requirements (lean pipeline-only set — no cartopy/scipy)
+COPY requirements-ci.txt /app/requirements-ci.txt
 
 # ==============================================================================
 # Install Python dependencies
@@ -93,7 +100,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # Install Python packages
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-ci.txt
 
 # ==============================================================================
 # Create directories for data
@@ -102,7 +109,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/tc_data \
     /app/tc_transformed \
     /app/wind_data \
-    /app/wind_extracted
+    /app/wind_extracted \
+    /app/met_data/grib_tmp
 
 # ==============================================================================
 # Health check (optional - for monitoring)
@@ -125,9 +133,12 @@ ENV WIND_EXTRACTED_DIR=/app/wind_extracted
 ENV DOWNLOAD_LIMIT=1
 ENV MAX_WORKERS=4
 ENV PROCESS_WIND_DATA=true
+ENV PROCESS_MET=true
+ENV MET_DATA_DIR=/app/met_data
 ENV NAMED_STORMS_ONLY=true
 ENV CLEANUP_AFTER_LOAD=true
 ENV USE_PROCESS_POOL=false
+# SNOWFLAKE_STAGE_NAME must be overridden at runtime when PROCESS_MET=true
 
 # Snowflake defaults (MUST be overridden at runtime)
 ENV SNOWFLAKE_WAREHOUSE=COMPUTE_WH
@@ -139,14 +150,9 @@ ENV SNOWFLAKE_SCHEMA=TC_DATA
 # ==============================================================================
 
 # Create startup script to clean old index files
-RUN echo '#!/bin/bash\n\
-# Clean any old GRIB index files that may cause conflicts\n\
-rm -f /app/wind_data/*.idx 2>/dev/null || true\n\
-rm -f /app/wind_data/*.grib2.*.idx 2>/dev/null || true\n\
-echo "Cleaned old index files"\n\
-# Run the pipeline\n\
-exec python snowflake/spcs_pipeline.py\n\
-' > /app/start.sh && chmod +x /app/start.sh
+# Use printf so \n is expanded as real newlines (echo does not expand \n in /bin/sh)
+RUN printf '#!/bin/bash\nrm -rf /app/wind_data/.idx_cache 2>/dev/null || true\nrm -f /app/wind_data/*.idx 2>/dev/null || true\necho "Cleaned old index files"\nexec python snowflake/spcs_pipeline.py\n' \
+    > /app/start.sh && chmod +x /app/start.sh
 
 # Run the SPCS pipeline with cleanup
 CMD ["/app/start.sh"]

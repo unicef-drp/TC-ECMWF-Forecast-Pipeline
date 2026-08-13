@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared pipeline core: configuration, statistics, and processing steps 1–5.
+Shared pipeline core: configuration, statistics, and processing steps 1–6.
 
 Both entry points import from here:
   - github_actions/main.py  — sequential execution, password auth
@@ -21,8 +21,10 @@ import pandas as pd
 
 from ecmwf_tc_data_downloader import download_tc_data
 from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_storm_csvs
-from ecmwf_wind_data_downloader import download_ensemble_wind
+from ecmwf_wind_data_downloader import download_ensemble_wind, download_ensemble_gust
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
+from ecmwf_gust_envelope_extractor import process_gust_combination
+from ecmwf_met_downloader import download_ensemble_param
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,20 @@ class BasePipelineConfig:
         self.named_storms_only = os.getenv('NAMED_STORMS_ONLY', 'true').lower() == 'true'
         self.max_ensemble_members = 51  # Fixed: 50 perturbed + 1 control
 
+        # Gust processing — independent of process_wind_data (a run can process
+        # wind without gust, e.g. the existing production workflow while gust
+        # is still being verified on the side; see step4b_download_gust/
+        # step5b_extract_gust_envelopes, both of which still also require
+        # process_wind_data since gust extraction reuses the same TC track data).
+        self.process_gust = os.getenv('PROCESS_GUST', 'true').lower() == 'true'
+
+        # Gridded ENS parameter downloads (tp, ro, and future params)
+        self.met_data_dir = Path(os.getenv('MET_DATA_DIR', 'met_data'))
+        self.process_met = os.getenv('PROCESS_MET', 'true').lower() == 'true'
+
+        # Snowflake stage name (used for gridded Zarr PUT and impact data)
+        self.snowflake_stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
+
     def _validate_run_time(self) -> bool:
         """Validate run_time format and required-when-date-specified rule."""
         if self.download_date and not self.run_time:
@@ -102,16 +118,24 @@ class BasePipelineConfig:
             logger.error(f"Missing required environment variables: {', '.join(missing)}")
             return False
 
+        if self.process_met and not self.snowflake_stage_name:
+            logger.error(
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_MET=true and "
+                "DATA_PIPELINE_DB=SNOWFLAKE. Add it to GitHub Secrets."
+            )
+            return False
+
         return self._validate_run_time()
 
     def create_directories(self):
         """Ensure all required working directories exist."""
         for d in (self.raw_data_dir, self.transformed_data_dir,
-                  self.wind_data_dir, self.wind_extracted_dir):
+                  self.wind_data_dir, self.wind_extracted_dir,
+                  self.met_data_dir):
             d.mkdir(parents=True, exist_ok=True)
         logger.info(
             f"Directories ready: {self.raw_data_dir}, {self.transformed_data_dir}, "
-            f"{self.wind_data_dir}, {self.wind_extracted_dir}"
+            f"{self.wind_data_dir}, {self.wind_extracted_dir}, {self.met_data_dir}"
         )
 
 
@@ -188,6 +212,25 @@ def extract_tc_data_info(csv_files: List[Path]) -> Dict:
         return {}
 
 
+def extract_tc_data_info_from_bufr(bufr_files: List[Path]) -> Dict:
+    """Derive forecast run date and hour from the BUFR filename.
+
+    Parses filenames like tc_tracks_2026-07-01_r06.bufr4.
+    Used when no named storms are found but precipitation should still run.
+    """
+    import re
+    for f in bufr_files:
+        m = re.search(r'(\d{4}-\d{2}-\d{2})_r(\d{2})', f.name)
+        if m:
+            date = m.group(1)
+            run_time = int(m.group(2))
+            forecast_time = f'{date} {run_time:02d}:00:00'
+            logger.info(f"TC data info from BUFR filename: {date} {run_time:02d}Z")
+            return {'run_time': run_time, 'date': date, 'forecast_time': forecast_time}
+    logger.warning("Could not parse date/run_time from BUFR filename(s)")
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Pipeline steps 1–5
 # ---------------------------------------------------------------------------
@@ -209,14 +252,13 @@ def step1_download(config: BasePipelineConfig, stats: PipelineStats) -> List[Pat
             logger.info(f"Downloading latest {config.download_limit} forecast(s)")
             download_kwargs['limit'] = config.download_limit
 
+        download_kwargs['skip_existing'] = config.skip_existing
         result = download_tc_data(**download_kwargs)
         stats.files_downloaded = result['downloaded']
         logger.info(f"Downloaded {stats.files_downloaded} file(s)")
 
-        # Support both .bufr4 (ecmwf-opendata) and .bin (DISS) files
-        bufr_files = (list(config.raw_data_dir.glob("*.bufr4"))
-                      + list(config.raw_data_dir.glob("*.bin")))
-        return bufr_files
+        # Use the file list returned by the downloader (only files from this run)
+        return result['files']
 
     except Exception as e:
         error_msg = f"Download failed: {e}"
@@ -283,7 +325,7 @@ def _transform_worker(args: tuple) -> tuple:
     csv_file_path, transformed_data_dir, skip_existing = args
     csv_file = _Path(csv_file_path)
     output_base = _Path(transformed_data_dir) / f"transformed_{csv_file.stem}"
-    output_file = output_base.with_suffix('.csv')
+    output_file = _Path(str(output_base) + '_transformed.csv')
     if output_file.exists() and skip_existing:
         return True, str(output_file), f"Skipping: {output_file.name}"
     import re as _re
@@ -397,11 +439,54 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
             logger.info(f"Downloaded {stats.files_wind_downloaded} wind file(s)")
             return result['downloaded_files']
         else:
-            logger.warning(f"Wind download failed: {result.get('error', 'unknown error')}")
+            error_msg = f"Wind download failed: {result.get('files_failed', '?')} step(s) failed"
+            logger.warning(error_msg)
+            stats.errors.append(error_msg)
             return []
 
     except Exception as e:
         error_msg = f"Wind download failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+
+def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
+                          tc_data_info: Dict, max_workers: int = 4) -> List[Path]:
+    """Step 4b: Download ensemble 10fg (max wind gust) GRIB files alongside u10/v10."""
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled — skipping gust download")
+        return []
+    if not config.process_gust:
+        logger.info("PROCESS_GUST=false — skipping gust download")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 4b: Downloading gust forecast data (10fg)...")
+    logger.info("=" * 70)
+    try:
+        tc_run_time = tc_data_info.get('run_time')
+        tc_date = tc_data_info.get('date')
+        if tc_run_time is None or tc_date is None:
+            logger.warning("Cannot determine TC run time or date — skipping gust download")
+            return []
+        max_forecast_hour = analyze_required_forecast_hours(config.transformed_data_dir, verbose=False)
+        required_forecast_hours = list(range(6, max_forecast_hour + 1, 6))
+        logger.info(f"Gust steps: 6–{max_forecast_hour}h every 6h ({len(required_forecast_hours)} files)")
+        result = download_ensemble_gust(
+            date=tc_date, run_time=tc_run_time,
+            forecast_hours=required_forecast_hours,
+            output_dir=str(config.wind_data_dir),
+            verbose=False, max_workers=max_workers,
+        )
+        if result['success']:
+            logger.info(f"Downloaded {result['files_downloaded']} gust file(s)")
+            return result['downloaded_files']
+        error_msg = f"Gust download failed: {result.get('files_failed', '?')} step(s) failed"
+        logger.warning(error_msg)
+        stats.errors.append(error_msg)
+        return []
+    except Exception as e:
+        error_msg = f"Gust download failed: {e}"
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return []
@@ -442,7 +527,10 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
         if result['processed_storms'] > 0:
             stats.files_wind_processed = result['processed_storms']
             logger.info(f"Processed wind data for {result['processed_storms']} storm(s)")
-            envelope_files = list(config.wind_extracted_dir.glob("*_envelopes_*.csv"))
+            envelope_files = [
+                f for f in config.wind_extracted_dir.glob("*_envelopes_*.csv")
+                if 'gust' not in f.name
+            ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
             return envelope_files
         else:
@@ -456,6 +544,115 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
         return []
 
 
+def step5b_extract_gust_envelopes(config: BasePipelineConfig,
+                                   stats: PipelineStats) -> List[Path]:
+    """Step 5b: Extract gust envelope polygons from 10fg GRIB files."""
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled — skipping gust envelope extraction")
+        return []
+    if not config.process_gust:
+        logger.info("PROCESS_GUST=false — skipping gust envelope extraction")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 5b: Extracting gust envelopes from 10fg GRIB files...")
+    logger.info("=" * 70)
+    try:
+        process_gust_combination(
+            tc_data_dir=config.transformed_data_dir,
+            gust_data_dir=config.wind_data_dir,
+            output_dir=config.wind_extracted_dir,
+        )
+        gust_files = sorted(config.wind_extracted_dir.glob('*_gust_envelopes_*.csv'))
+        if gust_files:
+            logger.info(f"Gust envelope files: {[f.name for f in gust_files]}")
+        else:
+            logger.warning("No gust envelope files generated")
+        return gust_files
+    except Exception as e:
+        error_msg = f"Gust envelope extraction failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Step 6: MET parameter download + Zarr build + stage upload
+# ---------------------------------------------------------------------------
+
+def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
+                          tc_data_info: Dict,
+                          snowflake_conn=None,
+                          max_workers: int = 4) -> List[Dict]:
+    """
+    Step 6: Download tp and ro, build Zarr ZipStores, upload to stage.
+
+    Runs after wind processing. Downloads all 51 members × 25 steps globally
+    (60°S–60°N), builds one ZipStore per param, and either PUTs them to the
+    Snowflake internal stage or keeps them locally.
+
+    tp  — total precipitation (global; primary pluvial forcing)
+    ro  — total runoff (land-only; soil-aware flood response signal)
+
+    Returns list of metadata dicts for loading into MET_FORECASTS table:
+      [{forecast_time, param, stage_path}]  — one entry per param (zarr is global, not per-storm)
+    """
+    params_to_run = ['tp', 'ro'] if config.process_met else []
+
+    if not params_to_run:
+        logger.info('Precipitation processing disabled — skipping')
+        return []
+
+    tc_run_time = tc_data_info.get('run_time')
+    tc_date     = tc_data_info.get('date')
+    tc_forecast_time = tc_data_info.get('forecast_time')
+    if tc_run_time is None or tc_date is None:
+        logger.warning('Cannot determine TC run time/date — skipping MET parameter download')
+        return []
+
+    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+    if upload_to_stage and not config.snowflake_stage_name:
+        error_msg = 'SNOWFLAKE_STAGE_NAME required for precipitation stage upload — skipping'
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
+
+    logger.info('=' * 70)
+    logger.info(f'STEP 6: MET download ({", ".join(p.upper() for p in params_to_run)})')
+    logger.info('=' * 70)
+
+    metadata_rows: List[Dict] = []
+
+    for param in params_to_run:
+        result = download_ensemble_param(
+            param=param,
+            date=tc_date,
+            run_time=tc_run_time,
+            output_dir=str(config.met_data_dir),
+            snowflake_conn=snowflake_conn if upload_to_stage else None,
+            snowflake_stage_name=config.snowflake_stage_name if upload_to_stage else None,
+            upload_to_stage=upload_to_stage,
+            cleanup_grib=config.cleanup_after_load,
+            max_workers=max_workers,
+            verbose=True,
+        )
+
+        if not result['success']:
+            error_msg = f'Precipitation {param} download/upload failed'
+            logger.error(error_msg)
+            stats.errors.append(error_msg)
+            continue
+
+        # One metadata row per param — the zarr is global (one file per model run)
+        metadata_rows.append({
+            'forecast_time': tc_forecast_time,
+            'param':         param,
+            'stage_path':    result['stage_path'] or str(result['zip_path']),
+        })
+
+    logger.info(f'Precipitation step done — {len(metadata_rows)} metadata rows')
+    return metadata_rows
+
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
@@ -466,20 +663,36 @@ def cleanup_files(config: BasePipelineConfig):
         logger.info("Cleanup skipped (CLEANUP_AFTER_LOAD=false)")
         return
 
+    local_mode = getattr(config, 'data_pipeline_db', 'SNOWFLAKE') == 'LOCAL'
+
     logger.info("Cleaning up temporary files...")
     try:
+        import shutil
         removed = 0
         for pattern, directory in [
             ("*.bufr4", config.raw_data_dir),
             ("*.bin", config.raw_data_dir),
             ("*.csv", config.raw_data_dir),
-            ("*.csv", config.transformed_data_dir),
+            # In LOCAL mode these CSVs are the final outputs — keep them
+            *([("*.csv", config.transformed_data_dir)] if not local_mode else []),
             ("*.grib2", config.wind_data_dir),
-            ("*.csv", config.wind_extracted_dir),
+            *([("*.csv", config.wind_extracted_dir)] if not local_mode else []),
+            # precip: grib_tmp only — ZipStore is the persistent output, keep it
+            ("*.grib2", config.met_data_dir / "grib_tmp"),
+            ("*.idx",   config.met_data_dir / "grib_tmp"),
         ]:
-            for f in directory.glob(pattern):
-                f.unlink()
-                removed += 1
+            if directory.exists():
+                for f in directory.glob(pattern):
+                    f.unlink()
+                    removed += 1
+
+        # Remove the cfgrib index cache directory — orphaned .idx files accumulate
+        # here after GRIB files are deleted and trigger spurious warnings on next run
+        idx_cache = config.wind_data_dir / ".idx_cache"
+        if idx_cache.exists():
+            shutil.rmtree(idx_cache)
+            logger.info("Removed .idx_cache directory")
+
         logger.info(f"Removed {removed} temporary file(s)")
     except Exception as e:
         logger.warning(f"Cleanup failed (non-critical): {e}")

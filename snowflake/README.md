@@ -11,13 +11,17 @@ This directory contains the SPCS entry point for the ECMWF TC Forecast Pipeline.
 - **Flexible Authentication**: SPCS OAuth, private key, or password
 - **Phase-level Timing**: per-phase timing logged to `unicef_pipeline.log`
 
-All data processing steps (1–5) are shared with the GitHub Actions pipeline via `pipeline_core.py`.  This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
+All data processing steps (1–6) are shared with the GitHub Actions pipeline via `pipeline_core.py`. This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
 
 Execution sequence:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
 2. **Phase 2**: Transform per-storm CSVs (concurrently if `USE_PROCESS_POOL=true`)
 3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 4**: Load all results to Snowflake (SPCS OAuth / private key / password)
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+5. **Phase 3c** *(optional)*: Download global met GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
+
+> **No named storms**: If Phase 1 finds no named storms, Phases 2–3 (wind) are skipped. Phase 3b (precipitation) still runs when `PROCESS_MET=true`, then the pipeline exits cleanly.
 
 ## Files
 
@@ -96,9 +100,9 @@ docker build -f snowflake/Dockerfile -t tc-ecmwf-pipeline:latest . --platform=li
 ```
 
 This will:
-- Install all system dependencies (eccodes, geospatial libraries)
-- Install Python dependencies from `requirements.txt`
-- Copy all pipeline modules
+- Install all system dependencies (eccodes, geospatial libraries, HDF5/NetCDF for zarr)
+- Install Python dependencies from `requirements-ci.txt`
+- Copy all pipeline modules (including `ecmwf_met_downloader.py`)
 - Set up the container entrypoint
 
 ## Tagging the Image for Snowflake Registry
@@ -167,6 +171,8 @@ docker run --rm \
   -e SNOWFLAKE_WAREHOUSE='your_warehouse' \
   -e SNOWFLAKE_DATABASE='your_database' \
   -e SNOWFLAKE_SCHEMA='your_schema' \
+  -e SNOWFLAKE_STAGE_NAME='AOTS_ANALYSIS' \
+  -e PROCESS_MET=true \
   tc-ecmwf-pipeline:latest
 ```
 
@@ -197,6 +203,8 @@ EXECUTE JOB SERVICE
           MAX_WORKERS: 0
           MAX_CONCURRENT_DOWNLOADS: 8
           NAMED_STORMS_ONLY: true
+          PROCESS_MET: "true"
+          SNOWFLAKE_STAGE_NAME: "AOTS_ANALYSIS"
           DOWNLOAD_DATE: YYYYMMDD
           RUN_TIME: 00
      platformMonitor:
@@ -246,6 +254,17 @@ The `ecmwf-opendata` client downloads a **single combined BUFR4 file per forecas
 - **Format**: `true` or `false` (case-insensitive)
 - **Default**: `true`
 - **Description**: Enable/disable wind data download and processing
+
+#### `PROCESS_MET`
+- **Format**: `true` or `false` (case-insensitive)
+- **Default**: `true`
+- **Description**: Enable/disable met parameter download and Zarr upload. When `true`, runs even if no named storms are found.
+
+#### `SNOWFLAKE_STAGE_NAME`
+- **Format**: String (Snowflake internal stage name)
+- **Default**: not set
+- **Required**: Yes, when `PROCESS_MET=true` and `DATA_PIPELINE_DB=SNOWFLAKE`
+- **Description**: The Snowflake internal stage where met Zarr ZipStore files are uploaded (e.g. `AOTS_ANALYSIS`)
 
 #### `NAMED_STORMS_ONLY`
 - **Format**: `true` or `false` (case-insensitive)
@@ -317,10 +336,122 @@ Wind data download depends on TC data:
 ## Pipeline Phases
 
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
-2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`)
-3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED` to Snowflake
+2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`) — skipped if no named storms
+3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons — skipped if no named storms
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+5. **Phase 3c** *(optional)*: Download global GRIB files for `tp` (total precipitation) and `ro` (total runoff) → convert each to a Zarr ZipStore → PUT to Snowflake stage. Runs regardless of whether named storms were found.
+6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
+
+---
+
+## GloFAS Riverine Discharge (Standalone Pipeline)
+
+A fully separate pipeline from everything above, not a phase of the main TC
+pipeline, not triggered alongside it. GloFAS publishes once per calendar day
+(driven by the 00Z IFS ENS cycle) and a full global download takes far longer
+than the main pipeline's other steps, so it runs on its own schedule with its
+own image rather than as a step inside the main pipeline.
+
+**Entry point:** `snowflake/glofas_spcs_pipeline.py`. **Image:** built from
+`snowflake/Dockerfile.glofas`, a dedicated, leaner image (no eccodes, no system
+libgdal/geos/proj built from source; GloFAS never touches BUFR/GRIB/wind processing),
+using `requirements-glofas.txt` instead of `requirements-ci.txt`. It does include
+`rasterio` for the extent-masking step's GeoTIFF I/O, but rasterio's PyPI wheel
+bundles its own GDAL, so no system geospatial packages are needed. This is a
+genuinely separate Docker image from `tc-ecmwf-pipeline` above, the main image's
+`CMD` is hardcoded to `spcs_pipeline.py` and never copies any GloFAS files in, so it
+cannot run this pipeline.
+
+### Building and pushing the GloFAS image
+
+Same registry/tagging flow as the main image above, just a different Dockerfile and
+image name:
+
+```bash
+docker build -f snowflake/Dockerfile.glofas -t glofas-pipeline:latest . --platform=linux/amd64
+
+docker tag glofas-pipeline:latest \
+  orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/myservice/glofas-pipeline:latest
+
+snow spcs image-registry login --connection default
+docker push orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/myservice/glofas-pipeline:latest
+```
+
+### Running in SPCS
+
+```sql
+EXECUTE JOB SERVICE
+   IN COMPUTE POOL my_compute_pool
+   NAME = glofas_job
+   ASYNC = TRUE
+   EXTERNAL_ACCESS_INTEGRATIONS = (AOTS_EGRESS_ACCESS_INTEGRATION)
+   FROM SPECIFICATION $$
+   spec:
+     containers:
+     - name: glofas-pipeline
+       image: /your_database/your_schema/your_service/glofas-pipeline:latest
+       env:
+          SPCS_RUN: true
+          SNOWFLAKE_ACCOUNT: your-account
+          SNOWFLAKE_USER: your_user
+          SNOWFLAKE_WAREHOUSE: your_warehouse
+          SNOWFLAKE_DATABASE: your_database
+          SNOWFLAKE_SCHEMA: your_schema
+          SNOWFLAKE_STAGE_NAME: "AOTS_ANALYSIS"
+          DATA_PIPELINE_DB: "SNOWFLAKE"
+          GLOFAS_THRESHOLD_SOURCE: "snowflake"
+          GLOFAS_EXTENT_ENABLED: "true"
+          GLOFAS_JRC_SOURCE: "snowflake"
+          GLOFAS_MODE: "process"
+          CDSAPI_URL: "https://ewds.climate.copernicus.eu/api"
+          CDSAPI_KEY: "your_ewds_api_key"
+     platformMonitor:
+       metricConfig:
+         groups:
+         - system
+         - network
+   $$;
+```
+
+**CDS idle-wait-time cost fix — submit/process split:** schedule via **two**
+Snowflake TASKs calling this `EXECUTE JOB SERVICE`, not one: one with `GLOFAS_MODE: "submit"`
+at the original once-daily time (past GloFAS's ~11h publication latency, e.g.
+12-13 UTC), and a second with `GLOFAS_MODE: "process"` `CDS_PROCESS_DELAY_MINUTES` later
+(currently 40 min, see `glofas_downloader.py`). `submit` fires the 2 real CDS requests and exits
+in seconds, saving the returned request IDs to a new `GLOFAS_CDS_REQUESTS` table; `process`
+resumes those requests (patient wait-then-download, same behavior the original single-step flow
+always had), falling back to a fresh submit-and-block if nothing was saved. This is what makes
+`GLOFAS_MODE` default to `process` and safe to omit entirely for a deployment that only wants
+one task, at the cost of not benefiting from the split. 
+
+**Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
+(manually, not part of any recurring job) to populate
+`@{stage}/glofas/thresholds_cache/rl_*.nc`. The sparse cell filter depends on
+these being present and will fail without them (unless `GLOFAS_THRESHOLD_SOURCE=local`
+with a pre-populated local directory instead).
+
+Extent masking (GloFAS x JRC v2.1 flood-extent, enabled by default via
+`GLOFAS_EXTENT_ENABLED`) additionally requires `setup_jrc_extents.py` to have been
+run once already (manually) to populate `@{stage}/glofas/jrc_extent_cache/v2_1/*.tif`, 
+a plain script with no credentials of its own, it fetches directly from JRC's own
+file server (unless `GLOFAS_JRC_SOURCE=local` with a pre-populated local directory
+instead).
+
+**Snowflake table:** `RIVER_FORECASTS` — same staging+MERGE pattern as the main
+pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`. Shared by both products:
+raw discharge rows use `PARAM='dis24'`; per-member flood-extent rows use
+`PARAM='extent_rp{2,5,10,20,50,100}_bymember'` plus an `IS_STANDIN` column (true only
+for the RP2/RP5 stand-in tiers, which reuse RP10's own extent , JRC has no native map
+below RP10). Each `_bymember` row points at a Parquet file (not a GeoTIFF), a sparse
+table, one row per pixel/member/step actually flooded for that member, not a blended
+probability across all 51 members.
+
+**Snowflake table (submit/process split):** `GLOFAS_CDS_REQUESTS`: key
+`(FORECAST_DATE, PRODUCT_TYPE)`, columns `REQUEST_ID`, `SUBMITTED_AT`. Written by the
+`submit` task, read by the `process` task (`save_cds_request_ids()`/`load_cds_request_ids()`
+in `snowflake_loader.py`). Not consumed downstream of this pipeline, purely an
+internal handoff between the two tasks.
 
 ---
 

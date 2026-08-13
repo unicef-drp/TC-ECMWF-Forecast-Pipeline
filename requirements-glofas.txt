@@ -1,0 +1,31 @@
+# Standalone GloFAS pipeline dependencies (CI/SPCS) — separate from requirements-ci.txt
+# on purpose: the GloFAS pipeline (glofas_downloader.py, glofas_pipeline_core.py,
+# github_actions/glofas_pipeline.py, snowflake/glofas_spcs_pipeline.py,
+# setup_glofas_thresholds.py) never touches BUFR/GRIB/wind/geospatial processing, so it
+# doesn't need eccodes, shapely, cfgrib, or matplotlib — installing the main pipeline's
+# requirements-ci.txt here would pull in heavy, unused packages (and vice versa, adding
+# GloFAS's needs to requirements-ci.txt would bloat the main pipeline's installs).
+
+# CDS/EWDS API access (cems-glofas-forecast) — a different API from ecmwf-opendata
+cdsapi>=0.7.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.28.0
+xarray>=2023.1.0
+netCDF4>=1.6.0     # xarray's NetCDF backend — required to open both the raw GloFAS
+                   # ensemble/control downloads and the RP threshold files (data_format=netcdf)
+
+# Sparse Zarr ZipStore storage
+zarr>=3.0.0
+numcodecs>=0.14.0  # zarr 3.x requires >=0.14; older versions cause CompatibilityError
+blosc2>=2.0.0      # required by zarr BloscCodec at write time (not in zarr's own deps)
+
+# Snowflake (threshold stage GET/PUT, forecast Zarr upload, RIVER_FORECASTS load)
+snowflake-connector-python[pandas]>=3.0.0
+cryptography>=41.0.0  # private-key auth (SPCS entry point)
+
+# GloFAS x JRC extent-masking (glofas_extent_masking.py) 
+rasterio>=1.3.0
+pyarrow>=14.0.0

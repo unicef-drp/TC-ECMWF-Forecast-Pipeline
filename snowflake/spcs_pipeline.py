@@ -44,14 +44,18 @@ from pipeline_core import (
     BasePipelineConfig,
     PipelineStats as _BasePipelineStats,
     extract_tc_data_info,
+    extract_tc_data_info_from_bufr,
     step1_download,
     step2_extract,
     step3_transform,
     step4_download_wind,
+    step4b_download_gust,
     step5_process_wind,
+    step5b_extract_gust_envelopes,
+    step6_download_precip,
     cleanup_files,
 )
-from snowflake.snowflake_loader import get_snowflake_connection, load_csv_to_snowflake
+from snowflake.snowflake_loader import get_snowflake_connection, load_csv_to_snowflake, load_precip_metadata_to_snowflake
 
 # Configure logging
 logging.basicConfig(
@@ -74,10 +78,9 @@ class PipelineConfig(BasePipelineConfig):
 
     def __init__(self):
         super().__init__()
-
-        # SPCS-specific directory default (differs from github_actions default)
-        if not os.getenv('TRANSFORMED_DATA_DIR'):
-            self.transformed_data_dir = Path('tc_transformed')
+        # transformed_data_dir already defaults to 'tc_data_transformed' via
+        # BasePipelineConfig.__init__ (same as github_actions), and already
+        # respects an explicit TRANSFORMED_DATA_DIR override
 
         # Extended Snowflake auth options
         self.sf_private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
@@ -118,6 +121,12 @@ class PipelineConfig(BasePipelineConfig):
             if not Path(self.spcs_token_path).is_file():
                 logger.error(f"SPCS token file not found: {self.spcs_token_path}")
                 return False
+            if not os.getenv('SNOWFLAKE_HOST'):
+                logger.error("Missing required environment variable for SPCS mode: SNOWFLAKE_HOST")
+                return False
+            if not os.getenv('SNOWFLAKE_PORT'):
+                logger.error("Missing required environment variable for SPCS mode: SNOWFLAKE_PORT")
+                return False
         else:
             if not self.sf_user:
                 logger.error("Missing required environment variable: SNOWFLAKE_USER")
@@ -128,6 +137,13 @@ class PipelineConfig(BasePipelineConfig):
             if self.sf_private_key_path and not Path(self.sf_private_key_path).is_file():
                 logger.error(f"Private key file not found: {self.sf_private_key_path}")
                 return False
+
+        if self.process_met and not self.snowflake_stage_name:
+            logger.error(
+                "SNOWFLAKE_STAGE_NAME is required when PROCESS_MET=true and "
+                "DATA_PIPELINE_DB=SNOWFLAKE. Add it to the SPCS service spec."
+            )
+            return False
 
         return self._validate_run_time()
 
@@ -182,9 +198,40 @@ class PipelineStats(_BasePipelineStats):
 # Pipeline phases
 # ---------------------------------------------------------------------------
 
+def _open_snowflake_conn(config: PipelineConfig):
+    """Open a Snowflake connection using the auth mode active in config."""
+    os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+    os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
+    os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+    os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+    os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+
+    if config.spcs_run:
+        os.environ['SPCS_RUN'] = 'true'
+        os.environ['SPCS_TOKEN_PATH'] = config.spcs_token_path
+        for key in ('SNOWFLAKE_PASSWORD', 'SNOWFLAKE_PRIVATE_KEY_PATH',
+                    'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
+            os.environ.pop(key, None)
+        logger.info("Connecting with SPCS OAuth authentication")
+    elif config.sf_private_key_path:
+        os.environ['SNOWFLAKE_PRIVATE_KEY_PATH'] = config.sf_private_key_path
+        if config.sf_private_key_passphrase:
+            os.environ['SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'] = config.sf_private_key_passphrase
+        os.environ.pop('SNOWFLAKE_PASSWORD', None)
+        logger.info(f"Connecting with private key: {config.sf_private_key_path}")
+    else:
+        os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+        for key in ('SNOWFLAKE_PRIVATE_KEY_PATH', 'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
+            os.environ.pop(key, None)
+        logger.info("Connecting with password authentication")
+
+    return get_snowflake_connection()
+
+
 def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                               transformed_files: List[Path],
-                              envelope_files: List[Path]):
+                              envelope_files: List[Path],
+                              precip_metadata: list = None):
     """Phase 4: Load all results to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
     logger.info("=" * 70)
     logger.info("PHASE 4: SNOWFLAKE LOADING")
@@ -195,6 +242,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        logger.info(f"  Met ZipStores      : {config.met_data_dir}")
         stats.files_loaded = len(transformed_files) + len(envelope_files)
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -203,39 +251,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         return
 
     try:
-        os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
-        os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
-        os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
-        os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
-        os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
-
-        if config.spcs_run:
-            os.environ['SPCS_RUN'] = 'true'
-            os.environ['SPCS_TOKEN_PATH'] = config.spcs_token_path
-            for key in ('SNOWFLAKE_PASSWORD', 'SNOWFLAKE_PRIVATE_KEY_PATH',
-                        'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
-                os.environ.pop(key, None)
-            logger.info("Connecting with SPCS OAuth authentication")
-        elif config.sf_private_key_path:
-            os.environ['SNOWFLAKE_PRIVATE_KEY_PATH'] = config.sf_private_key_path
-            if config.sf_private_key_passphrase:
-                os.environ['SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'] = config.sf_private_key_passphrase
-            os.environ.pop('SNOWFLAKE_PASSWORD', None)
-            logger.info(f"Connecting with private key: {config.sf_private_key_path}")
-        else:
-            os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
-            for key in ('SNOWFLAKE_PRIVATE_KEY_PATH', 'SNOWFLAKE_PRIVATE_KEY_PASSPHRASE'):
-                os.environ.pop(key, None)
-            logger.info("Connecting with password authentication")
-
-        conn = get_snowflake_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(f"USE WAREHOUSE {config.sf_warehouse}")
-            cursor.execute(f"USE DATABASE {config.sf_database}")
-            cursor.execute(f"USE SCHEMA {config.sf_schema}")
-        finally:
-            cursor.close()
+        conn = _open_snowflake_conn(config)
 
         def _set_context():
             c = conn.cursor()
@@ -247,38 +263,90 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 c.close()
 
         try:
+            _set_context()  # initial context — inside try/finally: conn.close()
             total_rows = 0
+
+            def _load_and_track(csv_file, table_type):
+                """load_csv_to_snowflake wrapper that tells a real failure
+                (None) apart from a legitimate empty file (0), a None means
+                the load itself broke and must be recorded as a real error,
+                not silently treated as zero rows loaded."""
+                nonlocal total_rows
+                rows = load_csv_to_snowflake(csv_file, conn, table_type=table_type)
+                if rows is None:
+                    error_msg = f"Failed to load {csv_file.name} into {table_type} — see error above"
+                    logger.error(error_msg)
+                    stats.errors.append(error_msg)
+                    return
+                total_rows += rows
+
             for csv_file in transformed_files:
                 _set_context()
-                total_rows += load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS')
+                _load_and_track(csv_file, 'TC_TRACKS')
 
             for csv_file in envelope_files:
                 _set_context()
-                if 'individual' in csv_file.name:
+                if 'gust_envelopes_individual' in csv_file.name:
+                    table_type = 'TC_GUST_ENVELOPES_INDIVIDUAL'
+                elif 'gust_envelopes_combined' in csv_file.name:
+                    table_type = 'TC_GUST_ENVELOPES_COMBINED'
+                elif 'individual' in csv_file.name:
                     table_type = 'TC_ENVELOPES_INDIVIDUAL'
                 elif 'combined' in csv_file.name:
                     table_type = 'TC_ENVELOPES_COMBINED'
                 else:
                     logger.warning(f"Unknown envelope file type: {csv_file.name}")
                     continue
-                total_rows += load_csv_to_snowflake(csv_file, conn, table_type=table_type)
+                _load_and_track(csv_file, table_type)
+
+            if precip_metadata:
+                _set_context()
+                total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
+
+            def _safe_table_count(cursor, table_name):
+                """COUNT(*) for a diagnostic-only summary log line. Returns
+                None (logged as 'unavailable') instead of raising on failure,
+                this is a visibility check for the newer gust/precip
+                tables, not load-bearing: a failure here (missing table,
+                transient permission/network issue) must never fail the
+                whole run or mask the wind/track data that already loaded
+                and committed successfully earlier in this function."""
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    return cursor.fetchone()[0]
+                except Exception as e:
+                    logger.warning(f"Could not read diagnostic count for {table_name}: {e}")
+                    return None
+
+            def _fmt_count(n):
+                return f"{n:,}" if n is not None else "unavailable"
 
             cursor = conn.cursor()
             try:
                 _set_context()
+                # TC_TRACKS/TC_ENVELOPES_* are the already-proven core wind
+                # path, a failure reading their own counts stays a hard
+                # error (matches this block's original behavior). Only the
+                # newer gust/precip tables get the fault-tolerant treatment.
                 cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
                 tracks_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_INDIVIDUAL")
                 individual_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
                 combined_count = cursor.fetchone()[0]
+                gust_individual_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_INDIVIDUAL")
+                gust_combined_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_COMBINED")
+                met_count = _safe_table_count(cursor, "MET_FORECASTS")
             finally:
                 cursor.close()
 
             logger.info("Total records in database:")
-            logger.info(f"  TC_TRACKS:                {tracks_count:,}")
-            logger.info(f"  TC_ENVELOPES_INDIVIDUAL:  {individual_count:,}")
-            logger.info(f"  TC_ENVELOPES_COMBINED:    {combined_count:,}")
+            logger.info(f"  TC_TRACKS:                     {tracks_count:,}")
+            logger.info(f"  TC_ENVELOPES_INDIVIDUAL:       {individual_count:,}")
+            logger.info(f"  TC_ENVELOPES_COMBINED:         {combined_count:,}")
+            logger.info(f"  TC_GUST_ENVELOPES_INDIVIDUAL:  {_fmt_count(gust_individual_count)}")
+            logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {_fmt_count(gust_combined_count)}")
+            logger.info(f"  MET_FORECASTS:                 {_fmt_count(met_count)}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -348,8 +416,26 @@ def main():
 
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
-            logger.warning("No per-storm CSVs extracted. Exiting.")
-            sys.exit(0)
+            logger.warning("No named storms found in BUFR data — skipping wind processing.")
+            if config.process_met:
+                logger.info("PROCESS_MET=true — running met download anyway.")
+                tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
+                _precip_conn = None
+                if config.data_pipeline_db == 'SNOWFLAKE':
+                    _precip_conn = _open_snowflake_conn(config)
+                try:
+                    precip_metadata = step6_download_precip(
+                        config, stats, tc_data_info,
+                        snowflake_conn=_precip_conn,
+                        max_workers=config.max_concurrent_downloads,
+                    )
+                finally:
+                    if _precip_conn:
+                        _precip_conn.close()
+                phase4_snowflake_loading(config, stats, [], [], precip_metadata)
+                cleanup_files(config)
+            stats.log_summary()
+            sys.exit(1 if stats.errors else 0)
 
         tc_data_info = extract_tc_data_info(csv_files)
         stats.log_phase_time("Phase 1: Download & Extract", (datetime.now() - phase_start).total_seconds())
@@ -365,14 +451,33 @@ def main():
         phase_start = datetime.now()
         step4_download_wind(config, stats, tc_data_info,
                             max_workers=config.max_concurrent_downloads)
+        step4b_download_gust(config, stats, tc_data_info,
+                             max_workers=config.max_concurrent_downloads)
         envelope_files = step5_process_wind(
             config, stats,
             use_process_pool=config.use_process_pool,
             max_workers=config.max_workers,
         )
-        stats.log_phase_time("Phase 3: Wind & Envelopes", (datetime.now() - phase_start).total_seconds())
+        gust_files = step5b_extract_gust_envelopes(config, stats)
 
-        phase4_snowflake_loading(config, stats, transformed_files, envelope_files)
+        # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
+        _precip_conn = None
+        if config.data_pipeline_db == 'SNOWFLAKE':
+            _precip_conn = _open_snowflake_conn(config)
+
+        try:
+            precip_metadata = step6_download_precip(
+                config, stats, tc_data_info,
+                snowflake_conn=_precip_conn,
+                max_workers=config.max_concurrent_downloads,
+            )
+        finally:
+            if _precip_conn:
+                _precip_conn.close()
+
+        stats.log_phase_time("Phase 3: Wind, Envelopes & Precip", (datetime.now() - phase_start).total_seconds())
+
+        phase4_snowflake_loading(config, stats, transformed_files, envelope_files + gust_files, precip_metadata)
 
         cleanup_files(config)
         stats.log_summary()

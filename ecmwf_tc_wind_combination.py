@@ -35,6 +35,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     get_bounding_box,
+    get_longitude_windows,
+    merge_contour_dicts,
     load_wind_data,
     load_wind_data_all_members,
     create_wind_threshold_contours,
@@ -197,16 +199,23 @@ def extract_wind_polygons_for_time_step(
     """
     try:
         # Load wind data for this member and region with optional index path
-        wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
-        
-        # Create contours for all thresholds
-        contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
-        
+        # one window in the common case, two when bbox straddles the
+        # antimeridian (see get_longitude_windows)
+        wind_regions = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
+
+        # Create contours per window, then merge (a single-window input
+        # merges to that one dict unchanged, see merge_contour_dicts)
+        sub_contours = [
+            create_wind_threshold_contours(region, WIND_THRESHOLDS, verbose=False)
+            for region in wind_regions
+        ]
+        contours = merge_contour_dicts(sub_contours)
+
         # Convert to WKT format
         wkt_polygons = {}
         for threshold, polygon in contours.items():
             wkt_polygons[threshold] = polygon_to_wkt(polygon)
-        
+
         return wkt_polygons
         
     except Exception as e:
@@ -214,27 +223,62 @@ def extract_wind_polygons_for_time_step(
         return {}
 
 
-def _extract_polygons_all_members(wind_data) -> Dict[int, Dict[int, Optional[str]]]:
+def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Optional[str]]]:
     """
-    Extract wind threshold polygons for every ensemble member from an already-loaded DataArray.
+    Extract wind threshold polygons for every ensemble member from one or
+    more already-loaded, already-windowed DataArrays.
 
     Args:
-        wind_data: xr.DataArray clipped to bbox, dims (number, lat, lon) for PF
-                   or (lat, lon) for CF.
+        wind_data_windows: List[xr.DataArray] from load_wind_data_all_members
+            — length 1 (bbox clipped exactly as before) for the overwhelming
+            majority of storms, length 2 only when the storm's bbox straddles
+            the antimeridian. Each has dims (number, lat, lon) for PF or
+            (lat, lon) for CF.
 
     Returns:
-        {grib_member_number: {threshold_kt: wkt_string_or_None}}
+        {grib_member_number: {threshold_kt: wkt_string_or_None}} — per-member
+        contours are extracted independently within each window, then
+        unioned across windows per member/threshold (a length-1 input list
+        is a verified no-op, producing exactly today's output).
     """
-    results = {}
-    if 'number' in wind_data.dims:
-        for grib_number in wind_data.number.values:
-            member_wind = wind_data.sel(number=grib_number)
-            contours = create_wind_threshold_contours(member_wind, WIND_THRESHOLDS, verbose=False)
-            results[int(grib_number)] = {kt: polygon_to_wkt(p) for kt, p in contours.items()}
-    else:
-        # CF file — single control member (maps to pipeline member 51, GRIB number 0)
-        contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
-        results[0] = {kt: polygon_to_wkt(p) for kt, p in contours.items()}
+    # per_window[i] = {grib_member_number: {threshold_kt: Polygon_or_None}}
+    per_window: List[Dict[int, Dict[int, Optional[object]]]] = []
+
+    for wind_data in wind_data_windows:
+        window_results: Dict[int, Dict[int, Optional[object]]] = {}
+        if 'number' in wind_data.dims:
+            for grib_number in wind_data.number.values:
+                member_wind = wind_data.sel(number=grib_number)
+                contours = create_wind_threshold_contours(member_wind, WIND_THRESHOLDS, verbose=False)
+                window_results[int(grib_number)] = contours
+        else:
+            # CF file — single control member (maps to pipeline member 51, GRIB number 0)
+            contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
+            window_results[0] = contours
+        per_window.append(window_results)
+
+    if len(per_window) == 1:
+        # No antimeridian split -- return polygons->wkt directly, identical
+        # to the original single-window behavior.
+        return {
+            member: {kt: polygon_to_wkt(p) for kt, p in contours.items()}
+            for member, contours in per_window[0].items()
+        }
+
+    # Merge across windows per member, per threshold
+    all_members = set()
+    for window_results in per_window:
+        all_members.update(window_results.keys())
+
+    results: Dict[int, Dict[int, Optional[str]]] = {}
+    for member in all_members:
+        member_contour_dicts = [
+            window_results[member] for window_results in per_window
+            if member in window_results
+        ]
+        merged_contours = merge_contour_dicts(member_contour_dicts)
+        results[member] = {kt: polygon_to_wkt(p) for kt, p in merged_contours.items()}
+
     return results
 
 
@@ -289,7 +333,11 @@ def combine_polygons_across_forecast_steps(envelope_records: List[Dict]) -> List
             try:
                 # Combine all polygons using unary_union
                 combined_polygon = unary_union(data['polygons'])
-                
+                # unary_union can return GEOMETRYCOLLECTION when inputs share edges;
+                # buffer(0) normalises it back to a (Multi)Polygon
+                if combined_polygon.geom_type not in ('Polygon', 'MultiPolygon'):
+                    combined_polygon = combined_polygon.buffer(0)
+
                 # Convert back to WKT
                 combined_wkt = polygon_to_wkt(combined_polygon)
                 
@@ -339,95 +387,112 @@ def find_wind_data_files(wind_data_dir: Path) -> List[Path]:
     return wind_files
 
 
-def _process_track_point_worker(args: Tuple) -> Tuple[List[Dict], str]:
+_pool_wind_files: List[Path] = []
+
+
+def _init_process_pool(wind_files: List[Path]) -> None:
+    """ProcessPoolExecutor initializer, stores wind_files in a per-process global."""
+    global _pool_wind_files
+    _pool_wind_files = wind_files
+
+
+def _process_lead_time_parallel(args: Tuple) -> Tuple[List[Dict], str]:
+    """Wrapper for parallel execution, reads wind_files from the process global."""
+    lead_time, rows_at_lead, has_forecast_time, bbox, storm_name, index_dir = args
+    return _process_lead_time_worker(
+        (lead_time, rows_at_lead, has_forecast_time, _pool_wind_files, bbox, storm_name, index_dir)
+    )
+
+
+def _process_lead_time_worker(args: Tuple) -> Tuple[List[Dict], str]:
     """
-    Worker function to process a single track point (wind file extraction) in parallel.
-    Must be top-level function for pickling.
-    
+    Worker function to process every ensemble member at a single lead time in
+    one call. Must be top-level function for pickling.
+
+    Loads the PF file (covers all 50 perturbed members) and the CF file
+    (control member) once each for this lead time, matching the sequential
+    path's one-GRIB-open-per-timestep design. The earlier per-track-point
+    worker submitted one task per (member, lead_time) pair and re-opened the
+    same PF/CF file once per member, doing roughly 25x more GRIB decompression
+    work than necessary, since one PF file already contains all 50 members.
+
     Args:
-        args: Tuple of (track_point_dict, wind_files, bbox, storm_name, index_dir)
-    
+        args: Tuple of (lead_time, rows_at_lead, has_forecast_time, wind_files,
+              bbox, storm_name, index_dir)
+
     Returns:
-        Tuple of (list of envelope records, log message)
+        Tuple of (list of envelope records for every member at this lead time,
+        log message)
     """
     import traceback
-    import pandas as pd
-    from pathlib import Path
-    from datetime import datetime
 
-    # Import required functions (in worker process)
-    from ecmwf_wind_data_extractor import (
-        load_wind_data,
-        create_wind_threshold_contours,
-        polygon_to_wkt,
-        WIND_THRESHOLDS
-    )
-    
-    track_point_dict, wind_files, bbox, storm_name, index_dir = args
-    
+    from ecmwf_wind_data_extractor import load_wind_data_all_members
+
+    lead_time, rows_at_lead, has_forecast_time, wind_files, bbox, storm_name, index_dir = args
+
     try:
-        valid_time = track_point_dict['valid_time']
-        lead_time = track_point_dict['lead_time']
-        ensemble_member = track_point_dict['ensemble_member']
-        forecast_time = track_point_dict.get('forecast_time')
-        
-        # Convert valid_time to datetime if needed
-        if isinstance(valid_time, pd.Timestamp):
-            valid_time = valid_time.to_pydatetime()
-        elif isinstance(valid_time, str):
-            valid_time = pd.to_datetime(valid_time).to_pydatetime()
+        sample = rows_at_lead[0]
+        valid_time = sample['valid_time']
+        forecast_time = sample.get('forecast_time') if has_forecast_time else None
 
-        # Resolve forecast_time, falling back to deriving it from valid_time and lead_time
-        if forecast_time is None:
-            forecast_time = valid_time - pd.Timedelta(hours=lead_time)
+        pf_file = _match_wind_file(forecast_time, lead_time, 1, wind_files)
+        cf_file = _match_wind_file(forecast_time, lead_time, 51, wind_files)
 
-        # Find matching wind file using the shared helper
-        wind_file = _match_wind_file(forecast_time, lead_time, ensemble_member, wind_files)
+        warnings = []
 
-        if wind_file is None:
-            if isinstance(forecast_time, pd.Timestamp):
-                forecast_time = forecast_time.to_pydatetime()
-            run_hour = f"{forecast_time.hour:02d}"
-            date_str = forecast_time.strftime('%Y-%m-%d')
-            type_tag = "_cf" if ensemble_member == 51 else "_pf"
-            expected_pattern = f"wind_ens_{date_str}_r{run_hour}_f{lead_time:03d}h_{type_tag}.grib2"
-            return [], f"No wind file found for {valid_time} (lead {lead_time}h) - looking for: {expected_pattern}"
-        
-        log_msg = f"Processing {valid_time} (lead {lead_time}h) - {wind_file.name}"
-        
-        # Extract wind polygons for this time step with storm-specific index directory
-        try:
-            # Load wind data for this member and region with optional index path
-            wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=index_dir)
-            
-            # Create contours for all thresholds
-            contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
-            
-            # Convert to WKT format
-            wkt_polygons = {}
-            for threshold, polygon in contours.items():
-                wkt_polygons[threshold] = polygon_to_wkt(polygon)
-        except Exception as e:
-            return [], f"Error extracting wind polygons for member {ensemble_member} at lead {lead_time}h: {e}\n{traceback.format_exc()}"
+        pf_results: Dict[int, Dict[int, Optional[str]]] = {}
+        if pf_file:
+            try:
+                pf_wind = load_wind_data_all_members(str(pf_file), bbox, indexpath=index_dir)
+                pf_results = _extract_polygons_all_members(pf_wind)
+            except Exception as e:
+                return [], f"Error loading PF wind at lead {lead_time}h: {e}\n{traceback.format_exc()}"
+        else:
+            warnings.append(f"No PF wind file for lead {lead_time}h")
 
-        # Create envelope records for this time step
+        cf_results: Dict[int, Dict[int, Optional[str]]] = {}
+        if cf_file:
+            try:
+                cf_wind = load_wind_data_all_members(str(cf_file), bbox, indexpath=index_dir)
+                cf_results = _extract_polygons_all_members(cf_wind)
+            except Exception as e:
+                return [], f"Error loading CF wind at lead {lead_time}h: {e}\n{traceback.format_exc()}"
+        else:
+            warnings.append(f"No CF wind file for lead {lead_time}h")
+
         envelope_records = []
-        for threshold, wkt_polygon in wkt_polygons.items():
-            if wkt_polygon is not None:
-                envelope_records.append({
-                    'forecast_time': track_point_dict['forecast_time'],
-                    'track_id': storm_name,
-                    'ensemble_member': ensemble_member,
-                    'valid_time': valid_time,
-                    'lead_time': lead_time,
-                    'wind_threshold': threshold,
-                    'envelope_region': wkt_polygon
-                })
-        
+        for row in rows_at_lead:
+            ensemble_member = row['ensemble_member']
+            row_forecast_time = row.get('forecast_time') if has_forecast_time else None
+            grib_number = 0 if ensemble_member == 51 else ensemble_member
+
+            wkt_polygons = (
+                cf_results.get(grib_number, {}) if ensemble_member == 51
+                else pf_results.get(grib_number, {})
+            )
+
+            if not wkt_polygons and ensemble_member == 51 and cf_file:
+                warnings.append(f"Member 51: no CF wind polygons at lead {lead_time}h")
+
+            for threshold, wkt_polygon in wkt_polygons.items():
+                if wkt_polygon is not None:
+                    envelope_records.append({
+                        'forecast_time': row_forecast_time,
+                        'track_id': storm_name,
+                        'ensemble_member': ensemble_member,
+                        'valid_time': row['valid_time'],
+                        'lead_time': lead_time,
+                        'wind_threshold': threshold,
+                        'envelope_region': wkt_polygon,
+                    })
+
+        log_msg = f"Processed lead {lead_time}h ({len(rows_at_lead)} members)"
+        if warnings:
+            log_msg += " | " + " | ".join(warnings)
         return envelope_records, log_msg
-        
+
     except Exception as e:
-        return [], f"Error processing track point: {e}\n{traceback.format_exc()}"
+        return [], f"Error processing lead time {lead_time}h: {e}\n{traceback.format_exc()}"
 
 
 def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> int:
@@ -476,13 +541,26 @@ def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> 
     if max_hour > 0:
         # Round up to next 6-hour interval
         rounded_hour = ((max_hour + 5) // 6) * 6
-        # Add 12-hour buffer for safety
-        recommended_hour = min(rounded_hour + 12, 144)
-        
+        # Add 12-hour buffer for safety, capped at 144h — this cap is a hard
+        # external data-availability limit, not a tunable knob: ECMWF only
+        # publishes 0.25deg operational ENS wind fields out to 144h, so no
+        # request beyond that would return real data anyway.
+        uncapped_hour = rounded_hour + 12
+        recommended_hour = min(uncapped_hour, 144)
+
         if verbose:
             logger.info(f"TC data analysis: max forecast hour needed = {max_hour}h")
             logger.info(f"Recommended wind forecast hours: 0 to {recommended_hour}h (every 6h)")
-        
+            if uncapped_hour > 144:
+                logger.warning(
+                    f"Track data needs wind coverage out to {uncapped_hour}h, but ECMWF's "
+                    f"0.25deg operational ENS wind fields are only published to 144h — wind "
+                    f"envelope coverage for this storm will have NO data for lead times "
+                    f"{150}h through {uncapped_hour}h (in 6h steps). This is a hard upstream "
+                    f"data-availability limit, not a bug; the storm's own track/position "
+                    f"forecast is unaffected, only wind-hazard coverage beyond 144h."
+                )
+
         return recommended_hour
     else:
         if verbose:
@@ -495,7 +573,7 @@ def process_wind_combination(
     wind_data_dir: Path,
     output_dir: Path,
     buffer_radius_km: int = 500,
-    max_ensemble_members: int = 3,
+    max_ensemble_members: int = None,
     verbose: bool = True,
     use_process_pool: bool = False,
     max_workers: int = 4
@@ -573,7 +651,7 @@ def process_wind_combination(
 
             # Limit ensemble members for faster processing — sort before slicing so
             # the slice is deterministic regardless of CSV row order
-            unique_members = sorted(tc_data['ensemble_member'].unique())[:max_ensemble_members]
+            unique_members = sorted(tc_data['ensemble_member'].unique())[:max_ensemble_members]  # None = all
             filtered_tc_data = tc_data[tc_data['ensemble_member'].isin(unique_members)]
 
             if verbose:
@@ -583,41 +661,47 @@ def process_wind_combination(
             index_dir = str(wind_data_dir / '.idx_cache' / storm_name)
             os.makedirs(index_dir, exist_ok=True)
 
-            # Process track points in parallel if enabled
+            # Process lead times in parallel if enabled. Batches by lead time
+            # (not by individual track point) so each worker opens the PF/CF
+            # GRIB file for that lead time exactly once and extracts every
+            # member from that single load, matching the sequential path's
+            # design instead of re-opening the same file once per member.
             if use_process_pool and len(filtered_tc_data) > 1:
-                logger.info(f"  Processing {len(filtered_tc_data)} track points in parallel with {max_workers} workers")
+                has_forecast_time = 'forecast_time' in filtered_tc_data.columns
+                all_rows = filtered_tc_data.to_dict('records')
+                unique_lead_times = sorted({r['lead_time'] for r in all_rows})
+                rows_by_lead = {
+                    lt: [r for r in all_rows if r['lead_time'] == lt]
+                    for lt in unique_lead_times
+                }
 
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    # Convert to records once — avoids iterrows DataFrame overhead
-                    has_forecast_time = 'forecast_time' in filtered_tc_data.columns
-                    track_point_args = [
-                        (
-                            {
-                                'valid_time': row['valid_time'],
-                                'lead_time': row['lead_time'],
-                                'ensemble_member': row['ensemble_member'],
-                                'forecast_time': row.get('forecast_time') if has_forecast_time else None,
-                            },
-                            wind_files, bbox, storm_name, index_dir,
-                        )
-                        for row in filtered_tc_data.to_dict('records')
+                logger.info(f"  Processing {len(unique_lead_times)} timestep(s) in parallel "
+                            f"with {max_workers} workers ({len(all_rows)} member-timesteps total)")
+
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    initializer=_init_process_pool,
+                    initargs=(wind_files,),
+                ) as executor:
+                    lead_time_args = [
+                        (lead_time, rows_by_lead[lead_time], has_forecast_time, bbox, storm_name, index_dir)
+                        for lead_time in unique_lead_times
                     ]
-                    
-                    # Submit all track points for processing
+
                     futures = {
-                        executor.submit(_process_track_point_worker, args): i
-                        for i, args in enumerate(track_point_args)
+                        executor.submit(_process_lead_time_parallel, args): lead_time
+                        for args, lead_time in zip(lead_time_args, unique_lead_times)
                     }
-                    
-                    # Collect results as they complete
+
                     for future in as_completed(futures):
+                        lead_time = futures[future]
                         try:
                             envelope_records, log_msg = future.result()
                             if log_msg and verbose:
                                 logger.info(f"    {log_msg}")
                             storm_envelope_records.extend(envelope_records)
                         except Exception as e:
-                            logger.warning(f"    Error processing track point: {e}")
+                            logger.warning(f"    Error processing lead time {lead_time}h: {e}")
             else:
                 # Sequential processing — timestep-first to open each GRIB file only once.
                 # Each _pf.grib2 file contains all 50 perturbed members; loading it once
@@ -730,9 +814,19 @@ def process_wind_combination(
 
                     combined_df.to_csv(combined_file, index=False)
 
-                    # Validate member count: warn if any threshold has fewer members than expected
+                    # Validate member count: warn if any threshold has fewer members than expected.
+                    # max_ensemble_members doubles as a processing cap AND the "expected" count here
+                    # — when it's None (no cap given), there's no real expected value to check against,
+                    # so this is a genuine, explicitly-logged skip rather than silently computing
+                    # expected=actual_members, which made the mismatch condition permanently False
+                    # while still looking like a real check ran.
                     actual_members = combined_df['ensemble_member'].nunique()
-                    if actual_members < max_ensemble_members:
+                    if max_ensemble_members is None:
+                        logger.info(
+                            f"  Member count for {storm_name}: {actual_members} "
+                            f"(no max_ensemble_members cap given, skipping mismatch check)"
+                        )
+                    elif actual_members < max_ensemble_members:
                         missing = max_ensemble_members - actual_members
                         logger.warning(
                             f"  Member count mismatch for {storm_name}: "
@@ -745,7 +839,7 @@ def process_wind_combination(
 
                     logger.info(f"✓ Successfully processed {storm_name}")
                     logger.info(f"  - Combined records: {len(combined_records)}")
-                    logger.info(f"  - Members in output: {actual_members}/{max_ensemble_members}")
+                    logger.info(f"  - Members in output: {actual_members}")
                     logger.info(f"  - Combined file: {combined_file.name}")
                 else:
                     logger.warning(f"  No combined polygons created for {storm_name}")
