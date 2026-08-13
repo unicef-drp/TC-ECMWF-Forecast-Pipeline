@@ -28,6 +28,8 @@ from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     create_wind_threshold_contours,
     get_bounding_box,
+    get_longitude_windows,
+    merge_contour_dicts,
     polygon_to_wkt,
 )
 from ecmwf_tc_wind_combination import find_tc_data_files, load_tc_track_data
@@ -55,19 +57,28 @@ GUST_THRESHOLDS_MS: Dict[int, float] = {
 _SKIP_STEP_ZERO = True
 
 
-def load_gust_data_all_members(grib_file: str, bbox: Dict) -> xr.DataArray:
+def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]:
     """
     Load 10fg (max wind gust) from a gust GRIB file and crop to bounding box.
 
-    For PF files the returned DataArray has a 'number' dimension (members 1-50).
-    For CF files there is no 'number' dimension.
+    For PF files each returned DataArray has a 'number' dimension (members
+    1-50). For CF files there is no 'number' dimension.
 
     Args:
         grib_file: Path to gust GRIB2 file
-        bbox: Bounding box dict with keys 'lat_min', 'lat_max', 'lon_min', 'lon_max'
+        bbox: Bounding box dict with keys 'lat_min', 'lat_max', 'lon_min',
+            'lon_max'. lon_min/lon_max may fall outside [-180, 180] (see
+            ecmwf_wind_data_extractor.get_bounding_box) — this function
+            slices the real GRIB longitude range once per real window
+            returned by get_longitude_windows(bbox).
 
     Returns:
-        Loaded, cropped DataArray for the 10fg field
+        List[xr.DataArray]: One loaded, cropped DataArray per real longitude
+            window — length 1 (bbox clipped exactly as before) for the
+            overwhelming majority of storms, length 2 only when bbox
+            straddles the antimeridian. Callers must extract contours once
+            per element and merge results (see merge_contour_dicts), never
+            concatenate these arrays directly.
     """
     ds = xr.open_dataset(
         grib_file,
@@ -85,13 +96,19 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> xr.DataArray:
             logger.debug(f"Expected gust var not found in {Path(grib_file).name}, using '{first_var}'")
             ds_var = ds[first_var]
 
-        # Crop to bounding box (latitude sliced high→low to match GRIB convention)
-        ds_var = ds_var.sel(
-            latitude=slice(bbox['lat_max'], bbox['lat_min']),
-            longitude=slice(bbox['lon_min'], bbox['lon_max']),
-        )
-        ds_var = ds_var.load()
-        return ds_var
+        # Crop to bounding box (latitude sliced high→low to match GRIB
+        # convention) — one real window in the common case, two when bbox
+        # straddles the antimeridian
+        windows = get_longitude_windows(bbox)
+        regions = []
+        for window in windows:
+            region = ds_var.sel(
+                latitude=slice(bbox['lat_max'], bbox['lat_min']),
+                longitude=slice(window['lon_min'], window['lon_max']),
+            )
+            region = region.load()
+            regions.append(region)
+        return regions
     finally:
         ds.close()
 
@@ -296,21 +313,22 @@ def process_gust_combination(
                 pf_file = _match_gust_file(lead_time, 'pf', gust_files)
                 cf_file = _match_gust_file(lead_time, 'cf', gust_files)
 
-                # Load PF gust DataArray (all members 1-50)
-                pf_da: Optional[xr.DataArray] = None
+                # Load PF gust DataArrays (all members 1-50) — one window in
+                # the common case, two when bbox straddles the antimeridian
+                pf_windows: List[xr.DataArray] = []
                 if pf_file:
                     try:
-                        pf_da = load_gust_data_all_members(pf_file, bbox)
+                        pf_windows = load_gust_data_all_members(pf_file, bbox)
                     except Exception as e:
                         logger.warning(f"    Error loading PF gust at lead {lead_time}h: {e}")
                 else:
                     logger.warning(f"    No PF gust file for lead {lead_time}h")
 
-                # Load CF gust DataArray (member 51)
-                cf_da: Optional[xr.DataArray] = None
+                # Load CF gust DataArrays (member 51)
+                cf_windows: List[xr.DataArray] = []
                 if cf_file:
                     try:
-                        cf_da = load_gust_data_all_members(cf_file, bbox)
+                        cf_windows = load_gust_data_all_members(cf_file, bbox)
                     except Exception as e:
                         logger.warning(f"    Error loading CF gust at lead {lead_time}h: {e}")
                 else:
@@ -323,30 +341,36 @@ def process_gust_combination(
                     valid_time = row['valid_time']
 
                     if ensemble_member == 51:
-                        # Control member — use CF DataArray directly (no 'number' dim)
-                        member_da = cf_da
+                        # Control member — use CF windows directly (no 'number' dim)
+                        member_da_windows = cf_windows
                     else:
-                        # Perturbed member 1-50 — select by GRIB number
-                        if pf_da is None:
+                        # Perturbed member 1-50 — select by GRIB number, from each window
+                        if not pf_windows:
                             continue
                         grib_number = ensemble_member  # grib member == pipeline member for PF
                         try:
-                            if 'number' in pf_da.dims:
-                                member_da = pf_da.sel(number=grib_number)
-                            else:
-                                # PF file decoded without number dim (single-member edge case)
-                                member_da = pf_da
+                            member_da_windows = [
+                                w.sel(number=grib_number) if 'number' in w.dims else w
+                                for w in pf_windows
+                            ]
                         except Exception as e:
                             logger.warning(
                                 f"    Error selecting member {ensemble_member} at lead {lead_time}h: {e}"
                             )
                             continue
 
-                    if member_da is None:
+                    if not member_da_windows:
                         continue
 
                     try:
-                        contours = create_wind_threshold_contours(member_da, GUST_THRESHOLDS_MS, unit_label='m/s')
+                        # Extract contours per window, then merge (a
+                        # single-window input merges to that one dict
+                        # unchanged — see merge_contour_dicts)
+                        sub_contours = [
+                            create_wind_threshold_contours(w, GUST_THRESHOLDS_MS, unit_label='m/s')
+                            for w in member_da_windows
+                        ]
+                        contours = merge_contour_dicts(sub_contours)
                     except Exception as e:
                         logger.warning(
                             f"    Error extracting gust contours for member {ensemble_member} "

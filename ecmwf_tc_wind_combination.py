@@ -35,6 +35,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     get_bounding_box,
+    get_longitude_windows,
+    merge_contour_dicts,
     load_wind_data,
     load_wind_data_all_members,
     create_wind_threshold_contours,
@@ -197,16 +199,23 @@ def extract_wind_polygons_for_time_step(
     """
     try:
         # Load wind data for this member and region with optional index path
-        wind_data = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
-        
-        # Create contours for all thresholds
-        contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
-        
+        # one window in the common case, two when bbox straddles the
+        # antimeridian (see get_longitude_windows)
+        wind_regions = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
+
+        # Create contours per window, then merge (a single-window input
+        # merges to that one dict unchanged, see merge_contour_dicts)
+        sub_contours = [
+            create_wind_threshold_contours(region, WIND_THRESHOLDS, verbose=False)
+            for region in wind_regions
+        ]
+        contours = merge_contour_dicts(sub_contours)
+
         # Convert to WKT format
         wkt_polygons = {}
         for threshold, polygon in contours.items():
             wkt_polygons[threshold] = polygon_to_wkt(polygon)
-        
+
         return wkt_polygons
         
     except Exception as e:
@@ -214,27 +223,62 @@ def extract_wind_polygons_for_time_step(
         return {}
 
 
-def _extract_polygons_all_members(wind_data) -> Dict[int, Dict[int, Optional[str]]]:
+def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Optional[str]]]:
     """
-    Extract wind threshold polygons for every ensemble member from an already-loaded DataArray.
+    Extract wind threshold polygons for every ensemble member from one or
+    more already-loaded, already-windowed DataArrays.
 
     Args:
-        wind_data: xr.DataArray clipped to bbox, dims (number, lat, lon) for PF
-                   or (lat, lon) for CF.
+        wind_data_windows: List[xr.DataArray] from load_wind_data_all_members
+            — length 1 (bbox clipped exactly as before) for the overwhelming
+            majority of storms, length 2 only when the storm's bbox straddles
+            the antimeridian. Each has dims (number, lat, lon) for PF or
+            (lat, lon) for CF.
 
     Returns:
-        {grib_member_number: {threshold_kt: wkt_string_or_None}}
+        {grib_member_number: {threshold_kt: wkt_string_or_None}} — per-member
+        contours are extracted independently within each window, then
+        unioned across windows per member/threshold (a length-1 input list
+        is a verified no-op, producing exactly today's output).
     """
-    results = {}
-    if 'number' in wind_data.dims:
-        for grib_number in wind_data.number.values:
-            member_wind = wind_data.sel(number=grib_number)
-            contours = create_wind_threshold_contours(member_wind, WIND_THRESHOLDS, verbose=False)
-            results[int(grib_number)] = {kt: polygon_to_wkt(p) for kt, p in contours.items()}
-    else:
-        # CF file — single control member (maps to pipeline member 51, GRIB number 0)
-        contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
-        results[0] = {kt: polygon_to_wkt(p) for kt, p in contours.items()}
+    # per_window[i] = {grib_member_number: {threshold_kt: Polygon_or_None}}
+    per_window: List[Dict[int, Dict[int, Optional[object]]]] = []
+
+    for wind_data in wind_data_windows:
+        window_results: Dict[int, Dict[int, Optional[object]]] = {}
+        if 'number' in wind_data.dims:
+            for grib_number in wind_data.number.values:
+                member_wind = wind_data.sel(number=grib_number)
+                contours = create_wind_threshold_contours(member_wind, WIND_THRESHOLDS, verbose=False)
+                window_results[int(grib_number)] = contours
+        else:
+            # CF file — single control member (maps to pipeline member 51, GRIB number 0)
+            contours = create_wind_threshold_contours(wind_data, WIND_THRESHOLDS, verbose=False)
+            window_results[0] = contours
+        per_window.append(window_results)
+
+    if len(per_window) == 1:
+        # No antimeridian split -- return polygons->wkt directly, identical
+        # to the original single-window behavior.
+        return {
+            member: {kt: polygon_to_wkt(p) for kt, p in contours.items()}
+            for member, contours in per_window[0].items()
+        }
+
+    # Merge across windows per member, per threshold
+    all_members = set()
+    for window_results in per_window:
+        all_members.update(window_results.keys())
+
+    results: Dict[int, Dict[int, Optional[str]]] = {}
+    for member in all_members:
+        member_contour_dicts = [
+            window_results[member] for window_results in per_window
+            if member in window_results
+        ]
+        merged_contours = merge_contour_dicts(member_contour_dicts)
+        results[member] = {kt: polygon_to_wkt(p) for kt, p in merged_contours.items()}
+
     return results
 
 
