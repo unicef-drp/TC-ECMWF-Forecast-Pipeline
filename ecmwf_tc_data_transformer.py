@@ -241,6 +241,27 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
     # -- a naive wrap would invert lon_min > lon_max and balloon the
     # rectangle to cover ~350deg of longitude instead of the intended
     # narrow band.
+    if lon_max > 180.0 and lon_min < -180.0:
+        # Both edges overflow at once,would require this single
+        # quadrant's combined wind radius to span more than 360 deg of
+        # longitude (over 20,000km), physically impossible for any real
+        # storm. Reaching this branch indicates a real data anomaly
+        # upstream (e.g. a unit-conversion bug feeding an absurd radius
+        # value) rather than a legitimate antimeridian crossing, the
+        # single-sided branch below only ever handles one edge, so
+        # silently taking it here would truncate the unhandled side's
+        # real extent with no error surfaced. Fail loudly instead,
+        # matching this function's own existing "invalid input -> None"
+        # convention above.
+        print(
+            f"  WARNING: wind_quadrant_polygon: lat={lat}, lon={lon} -- "
+            f"computed quadrant bounds overflow BOTH antimeridian edges "
+            f"(lon_min={lon_min:.2f}, lon_max={lon_max:.2f}), implying an "
+            f"implausible >360 deg-wide wind radius. Returning None rather "
+            f"than a silently truncated polygon."
+        )
+        return None
+
     if lon_max > 180.0 or lon_min < -180.0:
         try:
             if lon_max > 180.0:
@@ -332,6 +353,45 @@ def create_wind_field_polygons(forecasts_df: pd.DataFrame, wind_threshold: int =
     return df
 
 
+_ANTIMERIDIAN_EPS = 1e-7  # degrees; far below GRIB/track precision, zero real-world effect
+
+
+def _nudge_antimeridian_vertices(geom):
+    """
+    Shift any vertex sitting at or beyond exactly +180/-180 longitude
+    inward by a negligible epsilon.
+
+    wind_quadrant_polygon()'s own antimeridian branch (above) deliberately
+    constructs vertices at literal 180.0/-180.0 when splitting a
+    dateline-crossing quadrant rectangle into a MultiPolygon. That's valid
+    WKT and valid to shapely, but Snowflake's GEOGRAPHY parser rejects an
+    exact -180 (or +180) vertex outright ("Invalid Lng/Lat pair"), and the
+    real production loaders parse this table's WKT via
+    TRY_TO_GEOGRAPHY(...), which silently returns NULL on that rejection
+    rather than erroring -- so an unwrapped, un-nudged polygon here would
+    vanish from Snowflake with no error surfaced anywhere. This mirrors
+    the identical fix already applied to the separate wind/gust envelope
+    path's own polygon_to_wkt() in ecmwf_wind_data_extractor.py (kept as a
+    small local duplicate here rather than a cross-module import, since
+    this transform stage and that extraction stage are otherwise
+    independent pipeline steps).
+
+    shapely.ops.transform (shapely 2.x) calls its callback once per
+    coordinate *ring*, passing all of that ring's x values as a single
+    batched array/tuple, not scalar-per-call -- the nudge must be
+    vectorized.
+    """
+    from shapely.ops import transform
+
+    def _nudge(x, y, z=None):
+        x = np.asarray(x, dtype=float).copy()
+        x[x <= -180.0] = -180.0 + _ANTIMERIDIAN_EPS
+        x[x >= 180.0] = 180.0 - _ANTIMERIDIAN_EPS
+        return (x, y, z) if z is not None else (x, y)
+
+    return transform(_nudge, geom)
+
+
 def polygon_to_wkt(polygon) -> Optional[str]:
     """
     Convert Shapely polygon to WKT format for database storage.
@@ -347,6 +407,7 @@ def polygon_to_wkt(polygon) -> Optional[str]:
 
     try:
         if hasattr(polygon, 'wkt'):
+            polygon = _nudge_antimeridian_vertices(polygon)
             return polygon.wkt
         else:
             return None

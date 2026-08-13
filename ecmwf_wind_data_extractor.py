@@ -101,6 +101,84 @@ def _unwrap_track_longitudes(track_data: pd.DataFrame) -> pd.DataFrame:
     else:
         df = _unwrap_group(df)
 
+    return _reconcile_cross_member_longitudes(df)
+
+
+def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Second pass, after per-member unwrapping: reconcile a GROUP-level
+    antimeridian straddle that no single member's own trajectory exhibits.
+
+    _unwrap_track_longitudes above only fixes a jump within one member's
+    own time-ordered sequence. It is a correct no-op when, say, member A's
+    entire track sits at raw longitudes ~176-177.5 deg and member B's
+    entire track sits at ~-176 to -177.5 deg, neither member individually
+    crosses the seam, so per-member np.unwrap never fires for either, but
+    the true physical positions are only ~5 deg apart (both hugging the
+    dateline from opposite sides), while the raw combined min/max reads as
+    ~353 deg wide. That corrupted-looking bbox is real: it was reproduced
+    directly from this exact scenario during a real council review.
+
+    Uses the standard "largest circular gap" method: sort every point's
+    longitude, find the widest gap between consecutive values, including
+    the wraparound gap (from the highest value back to the lowest value
+    + 360). If the wraparound gap is itself the widest, the points are
+    genuinely not antimeridian-adjacent as a group, this is the ordinary
+    case (including the already-correct single-member NANGKA-style crossing
+    handled above, which per-member unwrap already leaves as one dense,
+    gap-free cluster) and this function is a verified no-op. If some other
+    gap is wider, the true cluster wraps through +/-180 at that gap
+    instead, so every value up to and including it gets shifted by +360 to
+    make the whole group numerically contiguous.
+
+    Sanity bound: only applies the shift if doing so actually produces a
+    plausibly-sized (<90 deg, matching this project's own established "no
+    real single-storm envelope is wider than this" convention used
+    elsewhere) reconciled cluster. A real council review found that,
+    without this bound, the largest-gap method would also fire on
+    genuinely scattered, non-antimeridian data whenever a group's total
+    spread happens to approach 360 deg, confirmed not reachable by any
+    real TC ensemble (tested clean against real, genuinely wide-spread
+    storms), but with no guard to distinguish that from a real upstream
+    data anomaly (e.g. a parsing bug placing one member on the wrong side
+    of the planet).
+    """
+    lons = df['longitude'].to_numpy(dtype=float)
+    if len(lons) < 2:
+        return df
+
+    sorted_lons = np.sort(np.unique(lons))
+    if len(sorted_lons) < 2:
+        return df
+
+    internal_gaps = np.diff(sorted_lons)
+    wrap_gap = (sorted_lons[0] + 360.0) - sorted_lons[-1]
+
+    widest_internal_idx = int(np.argmax(internal_gaps))
+    if internal_gaps[widest_internal_idx] <= wrap_gap:
+        # The wraparound gap is the widest (or tied) -- not antimeridian-
+        # adjacent as a group. No-op.
+        return df
+
+    cutoff = sorted_lons[widest_internal_idx]
+    shifted = np.where(lons <= cutoff, lons + 360.0, lons)
+    reconciled_span = float(shifted.max() - shifted.min())
+
+    _SANITY_MAX_SPAN_DEG = 90.0
+    if reconciled_span > _SANITY_MAX_SPAN_DEG:
+        logger.warning(
+            f"_reconcile_cross_member_longitudes: widest internal "
+            f"gap ({internal_gaps[widest_internal_idx]:.2f} deg) exceeds the "
+            f"wraparound gap ({wrap_gap:.2f} deg), but shifting would still "
+            f"leave a {reconciled_span:.2f} deg-wide cluster -- too wide to "
+            f"plausibly be a real antimeridian-hugging storm ensemble. "
+            f"Leaving longitudes unchanged rather than risk mis-reprojecting "
+            f"genuinely scattered/anomalous data."
+        )
+        return df
+
+    df = df.copy()
+    df['longitude'] = shifted
     return df
 
 
@@ -180,6 +258,23 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
     together cover the same real span: the part already inside
     [-180, 180], and the overflowing part shifted back by 360 degrees into
     its real native-range position on the other side of the antimeridian.
+
+    Handles both edges overflowing at once (e.g. lon_min=-184, lon_max=184)
+    by returning the FULL native range as a single window, not two
+    partial slivers. This is mathematically forced, not a judgment call:
+    lon_max > 180 and lon_min < -180 together guarantee lon_max - lon_min
+    > 360, and since longitude is periodic with period 360, any request
+    spanning more than a full circle covers every native value at least
+    once -- the correct window really is the whole globe. An earlier
+    version of this function got this backwards (returned two ~4deg-wide
+    slivers, silently dropping ~96% of the real requested area with no
+    error) -- caught by a real council review that reproduced it directly
+    against the real code. Reaching this branch at all should be rare in
+    practice once the caller's own bbox has been through
+    _reconcile_cross_member_longitudes() first (which keeps a real
+    storm's reconciled span well under 360 -- confirmed via a real,
+    realistic-scale reproduction), so hitting it is itself a signal of an
+    anomalously wide upstream input, not a normal antimeridian case.
     """
     lon_min = bbox['lon_min']
     lon_max = bbox['lon_max']
@@ -187,11 +282,24 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
     if lon_min >= -180.0 and lon_max <= 180.0:
         return [dict(bbox)]
 
+    overflow_east = lon_max > 180.0
+    overflow_west = lon_min < -180.0
+
+    if overflow_east and overflow_west:
+        logger.warning(
+            f"get_longitude_windows: bbox spans >360 deg "
+            f"(lon_min={lon_min:.2f}, lon_max={lon_max:.2f}, "
+            f"width={lon_max - lon_min:.2f}) -- returning the full native "
+            f"longitude range as a single window. This indicates an "
+            f"anomalously wide upstream input, not a normal antimeridian case."
+        )
+        return [{**bbox, 'lon_min': -180.0, 'lon_max': 180.0}]
+
     windows = []
-    if lon_max > 180.0:
+    if overflow_east:
         windows.append({**bbox, 'lon_min': max(lon_min, -180.0), 'lon_max': 180.0})
         windows.append({**bbox, 'lon_min': -180.0, 'lon_max': lon_max - 360.0})
-    elif lon_min < -180.0:
+    elif overflow_west:
         windows.append({**bbox, 'lon_min': lon_min + 360.0, 'lon_max': 180.0})
         windows.append({**bbox, 'lon_min': -180.0, 'lon_max': min(lon_max, 180.0)})
 
@@ -483,6 +591,45 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
     return contour_polygons
 
 
+_ANTIMERIDIAN_EPS = 1e-7  # degrees; far below GRIB grid spacing (0.25 deg), zero real-world effect
+
+
+def _nudge_antimeridian_vertices(geom):
+    """
+    Shift any vertex sitting at exactly +180 or -180 longitude inward by a
+    negligible epsilon.
+
+    A window from get_longitude_windows() can legitimately end at exactly
+    -180.0 (a real native GRIB grid coordinate, not an artifact), and
+    contour tracing can place a real vertex there. Snowflake's GEOGRAPHY
+    parser rejects that exact value outright ("Invalid Lng/Lat pair:
+    '-180,...'"), even though it's valid WKT and valid to shapely. Nudging
+    by 1e-7 degrees (~1cm) has no real-world effect and avoids the
+    rejection at storage time. A no-op for the overwhelming majority of
+    polygons, which never touch the antimeridian at all.
+
+    shapely.ops.transform (shapely 2.x) calls its callback once per
+    coordinate *ring*, passing all of that ring's x values (and y, and
+    optionally z) as a single batched array/tuple, not scalar-per-call —
+    the nudge must be vectorized, not a plain Python `if x == 180.0`.
+    """
+    from shapely.ops import transform
+
+    def _nudge(x, y, z=None):
+        x = np.asarray(x, dtype=float).copy()
+        # Clamp, not exact-match: upstream window/buffer arithmetic can
+        # overshoot the boundary by float noise (e.g. -180.00000000000003,
+        # seen in real NANGKA data) which is itself already out of the
+        # valid [-180, 180] range and would also fail Snowflake's parser
+        # an exact == -180.0 check misses that. Anything at or past the
+        # boundary gets pulled back in.
+        x[x <= -180.0] = -180.0 + _ANTIMERIDIAN_EPS
+        x[x >= 180.0] = 180.0 - _ANTIMERIDIAN_EPS
+        return (x, y, z) if z is not None else (x, y)
+
+    return transform(_nudge, geom)
+
+
 def polygon_to_wkt(polygon: Optional[Polygon]) -> Optional[str]:
     """
     Convert Shapely polygon to WKT format.
@@ -497,6 +644,7 @@ def polygon_to_wkt(polygon: Optional[Polygon]) -> Optional[str]:
         return None
 
     try:
+        polygon = _nudge_antimeridian_vertices(polygon)
         return polygon.wkt
     except Exception as e:
         logger.warning(f"Could not convert polygon to WKT: {e}")
