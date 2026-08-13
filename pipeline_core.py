@@ -73,6 +73,13 @@ class BasePipelineConfig:
         self.named_storms_only = os.getenv('NAMED_STORMS_ONLY', 'true').lower() == 'true'
         self.max_ensemble_members = 51  # Fixed: 50 perturbed + 1 control
 
+        # Gust processing — independent of process_wind_data (a run can process
+        # wind without gust, e.g. the existing production workflow while gust
+        # is still being verified on the side; see step4b_download_gust/
+        # step5b_extract_gust_envelopes, both of which still also require
+        # process_wind_data since gust extraction reuses the same TC track data).
+        self.process_gust = os.getenv('PROCESS_GUST', 'true').lower() == 'true'
+
         # Gridded ENS parameter downloads (tp, ro, and future params)
         self.met_data_dir = Path(os.getenv('MET_DATA_DIR', 'met_data'))
         self.process_met = os.getenv('PROCESS_MET', 'true').lower() == 'true'
@@ -450,6 +457,9 @@ def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
     if not config.process_wind_data:
         logger.info("Wind data processing disabled — skipping gust download")
         return []
+    if not config.process_gust:
+        logger.info("PROCESS_GUST=false — skipping gust download")
+        return []
     logger.info("=" * 70)
     logger.info("STEP 4b: Downloading gust forecast data (10fg)...")
     logger.info("=" * 70)
@@ -539,6 +549,9 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
     """Step 5b: Extract gust envelope polygons from 10fg GRIB files."""
     if not config.process_wind_data:
         logger.info("Wind data processing disabled — skipping gust envelope extraction")
+        return []
+    if not config.process_gust:
+        logger.info("PROCESS_GUST=false — skipping gust envelope extraction")
         return []
     logger.info("=" * 70)
     logger.info("STEP 5b: Extracting gust envelopes from 10fg GRIB files...")

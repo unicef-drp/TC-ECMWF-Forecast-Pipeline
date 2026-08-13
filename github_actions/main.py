@@ -79,8 +79,22 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
         try:
             total_rows = 0
 
+            def _load_and_track(csv_file, table_type):
+                """load_csv_to_snowflake wrapper that tells a real failure
+                (None) apart from a legitimate empty file (0) — a None means
+                the load itself broke and must be recorded as a real error,
+                not silently treated as zero rows loaded."""
+                nonlocal total_rows
+                rows = load_csv_to_snowflake(csv_file, conn, table_type=table_type)
+                if rows is None:
+                    error_msg = f"Failed to load {csv_file.name} into {table_type} — see error above"
+                    logger.error(error_msg)
+                    stats.errors.append(error_msg)
+                    return
+                total_rows += rows
+
             for csv_file in transformed_files:
-                total_rows += load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS')
+                _load_and_track(csv_file, 'TC_TRACKS')
 
             for csv_file in envelope_files:
                 if 'gust_envelopes_individual' in csv_file.name:
@@ -94,25 +108,44 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                 else:
                     logger.warning(f"Unknown envelope file type: {csv_file.name}")
                     continue
-                total_rows += load_csv_to_snowflake(csv_file, conn, table_type=table_type)
+                _load_and_track(csv_file, table_type)
 
             if precip_metadata:
                 total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
 
+            def _safe_table_count(cursor, table_name):
+                """COUNT(*) for a diagnostic-only summary log line. Returns
+                None (logged as 'unavailable') instead of raising on failure:
+                this is a visibility check for the newer gust/precip
+                tables, not load-bearing: a failure here (missing table,
+                transient permission/network issue) must never fail the
+                whole run or mask the wind/track data that already loaded
+                and committed successfully earlier in step7_load."""
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    return cursor.fetchone()[0]
+                except Exception as e:
+                    logger.warning(f"Could not read diagnostic count for {table_name}: {e}")
+                    return None
+
+            def _fmt_count(n):
+                return f"{n:,}" if n is not None else "unavailable"
+
             cursor = conn.cursor()
             try:
+                # TC_TRACKS/TC_ENVELOPES_* are the already-proven core wind
+                # path, a failure reading their own counts stays a hard
+                # error (matches this block's original behavior). Only the
+                # newer gust/precip tables get the fault-tolerant treatment.
                 cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
                 tracks_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_INDIVIDUAL")
                 individual_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM TC_ENVELOPES_COMBINED")
                 combined_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM TC_GUST_ENVELOPES_INDIVIDUAL")
-                gust_individual_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM TC_GUST_ENVELOPES_COMBINED")
-                gust_combined_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM MET_FORECASTS")
-                met_count = cursor.fetchone()[0]
+                gust_individual_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_INDIVIDUAL")
+                gust_combined_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_COMBINED")
+                met_count = _safe_table_count(cursor, "MET_FORECASTS")
             finally:
                 cursor.close()
 
@@ -120,9 +153,9 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             logger.info(f"  TC_TRACKS:                     {tracks_count:,}")
             logger.info(f"  TC_ENVELOPES_INDIVIDUAL:       {individual_count:,}")
             logger.info(f"  TC_ENVELOPES_COMBINED:         {combined_count:,}")
-            logger.info(f"  TC_GUST_ENVELOPES_INDIVIDUAL:  {gust_individual_count:,}")
-            logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {gust_combined_count:,}")
-            logger.info(f"  MET_FORECASTS:                 {met_count:,}")
+            logger.info(f"  TC_GUST_ENVELOPES_INDIVIDUAL:  {_fmt_count(gust_individual_count)}")
+            logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {_fmt_count(gust_combined_count)}")
+            logger.info(f"  MET_FORECASTS:                 {_fmt_count(met_count)}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files)
             stats.rows_loaded = total_rows
@@ -162,6 +195,8 @@ def main():
     )
     logger.info(f"Snowflake: {config.sf_database}.{config.sf_schema}")
     logger.info(f"Wind processing: {config.process_wind_data}")
+    logger.info(f"Gust processing: {config.process_gust}")
+    logger.info(f"Met (precip/runoff) processing: {config.process_met}")
     if config.download_date:
         logger.info(f"Download date: {config.download_date} {config.run_time or 'any'}Z")
     else:

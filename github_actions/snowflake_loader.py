@@ -117,6 +117,14 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     'TC_GUST_ENVELOPES_COMBINED')
         use_staging: If True, use staging table + MERGE (handles duplicates)
                      If False, direct INSERT (faster but no deduplication)
+
+    Returns:
+        int: rows actually loaded/merged (0 is a legitimate, non-error result
+             for a genuinely empty input CSV).
+        None: the load itself failed (Snowflake error, write_pandas failure,
+             etc.) — distinct from a real 0, so callers can tell "nothing to
+             load" apart from "the load broke" and record the latter as a
+             real error instead of silently treating it as zero rows.
     """
     logger.info(f"Loading {csv_file.name}...")
 
@@ -193,6 +201,27 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     )
                 """)
             elif table_type == 'TC_GUST_ENVELOPES_INDIVIDUAL':
+                # Base table has no bootstrap DDL anywhere else in this repo
+                # (unlike MET_FORECASTS/RIVER_FORECASTS/GLOFAS_CDS_REQUESTS,
+                # which self-create in their own loader functions below), a
+                # first-ever run against a fresh Snowflake account would
+                # otherwise fail the staging→MERGE below with "table does not
+                # exist". IF NOT EXISTS makes this a safe no-op once the table
+                # is already there, matching the real live DDL exactly.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_GUST_ENVELOPES_INDIVIDUAL (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        VALID_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Valid time for this forecast point',
+                        LEAD_TIME INTEGER NOT NULL COMMENT 'Forecast lead time in hours',
+                        GUST_THRESHOLD INTEGER NOT NULL COMMENT 'Gust speed threshold in m/s',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing the area where gusts exceed the threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, LEAD_TIME, GUST_THRESHOLD)
+                    )
+                    COMMENT = 'Individual gust field envelopes for specific forecast times'
+                """)
                 cursor.execute(f"""
                     CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
                         FORECAST_TIME TIMESTAMP_NTZ,
@@ -205,6 +234,20 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     )
                 """)
             elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
+                # Same bootstrap-DDL gap as TC_GUST_ENVELOPES_INDIVIDUAL above.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_GUST_ENVELOPES_COMBINED (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        LEAD_TIME_RANGE INTEGER NOT NULL COMMENT 'Starting lead time for the range in hours (e.g., 0, 6, 12)',
+                        GUST_THRESHOLD INTEGER NOT NULL COMMENT 'Gust speed threshold in m/s',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing cumulative area where gusts exceed threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, GUST_THRESHOLD)
+                    )
+                    COMMENT = 'Combined gust field envelopes across time ranges for impact analysis'
+                """)
                 cursor.execute(f"""
                     CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
                         FORECAST_TIME TIMESTAMP_NTZ,
@@ -229,7 +272,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
             if not success:
                 logger.error(f"  Failed to write to staging table")
                 cursor.close()
-                return 0
+                return None  # real failure, distinct from a legitimate 0 rows
 
             logger.info(f"  Uploaded {nrows} rows to staging table")
 
@@ -383,10 +426,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
                     WHEN NOT MATCHED THEN INSERT (
                         FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
-                        GUST_THRESHOLD, ENVELOPE_REGION
+                        GUST_THRESHOLD, ENVELOPE_REGION, LOADED_AT
                     ) VALUES (
                         s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
-                        s.GUST_THRESHOLD, s.ENVELOPE_REGION
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
                     )
                 """
 
@@ -426,10 +469,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         LEAD_TIME_RANGE = s.LEAD_TIME_RANGE
                     WHEN NOT MATCHED THEN INSERT (
                         FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
-                        GUST_THRESHOLD, ENVELOPE_REGION
+                        GUST_THRESHOLD, ENVELOPE_REGION, LOADED_AT
                     ) VALUES (
                         s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
-                        s.GUST_THRESHOLD, s.ENVELOPE_REGION
+                        s.GUST_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
                     )
                 """
 
@@ -453,7 +496,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
             if not success:
                 logger.error(f"  Failed to write to {table_type}")
                 cursor.close()
-                return 0
+                return None  # real failure, distinct from a legitimate 0 rows
 
             logger.info(f"  Inserted {nrows} rows directly")
             rows_merged = nrows
@@ -471,7 +514,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
             cursor.close()
         except Exception:
             pass
-        return 0
+        return None  # real failure, distinct from a legitimate 0 rows
 
 
 def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:

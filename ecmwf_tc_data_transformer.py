@@ -35,7 +35,7 @@ import re
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon, MultiPolygon, Point
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -228,6 +228,46 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
     lat_max = lat + max(r_ne, r_nw) * lat_deg_per_km
     lon_min = lon - max(r_sw, r_nw) * lon_deg_per_km
     lon_max = lon + max(r_ne, r_se) * lon_deg_per_km
+
+    # Antimeridian handling: for a storm near the 180deg date line, a
+    # large enough wind radius pushes lon_min/lon_max past the +-180
+    # boundary (e.g. lon=177.6 with a wide NE/SE radius can push lon_max
+    # to 183.1). Snowflake's GEOGRAPHY type rejects longitudes outside
+    # -180..180 outright, and TRY_TO_GEOGRAPHY(...) on that WKT silently
+    # returns NULL instead of erroring -- so an unwrapped polygon here
+    # would vanish downstream with no error surfaced anywhere. Split into
+    # two rectangles, one per side of the date line, rather than naively
+    # wrapping just the overshooting coordinate (e.g. 183.1 -> -176.9)
+    # -- a naive wrap would invert lon_min > lon_max and balloon the
+    # rectangle to cover ~350deg of longitude instead of the intended
+    # narrow band.
+    if lon_max > 180.0 or lon_min < -180.0:
+        try:
+            if lon_max > 180.0:
+                main_part = Polygon([
+                    (lon_min, lat_min), (180.0, lat_min),
+                    (180.0, lat_max), (lon_min, lat_max), (lon_min, lat_min),
+                ])
+                wrapped_part = Polygon([
+                    (-180.0, lat_min), (lon_max - 360.0, lat_min),
+                    (lon_max - 360.0, lat_max), (-180.0, lat_max), (-180.0, lat_min),
+                ])
+            else:  # lon_min < -180.0
+                main_part = Polygon([
+                    (-180.0, lat_min), (lon_max, lat_min),
+                    (lon_max, lat_max), (-180.0, lat_max), (-180.0, lat_min),
+                ])
+                wrapped_part = Polygon([
+                    (lon_min + 360.0, lat_min), (180.0, lat_min),
+                    (180.0, lat_max), (lon_min + 360.0, lat_max), (lon_min + 360.0, lat_min),
+                ])
+            parts = [p for p in (main_part, wrapped_part) if p.is_valid and not p.is_empty]
+            if not parts:
+                return None
+            multi = MultiPolygon(parts)
+            return multi if multi.is_valid and not multi.is_empty else None
+        except Exception:
+            return None
 
     # Create rectangular polygon (ensure it's properly closed)
     polygon_coords = [
@@ -489,6 +529,39 @@ def transform_tc_data(raw_csv_path: str,
             forecasts_df['wind_speed_knots'] = forecasts_df['wind_speed_ms'] * 1.944
             if verbose:
                 print("  Converted wind speed from m/s to knots")
+
+        # Zero out a threshold's wind-radius quadrants when the storm's own
+        # reported wind speed at this forecast point never reaches that
+        # threshold. WIND_SPEED_KNOTS is the storm's peak sustained wind
+        # anywhere at this instant, so a nonzero quadrant radius for a
+        # HIGHER threshold is physically impossible -- confirmed as a real,
+        # live data-quality bug against production data (e.g. a row
+        # reporting wind_speed_knots=29.9 alongside a 34kt-wind radius up
+        # to 272km). The raw BUFR wind-radii fields are extracted
+        # independently of the storm's own peak-wind field, so nothing
+        # upstream already guarantees this consistency -- guard it here,
+        # once, right after both are available and before any downstream
+        # consumer (wind field polygons, Snowflake load) reads the radius
+        # columns.
+        if 'wind_speed_knots' in forecasts_df.columns:
+            for threshold in (34, 50, 64):
+                radius_cols = [
+                    f'radius_{threshold}_knot_winds_ne_km',
+                    f'radius_{threshold}_knot_winds_se_km',
+                    f'radius_{threshold}_knot_winds_sw_km',
+                    f'radius_{threshold}_knot_winds_nw_km',
+                ]
+                present_cols = [c for c in radius_cols if c in forecasts_df.columns]
+                if not present_cols:
+                    continue
+                below_threshold = forecasts_df['wind_speed_knots'] < threshold
+                impossible = below_threshold & (forecasts_df[present_cols].fillna(0) > 0).any(axis=1)
+                n_cleared = int(impossible.sum())
+                if n_cleared and verbose:
+                    print(f"  Cleared {n_cleared} physically-impossible {threshold}kt radius "
+                          f"row(s) (wind speed below threshold)")
+                for c in present_cols:
+                    forecasts_df.loc[below_threshold, c] = 0.0
 
         # Calculate radius of maximum winds using Haversine formula
         if verbose:

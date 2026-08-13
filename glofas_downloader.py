@@ -496,16 +496,33 @@ def resume_glofas_download(requests: Dict[str, str], actual_date: datetime,
     Returns {'ens': path, 'ctrl': path} or None on failure (mirrors _download_for_date()).
     """
     import cdsapi
-    client = cdsapi.Client(url=os.getenv('CDSAPI_URL'), key=os.getenv('CDSAPI_KEY'),
-                           wait_until_complete=False)
-    if not hasattr(client, 'client'):
+    try:
+        client = cdsapi.Client(url=os.getenv('CDSAPI_URL'), key=os.getenv('CDSAPI_KEY'),
+                               wait_until_complete=False)
+        if not hasattr(client, 'client'):
+            raise RuntimeError(
+                f"resume_glofas_download() requires cdsapi.Client(...) to resolve to a "
+                f"LegacyClient (needs a token-format CDSAPI_KEY, not the legacy "
+                f"'UID:APIKEY' format) -- got {type(client).__name__} instead, which has "
+                f"no .client attribute for get_remote(). Fix CDSAPI_KEY's format; this is "
+                f"a configuration problem, not a transient CDS unavailability."
+            )
+    except RuntimeError:
+        raise  # already the right type/message for the caller's own catch, propagate as-is
+    except Exception as e:
+        # cdsapi.Client(...) construction itself can raise other exception
+        # types depending on how CDSAPI_URL/CDSAPI_KEY are malformed or
+        # missing (a bare Exception when both are unset and no usable
+        # ~/.cdsapirc exists; an AssertionError for a legacy-format key with
+        # the wrong number of ':'-separated parts) — normalized to
+        # RuntimeError here so download_glofas_forecast()'s existing
+        # `except RuntimeError` (the intended "config problem, fall back to
+        # a fresh submit" path) actually catches it, instead of an
+        # unhandled traceback crashing the whole run.
         raise RuntimeError(
-            f"resume_glofas_download() requires cdsapi.Client(...) to resolve to a "
-            f"LegacyClient (needs a token-format CDSAPI_KEY, not the legacy "
-            f"'UID:APIKEY' format) -- got {type(client).__name__} instead, which has "
-            f"no .client attribute for get_remote(). Fix CDSAPI_KEY's format; this is "
-            f"a configuration problem, not a transient CDS unavailability."
-        )
+            f"resume_glofas_download() could not construct a CDS API client "
+            f"(CDSAPI_URL/CDSAPI_KEY likely missing or malformed): {type(e).__name__}: {e}"
+        ) from e
 
     date_str = actual_date.strftime("%Y%m%d")
     targets = {

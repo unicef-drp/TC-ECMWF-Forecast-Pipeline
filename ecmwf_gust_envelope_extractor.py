@@ -211,8 +211,9 @@ def process_gust_combination(
         gust_data_dir: Directory containing gust GRIB files (gust_ens_* prefix)
         output_dir: Directory to write output CSV files
         buffer_radius_km: Buffer radius around TC track for spatial crop (default 1000 km —
-            larger than the wind extractor's 500 km because the 17 m/s gust threshold
-            extends ~1.3× further than the equivalent sustained-wind radius)
+            2x the wind extractor's 500 km, a deliberately conservative margin so the
+            17 m/s gust threshold's real spatial extent, wider than the equivalent
+            sustained-wind radius, is never clipped by too tight a crop)
         verbose: Whether to log extra detail
 
     Returns:
@@ -345,7 +346,7 @@ def process_gust_combination(
                         continue
 
                     try:
-                        contours = create_wind_threshold_contours(member_da, GUST_THRESHOLDS_MS)
+                        contours = create_wind_threshold_contours(member_da, GUST_THRESHOLDS_MS, unit_label='m/s')
                     except Exception as e:
                         logger.warning(
                             f"    Error extracting gust contours for member {ensemble_member} "

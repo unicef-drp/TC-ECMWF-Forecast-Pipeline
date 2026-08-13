@@ -254,14 +254,24 @@ def load_wind_data_all_members(
 
 def create_wind_threshold_contours(wind_data: xr.DataArray,
                                    thresholds: Dict[int, float],
-                                   verbose: bool = True) -> Dict[int, Optional[Polygon]]:
+                                   verbose: bool = True,
+                                   unit_label: str = 'kt') -> Dict[int, Optional[Polygon]]:
     """
     Create contour polygons for each wind threshold.
 
     Args:
         wind_data (xr.DataArray): Wind speed data
-        thresholds (dict): Wind thresholds (kt: m/s)
+        thresholds (dict): Wind thresholds (key: m/s) — the dict key's own unit
+            depends on the caller: wind passes real kt values (34, 40, 50...),
+            gust passes integer m/s labels (17, 21, 26...); see
+            ecmwf_gust_envelope_extractor.py's own GUST_THRESHOLDS_MS docstring.
         verbose (bool): Whether to print progress information
+        unit_label (str): Unit to print next to the threshold key in the
+            progress log (default 'kt', matching wind's own convention).
+            Gust's own caller passes 'm/s' here so the progress log doesn't
+            mislabel gust's m/s-keyed thresholds as knots — this is
+            display-only, it never affects the stored contour/envelope data,
+            which always keys off the same dict key passed in either way.
 
     Returns:
         dict: Polygons for each threshold
@@ -292,7 +302,7 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
     for i, (threshold_kt, threshold_ms) in enumerate(sorted_thresholds):
         if verbose:
-            print(f"    {threshold_kt} kt ({threshold_ms:.2f} m/s)...", end='', flush=True)
+            print(f"    {threshold_kt} {unit_label} ({threshold_ms:.2f} m/s)...", end='', flush=True)
 
         polygons = []
         try:

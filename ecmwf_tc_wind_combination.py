@@ -497,13 +497,26 @@ def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> 
     if max_hour > 0:
         # Round up to next 6-hour interval
         rounded_hour = ((max_hour + 5) // 6) * 6
-        # Add 12-hour buffer for safety
-        recommended_hour = min(rounded_hour + 12, 144)
-        
+        # Add 12-hour buffer for safety, capped at 144h — this cap is a hard
+        # external data-availability limit, not a tunable knob: ECMWF only
+        # publishes 0.25deg operational ENS wind fields out to 144h, so no
+        # request beyond that would return real data anyway.
+        uncapped_hour = rounded_hour + 12
+        recommended_hour = min(uncapped_hour, 144)
+
         if verbose:
             logger.info(f"TC data analysis: max forecast hour needed = {max_hour}h")
             logger.info(f"Recommended wind forecast hours: 0 to {recommended_hour}h (every 6h)")
-        
+            if uncapped_hour > 144:
+                logger.warning(
+                    f"Track data needs wind coverage out to {uncapped_hour}h, but ECMWF's "
+                    f"0.25deg operational ENS wind fields are only published to 144h — wind "
+                    f"envelope coverage for this storm will have NO data for lead times "
+                    f"{150}h through {uncapped_hour}h (in 6h steps). This is a hard upstream "
+                    f"data-availability limit, not a bug; the storm's own track/position "
+                    f"forecast is unaffected, only wind-hazard coverage beyond 144h."
+                )
+
         return recommended_hour
     else:
         if verbose:
@@ -757,14 +770,23 @@ def process_wind_combination(
 
                     combined_df.to_csv(combined_file, index=False)
 
-                    # Validate member count: warn if any threshold has fewer members than expected
+                    # Validate member count: warn if any threshold has fewer members than expected.
+                    # max_ensemble_members doubles as a processing cap AND the "expected" count here
+                    # — when it's None (no cap given), there's no real expected value to check against,
+                    # so this is a genuine, explicitly-logged skip rather than silently computing
+                    # expected=actual_members, which made the mismatch condition permanently False
+                    # while still looking like a real check ran.
                     actual_members = combined_df['ensemble_member'].nunique()
-                    expected = max_ensemble_members if max_ensemble_members is not None else actual_members
-                    if actual_members < expected:
-                        missing = expected - actual_members
+                    if max_ensemble_members is None:
+                        logger.info(
+                            f"  Member count for {storm_name}: {actual_members} "
+                            f"(no max_ensemble_members cap given, skipping mismatch check)"
+                        )
+                    elif actual_members < max_ensemble_members:
+                        missing = max_ensemble_members - actual_members
                         logger.warning(
                             f"  Member count mismatch for {storm_name}: "
-                            f"expected {expected}, got {actual_members} "
+                            f"expected {max_ensemble_members}, got {actual_members} "
                             f"({missing} member(s) missing — check GRIB files)"
                         )
 

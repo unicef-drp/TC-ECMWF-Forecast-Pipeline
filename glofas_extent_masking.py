@@ -217,15 +217,27 @@ def compute_tier_member_exceedance(cell_lat: np.ndarray, cell_lon: np.ndarray, d
     NaN thresholds (a cell with no valid RP value in the official threshold file) do
     not need explicit masking here: `data > nan` already evaluates to False for
     every member/step, so those cells simply never exceed, same as the aggregate path.
+
+    Best-effort per tier, matching run_glofas_extent_masking()'s own documented
+    fault-isolation contract: one tier's threshold fetch/load failure (a bad
+    Snowflake stage GET that also fails its ECMWF-download fallback, a corrupted
+    cached .nc file, etc.) is logged and that tier is simply absent from the
+    returned dict, it never discards tiers already computed earlier in this
+    same call, and it never aborts the whole function the way one shared
+    try/except around the entire loop used to.
     """
     n_steps = data.shape[1]
     result = {}
     for rp in EXTENT_RP_LEVELS:
-        threshold_path = _fetch_threshold_file(
-            threshold_source, threshold_local_dir, snowflake_conn=snowflake_conn,
-            snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir, rp=rp,
-        )
-        thr = _load_threshold_at_cells(cell_lat, cell_lon, rp, threshold_path)  # (n_cells,)
+        try:
+            threshold_path = _fetch_threshold_file(
+                threshold_source, threshold_local_dir, snowflake_conn=snowflake_conn,
+                snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir, rp=rp,
+            )
+            thr = _load_threshold_at_cells(cell_lat, cell_lon, rp, threshold_path)  # (n_cells,)
+        except Exception as e:
+            logger.warning(f"  RP{rp}: threshold fetch/load failed, skipping this tier only: {e}")
+            continue
         exceed = data > thr[np.newaxis, np.newaxis, :]  # (n_members, n_steps, n_cells)
         result[rp] = exceed
         logger.info(f"  RP{rp}: {int(exceed.any(axis=(0, 1)).sum())} of {len(cell_lat)} cells "
@@ -589,6 +601,11 @@ def run_glofas_extent_masking(
         logger.warning("  No cell_uparea_km2 in this Zarr, below_min_basin will be False for every cell this run")
 
     try:
+        # compute_tier_member_exceedance() is itself per-tier fault-isolated
+        # (a tier missing from the returned dict, not an exception, is how it
+        # reports a single tier's failure), this outer try/except only
+        # guards against something genuinely unexpected breaking the whole
+        # function (e.g. a malformed `data` array), not an individual tier.
         exceed_by_tier = compute_tier_member_exceedance(
             cell_lat, cell_lon, data, threshold_source, threshold_local_dir,
             snowflake_conn=snowflake_conn, snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir,
@@ -615,6 +632,13 @@ def run_glofas_extent_masking(
         if source_tier not in jrc_paths or "water" not in jrc_paths:
             logger.info(f"  RP{rp}: required JRC cache file(s) unavailable ({source_tier} depth "
                         f"and/or permanent-water) — skipping this tier")
+            continue
+
+        if rp not in exceed_by_tier:
+            # compute_tier_member_exceedance() already logged why (its own
+            # per-tier try/except), this tier's threshold fetch/load failed
+            # and was skipped there, not a bug here.
+            logger.info(f"  RP{rp}: member exceedance unavailable for this tier — skipping")
             continue
 
         exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
