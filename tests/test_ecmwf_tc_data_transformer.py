@@ -143,8 +143,10 @@ class TransformIdentityRetentionTests(unittest.TestCase):
         self.assertAlmostEqual(row["radius_of_maximum_winds_km"], 15.45799622485502)
         for column in LEGACY_STANDARD_COLUMNS[10:14]:
             self.assertEqual(row[column], 40.0)
-        for column in LEGACY_STANDARD_COLUMNS[14:22]:
+        for column in LEGACY_STANDARD_COLUMNS[14:18]:
             self.assertTrue(pd.isna(row[column]))
+        for column in LEGACY_STANDARD_COLUMNS[18:22]:
+            self.assertEqual(row[column], 0.0)
         self.assertEqual(
             row["wind_field_polygon_34kt"],
             "POLYGON ((-55.37307249744507 14.63963963963964, "
