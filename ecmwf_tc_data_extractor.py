@@ -38,6 +38,8 @@ from eccodes import *
 import numpy as np
 import pandas as pd
 
+from ecmwf_tc_lineage import build_storm_identity_fields
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
@@ -56,6 +58,9 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
 
     Returns:
         pd.DataFrame: Raw extracted tropical cyclone data with columns:
+            - storm_id: Existing long-name-first track value
+            - storm_identifier: Raw ECMWF BUFR stormIdentifier
+            - long_storm_name: Trimmed ECMWF BUFR longStormName
             - Member: Ensemble member number
             - step: Forecast time step (hours from analysis)
             - latitude: Storm center latitude (degrees)
@@ -98,7 +103,8 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                     long_name = codes_get(bufr, "longStormName").strip()
                 except Exception:
                     long_name = ''
-                storm_id = long_name if long_name else stormIdentifier
+                storm_identity = build_storm_identity_fields(stormIdentifier, long_name)
+                storm_id = storm_identity['storm_id']
         
                 if verbose:
                     print('**************** MESSAGE: ', cnt + 1, '  *****************')
@@ -348,6 +354,8 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                             _nan_if_missing = lambda v: float('nan') if abs(v) > 1e10 else v
                             base_row = {
                                 'storm_id': storm_id,
+                                'storm_identifier': storm_identity['storm_identifier'],
+                                'long_storm_name': storm_identity['long_storm_name'],
                                 'ensemble_member': memberNumber[m],
                                 'step': timePeriod[s],
                                 'datetime': datetime_str,
