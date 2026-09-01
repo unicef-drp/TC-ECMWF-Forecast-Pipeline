@@ -843,13 +843,23 @@ def download_glofas_forecast(
         logger.info(f'  Spatial: {LAT_MIN} deg - {LAT_MAX} deg  |  Cadence: once/calendar day')
         logger.info('=' * 70)
 
-    for lag in range(MAX_PUBLICATION_LAG_DAYS + 1):
-        candidate = forecast_date - timedelta(days=lag)
-        candidate_str = candidate.strftime("%Y%m%d")
-        candidate_path = output_path / candidate_str / f'river_{candidate_str}.zarr.zip'
-        if not candidate_path.exists():
-            continue
-
+    # SAME-DAY dedup only (lag=0): catches the 3-of-4 daily cycles that share one
+    # GloFAS run per day, per stage_file_exists()'s own docstring. This must NOT
+    # loop over MAX_PUBLICATION_LAG_DAYS: a lag>0 match here
+    # only proves YESTERDAY's file exists (which is always true, since yesterday's
+    # own run left it there), and accepting that as "today is done" meant today's
+    # real CDS request never got attempted at all, silently, on a roughly
+    # every-other-day cadence. The actual multi-day publication-lag fallback is
+    # already implemented correctly, further down, in download_with_fallback()
+    # (and in resume_glofas_download() for the pre_submitted path), both of
+    # which genuinely attempt today first and only fall back to an earlier day
+    # once that real attempt comes back empty. This early check exists purely to
+    # skip a redundant call when today's own work is already done; it must never
+    # substitute for that real fallback logic.
+    candidate = forecast_date
+    candidate_str = date_str
+    candidate_path = output_path / candidate_str / f'river_{candidate_str}.zarr.zip'
+    if candidate_path.exists():
         if upload_to_stage and snowflake_conn and snowflake_stage_name:
             candidate_stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
             if not stage_file_exists(snowflake_stage_name, candidate_stage_path, snowflake_conn):
@@ -867,14 +877,11 @@ def download_glofas_forecast(
                  'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
     if upload_to_stage and snowflake_conn and snowflake_stage_name:
-        for lag in range(MAX_PUBLICATION_LAG_DAYS + 1):
-            candidate = forecast_date - timedelta(days=lag)
-            candidate_str = candidate.strftime("%Y%m%d")
-            candidate_stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
-            if stage_file_exists(snowflake_stage_name, candidate_stage_path, snowflake_conn):
-                logger.info(f'  {candidate_stage_path} already staged — skipping (day-level cache hit)')
-                return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
-                         'forecast_date': candidate, 'param': 'dis24', 'cached': True}
+        candidate_stage_path = f'glofas/{date_str}/river_{date_str}.zarr.zip'
+        if stage_file_exists(snowflake_stage_name, candidate_stage_path, snowflake_conn):
+            logger.info(f'  {candidate_stage_path} already staged — skipping (day-level cache hit)')
+            return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
+                     'forecast_date': forecast_date, 'param': 'dis24', 'cached': True}
 
     # Step 1: Download. Two paths:
     #  - pre_submitted given (GLOFAS_MODE=process, resuming an earlier submit step):

@@ -16,7 +16,7 @@ function itself comes from a different module per entry point
 
 import os
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -24,7 +24,6 @@ from glofas_downloader import (
     download_glofas_forecast,
     submit_glofas_requests,
     stage_file_exists,
-    MAX_PUBLICATION_LAG_DAYS,
     EXTENT_RP_LEVELS,
 )
 from glofas_extent_masking import run_glofas_extent_masking
@@ -162,27 +161,32 @@ class BaseGlofasConfig:
 def _glofas_already_downloaded(config: BaseGlofasConfig, forecast_date: datetime,
                                 snowflake_conn=None) -> Optional[datetime]:
     """
-    Returns the matched date if forecast_date's raw discharge Zarr already exists
-    locally or on the Snowflake stage, checked across the same
-    MAX_PUBLICATION_LAG_DAYS fallback window submit_glofas_requests()/
-    download_with_fallback() themselves use; None otherwise.
+    Returns forecast_date if forecast_date's own raw discharge Zarr already
+    exists locally or on the Snowflake stage; None otherwise.
 
     Guards GLOFAS_MODE=submit against firing a redundant, wasted pair of CDS
     requests when its own scheduled trigger runs late (GitHub Actions gives no
     execution-order guarantee between separate schedule entries) after the
     process trigger's own submit-and-block fallback has already completed the
     day.
+
+    SAME-DAY only (no MAX_PUBLICATION_LAG_DAYS loop): a stale prior day's file
+    always exists once that day's own run has completed, so looping over the
+    lag window here would wrongly report today as
+    "already downloaded" without ever attempting today's real CDS request,
+    the real multi-day publication-lag fallback already lives in, and must stay
+    owned by, download_with_fallback()/resume_glofas_download() in
+    glofas_downloader.py, which only fall back after a genuine attempt at the
+    requested date comes back empty.
     """
-    for lag in range(MAX_PUBLICATION_LAG_DAYS + 1):
-        candidate = forecast_date - timedelta(days=lag)
-        candidate_str = candidate.strftime("%Y%m%d")
-        local_path = Path(config.glofas_data_dir) / candidate_str / f'river_{candidate_str}.zarr.zip'
-        if local_path.exists():
-            return candidate
-        if snowflake_conn and config.snowflake_stage_name:
-            stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
-            if stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn):
-                return candidate
+    candidate_str = forecast_date.strftime("%Y%m%d")
+    local_path = Path(config.glofas_data_dir) / candidate_str / f'river_{candidate_str}.zarr.zip'
+    if local_path.exists():
+        return forecast_date
+    if snowflake_conn and config.snowflake_stage_name:
+        stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
+        if stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn):
+            return forecast_date
     return None
 
 
