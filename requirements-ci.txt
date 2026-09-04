@@ -1,6 +1,6 @@
 # Pipeline-only dependencies for CI (GitHub Actions / SPCS).
 # Includes matplotlib (needed for wind isoline extraction via ax.contour()).
-# Does NOT include cartopy or scipy — those are only for notebooks/local dev; see requirements.txt.
+# Does NOT include cartopy or scipy; those are only for notebooks/local dev; see requirements.txt.
 
 # Core BUFR processing
 eccodes>=1.5.0
@@ -20,7 +20,7 @@ shapely>=2.0.0
 # GRIB data processing
 cfgrib>=0.9.10
 
-# Wind isoline extraction — ax.contour() in ecmwf_wind_data_extractor.py
+# Wind isoline extraction: ax.contour() in ecmwf_wind_data_extractor.py
 # Runs headless via MPLBACKEND=Agg (no display needed). cartopy/scipy not needed.
 matplotlib>=3.7.0
 

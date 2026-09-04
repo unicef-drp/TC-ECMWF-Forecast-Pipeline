@@ -32,7 +32,7 @@ from ecmwf_wind_data_extractor import (
     merge_contour_dicts,
     polygon_to_wkt,
 )
-from ecmwf_tc_wind_combination import find_tc_data_files, load_tc_track_data
+from ecmwf_tc_wind_combination import find_tc_data_files, load_tc_track_data, _save_wind_rasters_for_lead_time
 
 # Configure logging
 logging.basicConfig(
@@ -68,13 +68,13 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]
         grib_file: Path to gust GRIB2 file
         bbox: Bounding box dict with keys 'lat_min', 'lat_max', 'lon_min',
             'lon_max'. lon_min/lon_max may fall outside [-180, 180] (see
-            ecmwf_wind_data_extractor.get_bounding_box) — this function
+            ecmwf_wind_data_extractor.get_bounding_box): this function
             slices the real GRIB longitude range once per real window
             returned by get_longitude_windows(bbox).
 
     Returns:
         List[xr.DataArray]: One loaded, cropped DataArray per real longitude
-            window — length 1 (bbox clipped exactly as before) for the
+            window (length 1, bbox clipped exactly as before, for the
             overwhelming majority of storms, length 2 only when bbox
             straddles the antimeridian. Callers must extract contours once
             per element and merge results (see merge_contour_dicts), never
@@ -97,7 +97,7 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]
             ds_var = ds[first_var]
 
         # Crop to bounding box (latitude sliced high→low to match GRIB
-        # convention) — one real window in the common case, two when bbox
+        # convention): one real window in the common case, two when bbox
         # straddles the antimeridian
         windows = get_longitude_windows(bbox)
         regions = []
@@ -217,6 +217,7 @@ def process_gust_combination(
     output_dir,
     buffer_radius_km: int = 1000,
     verbose: bool = False,
+    publish_raster: bool = False,
 ) -> Dict:
     """
     Extract gust envelope polygons for all TC storms and write individual + combined CSVs.
@@ -227,8 +228,8 @@ def process_gust_combination(
         tc_data_dir: Directory containing transformed TC CSV files
         gust_data_dir: Directory containing gust GRIB files (gust_ens_* prefix)
         output_dir: Directory to write output CSV files
-        buffer_radius_km: Buffer radius around TC track for spatial crop (default 1000 km —
-            2x the wind extractor's 500 km, a deliberately conservative margin so the
+        buffer_radius_km: Buffer radius around TC track for spatial crop (default 1000 km,
+            2x the wind extractor's 500 km: a deliberately conservative margin so the
             17 m/s gust threshold's real spatial extent, wider than the equivalent
             sustained-wind radius, is never clipped by too tight a crop)
         verbose: Whether to log extra detail
@@ -267,7 +268,7 @@ def process_gust_combination(
     # Find storm CSV files
     storm_configs = find_tc_data_files(tc_data_dir)
     if not storm_configs:
-        logger.warning("No TC data files found — nothing to process")
+        logger.warning("No TC data files found -- nothing to process")
         return {'processed_storms': 0, 'total_envelope_files': 0}
 
     processed_storms = 0
@@ -313,14 +314,34 @@ def process_gust_combination(
                 pf_file = _match_gust_file(lead_time, 'pf', gust_files)
                 cf_file = _match_gust_file(lead_time, 'cf', gust_files)
 
-                # Load PF gust DataArrays (all members 1-50) — one window in
+                # Load PF gust DataArrays (all members 1-50): one window in
                 # the common case, two when bbox straddles the antimeridian
+                # Real forecast issuance suffix for this lead time's raster filenames,
+                # same 'YYYYMMDDTHHZ' convention the CSV output already uses.
+                _sample_ft = rows_at_lead[0].get('forecast_time') if has_forecast_time else None
+                ft_suffix = None
+                if _sample_ft is not None:
+                    try:
+                        ft_suffix = pd.to_datetime(_sample_ft).strftime('%Y%m%dT%HZ')
+                    except Exception:
+                        ft_suffix = None
+
                 pf_windows: List[xr.DataArray] = []
                 if pf_file:
                     try:
                         pf_windows = load_gust_data_all_members(pf_file, bbox)
                     except Exception as e:
                         logger.warning(f"    Error loading PF gust at lead {lead_time}h: {e}")
+                    # Own try/except, deliberately separate from the load above (same
+                    # real fix + rationale as ecmwf_tc_wind_combination.py's wind path):
+                    # raster output must never be attributed as (or able to cause) a
+                    # gust-load failure for the real, more critical polygon output.
+                    if publish_raster and pf_windows:
+                        try:
+                            _save_wind_rasters_for_lead_time(pf_windows, output_dir, storm_name, ft_suffix,
+                                                              lead_time, 'pf', dataset_label='gust')
+                        except Exception as e:
+                            logger.warning(f"    Could not save PF gust raster at lead {lead_time}h: {e}")
                 else:
                     logger.warning(f"    No PF gust file for lead {lead_time}h")
 
@@ -331,6 +352,12 @@ def process_gust_combination(
                         cf_windows = load_gust_data_all_members(cf_file, bbox)
                     except Exception as e:
                         logger.warning(f"    Error loading CF gust at lead {lead_time}h: {e}")
+                    if publish_raster and cf_windows:
+                        try:
+                            _save_wind_rasters_for_lead_time(cf_windows, output_dir, storm_name, ft_suffix,
+                                                              lead_time, 'cf', dataset_label='gust')
+                        except Exception as e:
+                            logger.warning(f"    Could not save CF gust raster at lead {lead_time}h: {e}")
                 else:
                     logger.warning(f"    No CF gust file for lead {lead_time}h")
 
@@ -341,10 +368,10 @@ def process_gust_combination(
                     valid_time = row['valid_time']
 
                     if ensemble_member == 51:
-                        # Control member — use CF windows directly (no 'number' dim)
+                        # Control member: use CF windows directly (no 'number' dim)
                         member_da_windows = cf_windows
                     else:
-                        # Perturbed member 1-50 — select by GRIB number, from each window
+                        # Perturbed member 1-50: select by GRIB number, from each window
                         if not pf_windows:
                             continue
                         grib_number = ensemble_member  # grib member == pipeline member for PF
@@ -365,7 +392,7 @@ def process_gust_combination(
                     try:
                         # Extract contours per window, then merge (a
                         # single-window input merges to that one dict
-                        # unchanged — see merge_contour_dicts)
+                        # unchanged, see merge_contour_dicts)
                         sub_contours = [
                             create_wind_threshold_contours(w, GUST_THRESHOLDS_MS, unit_label='m/s')
                             for w in member_da_windows

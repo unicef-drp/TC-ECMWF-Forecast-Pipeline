@@ -3,7 +3,18 @@
 # Note: In GitHub Actions, these are set as GitHub Secrets and workflow environment variables
 
 # ==============================================================================
-# REQUIRED: Snowflake Connection
+# Storage backend: SNOWFLAKE (default), BLOB, or LOCAL
+# ==============================================================================
+# SNOWFLAKE pushes tracks/envelope/met output to Snowflake tables and stage.
+# BLOB uploads the same output to Azure Blob Storage instead, touching no Snowflake
+# table or stage at all. LOCAL keeps files locally and skips the load step entirely.
+# GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE (see the GloFAS section below) default to
+# this same value.
+DATA_PIPELINE_DB=SNOWFLAKE
+
+# ==============================================================================
+# REQUIRED: Snowflake Connection (when DATA_PIPELINE_DB=SNOWFLAKE, or when
+# GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE=snowflake)
 # ==============================================================================
 SNOWFLAKE_ACCOUNT=your_account_identifier
 SNOWFLAKE_USER=your_username
@@ -11,6 +22,14 @@ SNOWFLAKE_PASSWORD=your_password
 SNOWFLAKE_WAREHOUSE=your_warehouse
 SNOWFLAKE_DATABASE=your_database
 SNOWFLAKE_SCHEMA=your_schema
+
+# ==============================================================================
+# REQUIRED: Azure Blob Storage Connection (when DATA_PIPELINE_DB=BLOB, or when
+# GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE=blob)
+# ==============================================================================
+ACCOUNT_URL=https://your_account.blob.core.windows.net/
+SAS_TOKEN=your_container_scoped_sas_token
+CONTAINER_NAME=your_container_name
 
 # ==============================================================================
 # OPTIONAL: Directory Configuration (defaults shown)
@@ -25,6 +44,10 @@ SNOWFLAKE_SCHEMA=your_schema
 # ==============================================================================
 # Process wind data (true/false)
 PROCESS_WIND_DATA=true
+
+# Enable gust envelope processing (true/false, default: true), independent of
+# PROCESS_WIND_DATA
+PROCESS_GUST=true
 
 # Filter to named storms only (true/false, default: true)
 # Set false to include unnamed disturbances (e.g. 70W, 95E)
@@ -56,16 +79,23 @@ DOWNLOAD_LIMIT=1
 # RUN_TIME=00
 
 # ==============================================================================
-# GloFAS riverine discharge — glofas_pipeline.py ONLY (standalone, separate cron
-# from the main pipeline above — see .github/workflows/glofas.yml)
+# GloFAS riverine discharge: glofas_pipeline.py ONLY (standalone, separate cron
+# from the main pipeline above; see .github/workflows/glofas.yml)
 # ==============================================================================
 
 # Local dir for GloFAS Zarr files
 GLOFAS_DATA_DIR=glofas_data
 
-# Where the RP2 threshold file is read from: snowflake (default, works even when
-# DATA_PIPELINE_DB=LOCAL) or local (requires setup_glofas_thresholds.py --local-only
-# to have been run first)
+# submit: fires the 2 CDS requests and exits (fast, no queue wait). process
+# (default): resumes a prior submit's saved request IDs, or falls back to a
+# fresh submit-and-block if nothing was saved. Also a real workflow_dispatch
+# input / schedule-selected mode in .github/workflows/glofas.yml.
+GLOFAS_MODE=process
+
+# Where the RP2 threshold file is read from: snowflake, blob, or local (requires
+# setup_glofas_thresholds.py --local-only to have been run first). Defaults to
+# DATA_PIPELINE_DB above; set explicitly to use a different source for this static
+# reference file than for the per-cycle output.
 GLOFAS_THRESHOLD_SOURCE=snowflake
 GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
 
@@ -73,11 +103,13 @@ GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
 CDSAPI_URL=https://ewds.climate.copernicus.eu/api
 CDSAPI_KEY=your_ewds_api_key
 
-# Specific date to download (YYYY-MM-DD format, optional — defaults to today UTC)
+# Specific date to download (YYYY-MM-DD format, optional, defaults to today UTC)
 # DOWNLOAD_DATE=2026-07-02
 
 # GloFAS x JRC extent-masking (glofas_extent_masking.py, same standalone pipeline)
 GLOFAS_EXTENT_ENABLED=true
+# snowflake, blob, or local: defaults to DATA_PIPELINE_DB above, same as
+# GLOFAS_THRESHOLD_SOURCE
 GLOFAS_JRC_SOURCE=snowflake
 GLOFAS_JRC_LOCAL_DIR=glofas_jrc_extents
 

@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # BUFR/GRIB processing
     libeccodes-dev \
     libeccodes-tools \
-    # HDF5/NetCDF — required by zarr/cfgrib
+    # HDF5/NetCDF: required by zarr/cfgrib
     libhdf5-dev \
     libnetcdf-dev \
     # Geospatial libraries
@@ -72,7 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Python environment
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-# Headless matplotlib backend — required for wind isoline extraction (ax.contour())
+# Headless matplotlib backend: required for wind isoline extraction (ax.contour())
 ENV MPLBACKEND=Agg
 
 # Set working directory
@@ -89,7 +89,7 @@ COPY pipeline_core.py /app/
 # Copy snowflake directory (contains spcs_pipeline.py and snowflake_loader.py)
 COPY snowflake/ /app/snowflake/
 
-# Copy requirements (lean pipeline-only set — no cartopy/scipy)
+# Copy requirements (lean pipeline-only set, no cartopy/scipy)
 COPY requirements-ci.txt /app/requirements-ci.txt
 
 # ==============================================================================

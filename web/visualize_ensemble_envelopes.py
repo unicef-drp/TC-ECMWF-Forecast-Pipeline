@@ -3,7 +3,7 @@
 Visualize combined wind envelopes per ensemble member for a given storm / forecast run.
 
 Fetches TC_ENVELOPES_COMBINED and TC_TRACKS from Snowflake and produces a grid of
-subplots — one per ensemble member — showing all available wind threshold envelopes
+subplots, one per ensemble member, showing all available wind threshold envelopes
 overlaid with the track.
 
 Usage:
@@ -178,7 +178,7 @@ def plot_ensemble(storm: str, forecast_time_filter: str, out_path: str):
                fontsize=9, title='Wind threshold', bbox_to_anchor=(0.98, 0.01))
 
     fig.suptitle(
-        f'{storm} — Combined wind envelopes per member\n{forecast_time_filter.replace("%", "*")}',
+        f'{storm} -- Combined wind envelopes per member\n{forecast_time_filter.replace("%", "*")}',
         fontsize=14, y=1.01
     )
     plt.tight_layout()

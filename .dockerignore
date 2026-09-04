@@ -29,7 +29,7 @@ wind_data/
 wind_extracted/
 met_data/
 
-# GloFAS local working directories (never COPY'd into either image — both Dockerfiles
+# GloFAS local working directories (never COPY'd into either image; both Dockerfiles
 # create their own empty dirs fresh via mkdir)
 glofas_data/
 glofas_thresholds/

@@ -21,8 +21,8 @@ LABEL version="1.0"
 # Install system dependencies
 # ==============================================================================
 
-# Only what's needed to build/run netCDF4, blosc2, and rasterio's bundled-GDAL wheels
-# — no system libgdal/geos/proj build-from-source (unlike Dockerfile, the main
+# Only what's needed to build/run netCDF4, blosc2, and rasterio's bundled-GDAL wheels:
+# no system libgdal/geos/proj build-from-source (unlike Dockerfile, the main
 # pipeline's image), since rasterio's PyPI wheel already bundles GDAL.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libhdf5-dev \

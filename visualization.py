@@ -311,7 +311,7 @@ def visualize_tracks_with_wind_polygons(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     plt.title(f"Tropical Cyclone {storm_name} - Tracks with Wind Polygons\nForecast: {forecast_time}",
               fontsize=16, fontweight='bold', pad=20)
 
-    # Add track legend — store it before creating the threshold legend, which would replace it
+    # Add track legend: store it before creating the threshold legend, which would replace it
     track_legend = ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
 
     # Add threshold legend outside the map (second ax.legend() call replaces the first,
@@ -379,7 +379,7 @@ def visualize_individual_wind_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     storm_name = df_polygons['track_id'].iloc[0]
     forecast_time = df_polygons['forecast_time'].iloc[0]
 
-    # Select member — fall back to first available if requested member has no data
+    # Select member, falling back to first available if requested member has no data
     available_members = sorted(df_polygons['ensemble_member'].unique())
     if member not in available_members:
         print(f"Member {member} not in data (available: {available_members[:5]}{'...' if len(available_members) > 5 else ''}); using member {available_members[0]}")
@@ -718,7 +718,7 @@ def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("PRECIPITATION — ENSEMBLE MEAN")
+    print("PRECIPITATION -- ENSEMBLE MEAN")
     print("=" * 60)
 
     p = _load_precip_zarr(zarr_path)
@@ -774,9 +774,9 @@ def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
                     transform=ccrs.PlateCarree(), label='HRES (member 51)', zorder=5)
         ax.legend(loc='upper right', fontsize=9)
 
-    title = f"Ensemble Mean Accumulated Precipitation — {step_h}h"
+    title = f"Ensemble Mean Accumulated Precipitation -- {step_h}h"
     if storm_name:
-        title = f"{storm_name} — {title}"
+        title = f"{storm_name} -- {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -813,7 +813,7 @@ def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("PRECIPITATION — PERIOD ACCUMULATION PANELS")
+    print("PRECIPITATION -- PERIOD ACCUMULATION PANELS")
     print("=" * 60)
 
     if periods is None:
@@ -902,7 +902,7 @@ def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
 
     title = 'Ensemble Mean Period Precipitation'
     if storm_name:
-        title = f"{storm_name} — {title}"
+        title = f"{storm_name} -- {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     fig.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
 
@@ -938,7 +938,7 @@ def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv
         save_plot:      Save PNG to output_dir
     """
     print("=" * 60)
-    print(f"PRECIPITATION — EXCEEDANCE PROBABILITY (>{threshold_mm}mm by {step_h}h)")
+    print(f"PRECIPITATION -- EXCEEDANCE PROBABILITY (>{threshold_mm}mm by {step_h}h)")
     print("=" * 60)
 
     p = _load_precip_zarr(zarr_path)
@@ -995,7 +995,7 @@ def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv
 
     title = f"Exceedance Probability: >{threshold_mm}mm by {step_h}h"
     if storm_name:
-        title = f"{storm_name} — {title}"
+        title = f"{storm_name} -- {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -1044,7 +1044,7 @@ GLOFAS_DEFAULT_BOUNDS = (-180.0, 180.0, -60.0, 60.0)  # matches the pipeline's o
 def _setup_glofas_map(ax, bounds, regional=False, show_labels=True):
     """
     Map setup for GloFAS plots. Deliberately does NOT use setup_map()'s web-tile
-    basemap (Carto Positron) — that tile source is a) a live network fetch that
+    basemap (Carto Positron): that tile source is a) a live network fetch that
     silently falls back to a near-blank map if it fails, and b) intentionally
     very pale even when it succeeds (designed for busy data overlays, not for
     orienting a viewer who has no other context). Instead uses solid, always
@@ -1052,7 +1052,7 @@ def _setup_glofas_map(ax, bounds, regional=False, show_labels=True):
     map is legible even at a glance and never depends on network access.
 
     regional=True (for zoomed views) also adds state/province boundaries and
-    lake outlines — needed for orientation once you're zoomed past country scale.
+    lake outlines, needed for orientation once you're zoomed past country scale.
     """
     lon_min, lon_max, lat_min, lat_max = bounds
     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -1123,7 +1123,7 @@ def _glofas_sparse_to_dense(cell_lat, cell_lon, values, res=0.05,
     Native 0.05deg grid: row 0 = lat_max (grid is stored N->S, matching the
     forecast's own latitude order), col 0 = lon_min (grid is W->E).
 
-    Returns (dense, lats_1d, lons_1d) — dense.shape == (len(lats_1d), len(lons_1d)).
+    Returns (dense, lats_1d, lons_1d); dense.shape == (len(lats_1d), len(lons_1d)).
     """
     n_lat = int(round((lat_max - lat_min) / res)) + 1
     n_lon = int(round((lon_max - lon_min) / res)) + 1
@@ -1157,7 +1157,7 @@ def _lookup_threshold_at_cells(threshold_path, rp, cell_lat, cell_lon):
     try:
         thr_lat = official['lat'].values   # descending, full global domain
         thr_lon = official['lon'].values   # ascending
-        thr_arr = official[f"rl_{rp}"].values  # (lat, lon), eager load — one bulk read
+        thr_arr = official[f"rl_{rp}"].values  # (lat, lon), eager load: one bulk read
     finally:
         official.close()
 
@@ -1179,7 +1179,7 @@ def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_c
     """
     threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
     if not threshold_path.exists():
-        print(f"  RP{rp} threshold file not found at {threshold_path} — cannot find a hotspot.")
+        print(f"  RP{rp} threshold file not found at {threshold_path} -- cannot find a hotspot.")
         return None
 
     g = _load_glofas_zarr(zarr_path)
@@ -1193,7 +1193,7 @@ def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_c
     exceed_pct[valid] = (disch[:, valid] > thr_at_cells[valid]).mean(axis=0) * 100
 
     if not (exceed_pct > 0).any():
-        print("  No exceedance found anywhere — cannot pick a hotspot.")
+        print("  No exceedance found anywhere -- cannot pick a hotspot.")
         return None
 
     # Densest cluster of high-exceedance cells: bin into 2deg cells, find the bin
@@ -1218,7 +1218,7 @@ def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_c
 
 def find_glofas_active_cell(zarr_path):
     """
-    Find a single "gauge" cell with a genuinely developing signal — the cell
+    Find a single "gauge" cell with a genuinely developing signal: the cell
     whose ensemble-max discharge rises the most from the first to the last lead
     time (a clear, visually dramatic rising hydrograph, not just a big river that
     happens to be uniformly high all week). Returns (cell_lat, cell_lon).
@@ -1276,7 +1276,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
         save_plot:            Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS — GAUGE HYDROGRAPH")
+    print("GLOFAS -- GAUGE HYDROGRAPH")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1284,7 +1284,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
     if cell_lat is None or cell_lon is None:
         cell_lat, cell_lon = find_glofas_active_cell(zarr_path)
 
-    # Nearest stored cell to the requested point (sparse array — no direct index)
+    # Nearest stored cell to the requested point (sparse array, no direct index)
     dist2 = (g['cell_lat'] - cell_lat) ** 2 + (g['cell_lon'] - cell_lon) ** 2
     idx = int(np.argmin(dist2))
     actual_lat, actual_lon = float(g['cell_lat'][idx]), float(g['cell_lon'][idx])
@@ -1302,7 +1302,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
     fig = plt.figure(figsize=(11, 6.5), dpi=DPI)
     ax = fig.add_axes([0.08, 0.1, 0.88, 0.8])
 
-    # Locator inset — regional context map with a marker at the gauge, so the
+    # Locator inset: regional context map with a marker at the gauge, so the
     # chart doesn't require already knowing what lat/lon 22.18, 113.43 means.
     pad = 12.0
     inset_bounds = (max(actual_lon - pad, -180), min(actual_lon + pad, 180),
@@ -1325,7 +1325,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
     ax.fill_between(x, lo, hi, color='#4C72B0', alpha=0.12, zorder=1, label='Member min-max range')
     ax.plot(x, median, color='#1B3B6F', linewidth=2.5, zorder=4, label='Ensemble median')
 
-    # Threshold lines — Warning/Danger/Extreme-style palette, lightest RP first
+    # Threshold lines: Warning/Danger/Extreme-style palette, lightest RP first
     threshold_colors = ['#F5A623', '#E85D4F', '#8B1A1A', '#4B0082', '#000000']
     threshold_labels_map = {'2.0': 'Warning', '5.0': 'Danger', '20.0': 'Extreme'}
     for i, rp in enumerate(rps):
@@ -1344,7 +1344,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
     ax.grid(alpha=0.25)
     ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
 
-    title = f"GloFAS Gauge Hydrograph — lat={actual_lat:.2f}, lon={actual_lon:.2f}"
+    title = f"GloFAS Gauge Hydrograph -- lat={actual_lat:.2f}, lon={actual_lon:.2f}"
     title += f"\nIssued: {g['forecast_date']} | {series.shape[0]} members"
     ax.set_title(title, fontsize=13, fontweight='bold', pad=12)
 
@@ -1386,7 +1386,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS — ENSEMBLE MEAN DISCHARGE")
+    print("GLOFAS -- ENSEMBLE MEAN DISCHARGE")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1405,7 +1405,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
     ax = plt.axes(projection=ccrs.PlateCarree())
     _setup_glofas_map(ax, bounds, regional=(bounds != GLOFAS_DEFAULT_BOUNDS))
 
-    # Log color scale — discharge spans <1 to >200,000 m3/s
+    # Log color scale: discharge spans <1 to >200,000 m3/s
     from matplotlib.colors import LogNorm
     vmax = max(float(np.nanpercentile(dense, 99)), 1.0)
     mesh = ax.pcolormesh(lons_1d, lats_1d, np.clip(dense, 0.1, None),
@@ -1414,7 +1414,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
     plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
                  label='Ensemble mean discharge (m3/s, log scale)', shrink=0.7)
 
-    title = f"GloFAS Ensemble Mean River Discharge — +{step_h}h"
+    title = f"GloFAS Ensemble Mean River Discharge -- +{step_h}h"
     title += (f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
               f" | filtered to {g['filter_threshold']}")
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
@@ -1446,13 +1446,13 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
     Args:
         zarr_path:   Path to river_YYYYMMDD.zarr.zip
         lead_hours:  List of lead hours to show (default: first, ~1/3, ~2/3, last
-                     of the available steps — typically [24, 72, 120, 168])
+                     of the available steps, typically [24, 72, 120, 168])
         output_dir:  Directory for saved PNG
         show_plot:   Display interactively
         save_plot:   Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS — MULTI-DAY ENSEMBLE MAX PANELS")
+    print("GLOFAS -- MULTI-DAY ENSEMBLE MAX PANELS")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1463,7 +1463,7 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
         lead_hours = [steps[i] for i in idxs]
 
     from matplotlib.colors import LogNorm
-    all_max = g['data'].max(axis=0)  # (step, n_cells) — for a shared color scale
+    all_max = g['data'].max(axis=0)  # (step, n_cells), for a shared color scale
     vmax = max(float(np.percentile(all_max, 99)), 1.0)
 
     n_panels = len(lead_hours)
@@ -1489,7 +1489,7 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
 
     fig.colorbar(mesh, ax=axes[:n_panels].tolist(), orientation='horizontal',
                 pad=0.05, label='Ensemble max discharge (m3/s, log scale)', shrink=0.6)
-    fig.suptitle(f"GloFAS Ensemble Max Discharge by Lead Time — issued {g['forecast_date']}",
+    fig.suptitle(f"GloFAS Ensemble Max Discharge by Lead Time -- issued {g['forecast_date']}",
                 fontsize=14, fontweight='bold')
 
     filepath = None
@@ -1514,7 +1514,7 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
     """
     Probability map: fraction of ensemble members exceeding the official RPx
     threshold at a given lead hour. Requires the threshold file to already be
-    cached locally (setup_glofas_thresholds.py --local-only) — this is the same
+    cached locally (setup_glofas_thresholds.py --local-only); this is the same
     file the pipeline itself depends on for its sparse cell filter.
 
     Args:
@@ -1523,19 +1523,19 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
         rp:                   Return period tier, e.g. '2.0', '5.0', '20.0'
         step_h:               Lead hour shown
         bounds:               Optional (lon_min, lon_max, lat_min, lat_max) to zoom
-                               in — see find_glofas_hotspot() to locate one automatically
+                               in; see find_glofas_hotspot() to locate one automatically
         output_dir:           Directory for saved PNG
         show_plot:            Display interactively
         save_plot:            Save PNG to output_dir
     """
     zoomed = bounds is not None
     print("=" * 60)
-    print(f"GLOFAS — RP{rp}yr EXCEEDANCE PROBABILITY (+{step_h}h)" + ("  [ZOOMED]" if zoomed else ""))
+    print(f"GLOFAS -- RP{rp}yr EXCEEDANCE PROBABILITY (+{step_h}h)" + ("  [ZOOMED]" if zoomed else ""))
     print("=" * 60)
 
     threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
     if not threshold_path.exists():
-        print(f"  RP{rp} threshold file not found at {threshold_path} — skipping.")
+        print(f"  RP{rp} threshold file not found at {threshold_path} -- skipping.")
         print(f"  Run: python3 setup_glofas_thresholds.py --local-only {threshold_local_dir}")
         return None
 
@@ -1566,7 +1566,7 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
     plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
                 label=f'P(discharge > RP{rp}yr) at +{step_h}h  [%]', shrink=0.7)
 
-    title = f"GloFAS RP{rp}yr Exceedance Probability — +{step_h}h" + (" (zoomed to hotspot)" if zoomed else "")
+    title = f"GloFAS RP{rp}yr Exceedance Probability -- +{step_h}h" + (" (zoomed to hotspot)" if zoomed else "")
     title += f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -1637,7 +1637,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
 
     standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
     print("=" * 60)
-    print(f"GLOFAS x JRC — EXTENT-MASKED RP{rp}yr (+{step_h}h){standin_note}")
+    print(f"GLOFAS x JRC -- EXTENT-MASKED RP{rp}yr (+{step_h}h){standin_note}")
     print("=" * 60)
 
     if rp not in EXTENT_RP_LEVELS:
@@ -1669,7 +1669,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
     cell_lon = g['cell_lon'][in_jrc]
     data = g['data'][:, :, in_jrc]
     print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
-          f"cached JRC coverage ({jrc_local_dir}) — restricting to those before combining")
+          f"cached JRC coverage ({jrc_local_dir}) -- restricting to those before combining")
 
     prob_by_tier = compute_tier_probabilities(
         cell_lat, cell_lon, data, len(g['member_numbers']),
@@ -1678,7 +1678,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
     prob = prob_by_tier[rp]  # (n_steps, n_cells), fraction of members exceeding RP{rp}
     keep_mask = (prob > 0).any(axis=0)
     if not keep_mask.any():
-        print(f"  No cells exceed RP{rp}yr anywhere in this forecast — try a lower tier or a different date.")
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast -- try a lower tier or a different date.")
         return None
 
     out_path = Path(output_dir) / f"_demo_extent_rp{rp}.tif"
@@ -1736,7 +1736,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
                 label=f'Extent-masked P(exceed RP{rp}yr)  [%]')
     ax2.set_title(f"GloFAS x JRC extent-masked (RP{source_tier} extent)\nreal flood-prone area only", fontsize=11)
 
-    suptitle = f"GloFAS x JRC Flood-Extent Masking — RP{rp}yr — +{step_h}h{standin_note}"
+    suptitle = f"GloFAS x JRC Flood-Extent Masking -- RP{rp}yr -- +{step_h}h{standin_note}"
     plt.suptitle(suptitle, fontsize=14, fontweight='bold')
 
     filepath = None
@@ -1787,7 +1787,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
 
     standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
     print("=" * 60)
-    print(f"GLOFAS x JRC — PER-MEMBER FLOOD EXTENT RP{rp}yr (+{step_h}h){standin_note}")
+    print(f"GLOFAS x JRC -- PER-MEMBER FLOOD EXTENT RP{rp}yr (+{step_h}h){standin_note}")
     print("=" * 60)
 
     if rp not in EXTENT_RP_LEVELS:
@@ -1816,7 +1816,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     cell_lon = g['cell_lon'][in_jrc]
     data = g['data'][:, :, in_jrc]
     print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
-          f"cached JRC coverage ({jrc_local_dir}) — restricting to those before combining")
+          f"cached JRC coverage ({jrc_local_dir}) -- restricting to those before combining")
 
     exceed_by_tier = compute_tier_member_exceedance(
         cell_lat, cell_lon, data, threshold_source='local', threshold_local_dir=threshold_local_dir,
@@ -1824,7 +1824,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
     keep_mask = exceed.any(axis=(0, 1))
     if not keep_mask.any():
-        print(f"  No cells exceed RP{rp}yr anywhere in this forecast — try a lower tier or a different date.")
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast -- try a lower tier or a different date.")
         return None
 
     member_numbers = np.asarray(g['member_numbers'])
@@ -1853,7 +1853,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
                        marker='s', transform=ccrs.PlateCarree(), zorder=2, alpha=0.8)
         ax.set_title(f"Member {member_no}\n{n_px:,} flooded pixels", fontsize=11)
 
-    suptitle = f"GloFAS x JRC Per-Member Flood Extent — RP{rp}yr — +{step_h}h{standin_note}"
+    suptitle = f"GloFAS x JRC Per-Member Flood Extent -- RP{rp}yr -- +{step_h}h{standin_note}"
     plt.suptitle(suptitle, fontsize=14, fontweight='bold')
 
     filepath = None
@@ -1883,16 +1883,16 @@ def show_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_extent_c
 
 # ─── Gust Envelope Visualizations ────────────────────────────────────────────
 
-# Gust threshold colors (oranges/reds — distinct from wind blues/greens)
+# Gust threshold colors (oranges/reds, distinct from wind blues/greens)
 GUST_THRESHOLD_COLORS = {
-    17: '#FED8B1',   # Light orange  — Gale force          (~34 kt equivalent)
-    21: '#FFA500',   # Orange        — Storm force         (~40 kt equivalent)
-    26: '#FF4500',   # OrangeRed     — Violent storm       (~50 kt equivalent)
-    33: '#8B0000',   # Dark red      — Hurricane force     (~64 kt equivalent)
-    43: '#6A0DAD',   # Purple        — Cat-2 gust          (~83 kt equivalent)
-    49: '#4B0082',   # Indigo        — Cat-3 gust          (~96 kt equivalent)
-    58: '#00008B',   # Dark blue     — Cat-4 gust          (~113 kt equivalent)
-    70: '#000000',   # Black         — Cat-5 gust          (~137 kt equivalent)
+    17: '#FED8B1',   # Light orange: Gale force          (~34 kt equivalent)
+    21: '#FFA500',   # Orange: Storm force         (~40 kt equivalent)
+    26: '#FF4500',   # OrangeRed: Violent storm       (~50 kt equivalent)
+    33: '#8B0000',   # Dark red: Hurricane force     (~64 kt equivalent)
+    43: '#6A0DAD',   # Purple: Cat-2 gust          (~83 kt equivalent)
+    49: '#4B0082',   # Indigo: Cat-3 gust          (~96 kt equivalent)
+    58: '#00008B',   # Dark blue: Cat-4 gust          (~113 kt equivalent)
+    70: '#000000',   # Black: Cat-5 gust          (~137 kt equivalent)
 }
 
 GUST_THRESHOLD_LABELS = {
@@ -2010,7 +2010,7 @@ def visualize_individual_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     for i in range(n_steps, len(axes)):
         axes[i].set_visible(False)
 
-    fig.suptitle(f"Storm: {storm_name} — Member {member} Gust Envelopes\nForecast: {forecast_time}",
+    fig.suptitle(f"Storm: {storm_name} -- Member {member} Gust Envelopes\nForecast: {forecast_time}",
                  fontsize=14, fontweight='bold')
 
     if n_steps > 0:
@@ -2131,7 +2131,7 @@ def visualize_combined_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     for i in range(n_members, len(axes)):
         axes[i].set_visible(False)
 
-    fig.suptitle(f"Storm: {storm_name} — Combined Gust Envelopes\nForecast: {forecast_time}",
+    fig.suptitle(f"Storm: {storm_name} -- Combined Gust Envelopes\nForecast: {forecast_time}",
                  fontsize=16, fontweight='bold')
 
     if n_members > 0:
@@ -2286,8 +2286,8 @@ def visualize_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
     else:
         axes = axes.flatten()
 
-    WIND_COLOR = '#4169E1'    # Royal blue   — sustained wind
-    GUST_COLOR = '#FF4500'    # OrangeRed    — gust
+    WIND_COLOR = '#4169E1'    # Royal blue: sustained wind
+    GUST_COLOR = '#FF4500'    # OrangeRed: gust
 
     for i, step in enumerate(all_steps):
         ax = axes[i]
@@ -2317,7 +2317,7 @@ def visualize_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
         axes[i].set_visible(False)
 
     fig.suptitle(
-        f"Storm: {storm_name} — Sustained Wind ({wind_kt} kt) vs Gust ({gust_ms} m/s) — Member {member}\n"
+        f"Storm: {storm_name} -- Sustained Wind ({wind_kt} kt) vs Gust ({gust_ms} m/s) -- Member {member}\n"
         f"Forecast: {forecast_time}  |  Gust envelopes extend beyond sustained-wind envelopes",
         fontsize=12, fontweight='bold'
     )

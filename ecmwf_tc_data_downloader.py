@@ -3,7 +3,7 @@
 ECMWF Tropical Cyclone Track Data Downloader
 
 Primary: ecmwf-opendata client (data.ecmwf.int, type="tf", stream="enfo").
-Fallback: ECMWF DISS/Essential portal (essential.ecmwf.int) — used when the
+Fallback: ECMWF DISS/Essential portal (essential.ecmwf.int), used when the
   primary endpoint returns 404. DISS publishes per-storm BUFR4 files which are
   concatenated into a single output file so the extractor sees the same format.
 
@@ -88,7 +88,7 @@ def _download_diss_and_combine(
         logger.info("DISS: no TC track files found for this run (no active named storms)")
         return False
 
-    logger.info(f"DISS: found {len(tc_urls)} TC track file(s) — downloading and combining")
+    logger.info(f"DISS: found {len(tc_urls)} TC track file(s) -- downloading and combining")
 
     total_bytes = 0
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -159,7 +159,7 @@ def download_tc_data(
     targets = _resolve_targets(date, run_time, limit)
 
     if not targets:
-        logger.error("No forecast targets resolved — nothing to download")
+        logger.error("No forecast targets resolved -- nothing to download")
         return {'downloaded': 0, 'failed': 0, 'files': []}
 
     downloaded = 0
@@ -216,7 +216,7 @@ def download_tc_data(
         else:
             failed += 1
 
-    logger.info(f"TC download complete — downloaded: {downloaded}, failed: {failed}")
+    logger.info(f"TC download complete -- downloaded: {downloaded}, failed: {failed}")
     return {'downloaded': downloaded, 'failed': failed, 'files': files}
 
 

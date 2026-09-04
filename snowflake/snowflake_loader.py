@@ -30,36 +30,36 @@ logger = logging.getLogger(__name__)
 def load_private_key(private_key_path, passphrase=None):
     """
     Load and parse a private key from file.
-    
+
     Args:
         private_key_path: Path to the private key file (PEM format)
         passphrase: Optional passphrase for encrypted private keys
-    
+
     Returns:
         Private key bytes in DER format
     """
     with open(private_key_path, "rb") as key_file:
         private_key_data = key_file.read()
-    
+
     # Parse the private key
     if passphrase:
         passphrase_bytes = passphrase.encode() if isinstance(passphrase, str) else passphrase
     else:
         passphrase_bytes = None
-    
+
     private_key = serialization.load_pem_private_key(
         private_key_data,
         password=passphrase_bytes,
         backend=default_backend()
     )
-    
+
     # Convert to DER format (required by Snowflake connector)
     private_key_der = private_key.private_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
-    
+
     return private_key_der
 
 
@@ -67,19 +67,19 @@ def get_snowflake_connection():
     """
     Create Snowflake connection from environment variables.
     Supports SPCS OAuth, private key, and password authentication.
-    
+
     Authentication Methods:
     1. SPCS OAuth (for Snowflake Container Services):
        - Set SPCS_RUN=true
        - Token read from SPCS_TOKEN_PATH (default: /snowflake/session/token)
-       
+
     2. Private Key (recommended):
        - Set SNOWFLAKE_PRIVATE_KEY_PATH to path of private key file
        - Optionally set SNOWFLAKE_PRIVATE_KEY_PASSPHRASE if key is encrypted
-       
+
     3. Password (legacy):
        - Set SNOWFLAKE_PASSWORD
-    
+
     Required variables:
     - SNOWFLAKE_ACCOUNT
     - SNOWFLAKE_USER (not required for SPCS OAuth)
@@ -104,23 +104,23 @@ def get_snowflake_connection():
     spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
     private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
     password = os.getenv('SNOWFLAKE_PASSWORD')
-    
+
     if not spcs_run and not private_key_path and not password:
         raise ValueError(
             "Missing authentication: Set SPCS_RUN=true OR SNOWFLAKE_PRIVATE_KEY_PATH OR SNOWFLAKE_PASSWORD"
         )
-    
+
     # Build connection parameters based on authentication method
     if spcs_run:
         # SPCS OAuth authentication using session token
         # Reference: https://medium.com/snowflake/connecting-to-snowflake-from-snowpark-container-services-cfc3a133480e
         logger.info("Connecting to Snowflake with SPCS OAuth authentication...")
         token_path = os.getenv('SPCS_TOKEN_PATH', '/snowflake/session/token')
-        
+
         try:
             with open(token_path, 'r') as f:
                 token = f.read().strip()
-            
+
             # SPCS requires specific connection parameters for internal network
             conn_params = {
                 'host': os.getenv('SNOWFLAKE_HOST'),
@@ -143,7 +143,7 @@ def get_snowflake_connection():
         # Non-SPCS mode: use standard connection parameters
         if not os.getenv('SNOWFLAKE_USER'):
             raise ValueError("SNOWFLAKE_USER is required for non-SPCS authentication")
-        
+
         conn_params = {
             'account': os.getenv('SNOWFLAKE_ACCOUNT'),
             'user': os.getenv('SNOWFLAKE_USER'),
@@ -151,11 +151,11 @@ def get_snowflake_connection():
             'database': os.getenv('SNOWFLAKE_DATABASE'),
             'schema': os.getenv('SNOWFLAKE_SCHEMA')
         }
-        
+
         if private_key_path:
             logger.info("Connecting to Snowflake with private key authentication...")
             passphrase = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')
-            
+
             try:
                 private_key_der = load_private_key(private_key_path, passphrase)
                 conn_params['private_key'] = private_key_der
@@ -165,22 +165,22 @@ def get_snowflake_connection():
         else:
             logger.info("Connecting to Snowflake with password authentication...")
             conn_params['password'] = password
-    
+
     # Add connection options for SSL/OCSP handling
     # This helps avoid certificate validation issues with S3 stage uploads
     conn_params['ocsp_fail_open'] = True
-    
+
     # Check if we should use insecure mode (for certificate issues)
     use_insecure = os.getenv('SNOWFLAKE_INSECURE_MODE', 'false').lower() == 'true'
     if use_insecure:
         logger.warning("Using insecure_mode - SSL certificate validation is disabled")
         conn_params['insecure_mode'] = True
-    
+
     # Disable OCSP checks entirely via session parameters
     conn_params['session_parameters'] = {
         'OCSP_FAIL_OPEN': 'true'
     }
-    
+
     # Connect
     try:
         conn = snowflake.connector.connect(**conn_params)
@@ -261,7 +261,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
         int: rows actually loaded/merged (0 is a legitimate, non-error result
              for a genuinely empty input CSV).
         None: the load itself failed (Snowflake error, write_pandas failure,
-             etc.) — distinct from a real 0, so callers can tell "nothing to
+             etc.), distinct from a real 0, so callers can tell "nothing to
              load" apart from "the load broke" and record the latter as a
              real error instead of silently treating it as zero rows.
     """
@@ -422,7 +422,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_TRACKS t
                     USING {staging_table} s
-                    ON t.TRACK_ID = s.TRACK_ID 
+                    ON t.TRACK_ID = s.TRACK_ID
                         AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.LEAD_TIME = s.LEAD_TIME
@@ -464,12 +464,12 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_ENVELOPES_INDIVIDUAL t
                     USING (
-                        SELECT 
+                        SELECT
                             FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
                             WIND_THRESHOLD,
-                            CASE 
-                                WHEN ENVELOPE_REGION IS NOT NULL 
-                                     AND ENVELOPE_REGION != '' 
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
                                      AND ENVELOPE_REGION != 'None'
                                      AND ENVELOPE_REGION != 'null'
                                 THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
@@ -477,7 +477,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                             END AS ENVELOPE_REGION
                         FROM {staging_table}
                     ) s
-                    ON t.TRACK_ID = s.TRACK_ID 
+                    ON t.TRACK_ID = s.TRACK_ID
                         AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.LEAD_TIME = s.LEAD_TIME
@@ -666,7 +666,7 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     Load met forecast metadata rows into MET_FORECASTS table.
 
     Creates the table if it does not exist. Uses staging + MERGE to deduplicate
-    on (FORECAST_TIME, PARAM) — re-runs are safe.
+    on (FORECAST_TIME, PARAM): re-runs are safe.
 
     The zarr is a global file (one per model run), so there is one row per
     (FORECAST_TIME, PARAM), not one per storm.

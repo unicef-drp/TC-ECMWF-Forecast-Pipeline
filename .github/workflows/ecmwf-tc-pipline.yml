@@ -3,7 +3,7 @@ name: TC Forecast Pipeline
 on:
   # Run 4x daily, 1h20m after ECMWF EPS TC track data is available (~7h40m after each run)
   schedule:
-    - cron: '0 3,9,15,21 * * *'  # 03/09/15/21 UTC — aligned to 18Z/00Z/06Z/12Z releases
+    - cron: '0 3,9,15,21 * * *'  # 03/09/15/21 UTC: aligned to 18Z/00Z/06Z/12Z releases
 
   # Allow manual trigger
   workflow_dispatch:
@@ -67,15 +67,26 @@ jobs:
 
       - name: Run TC Forecast Pipeline
         env:
-          # Snowflake credentials from GitHub Secrets
+          # Snowflake credentials from GitHub Secrets. DATA_PIPELINE_DB=BLOB below no
+          # longer requires these (validate() needs zero Snowflake creds in that mode),
+          # kept present so a workflow_dispatch override back to SNOWFLAKE still works
+          # without a separate secrets change.
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+
+          # Azure Blob Storage: tracks/envelope/met output all land here instead of the
+          # Snowflake stage.
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
 
           # Pipeline configuration
+          DATA_PIPELINE_DB: 'BLOB'
           DOWNLOAD_DATE: ${{ github.event.inputs.download_date }}
           RUN_TIME: ${{ github.event.inputs.run_time }}
           DOWNLOAD_LIMIT: '1'
@@ -86,7 +97,6 @@ jobs:
           # Gridded met parameter downloads (tp, ro)
           PROCESS_MET: 'true'
           MET_DATA_DIR: 'met_data'
-          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
           # Headless matplotlib (no display available in CI)
           MPLBACKEND: 'Agg'
         run: |

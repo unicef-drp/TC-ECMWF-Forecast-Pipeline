@@ -24,7 +24,7 @@ Coverage: the same 60S-60N band GloFAS's own discharge fetch already uses
 
 Mosaicking: JRC's own tiles are downloaded as-is, then streamed one at a time
         into a single per-band output GeoTIFF via rasterio.warp.reproject()
-        (never an in-memory full-mosaic array — see build_band_mosaic) so
+        (never an in-memory full-mosaic array; see build_band_mosaic) so
         glofas_extent_masking.py's resolve_jrc_cache()/combine_tier() can keep
         treating each band as one file, unchanged.
 
@@ -32,7 +32,7 @@ Usage:
     python3 setup_jrc_extents.py                                            # upload to Snowflake stage
     python3 setup_jrc_extents.py --local-only glofas_data/jrc_extent_cache  # keep local only, for offline dev
                                                                             # (this is glofas_extent_masking.py's
-                                                                            # own local default -- one root dir,
+                                                                            # own local default: one root dir,
                                                                             # no separate top-level cache)
     python3 setup_jrc_extents.py --bbox 88 20 93 26                         # smaller region, for testing
                                                                             # (west south east north)
@@ -144,7 +144,7 @@ def download_tile(url: str, dest_path: Path) -> None:
         if attempt < MAX_FETCH_RETRIES:
             backoff = RETRY_BACKOFF_BASE_S * (2 ** attempt)
             logger.warning(f"    {url}: {last_error} (attempt {attempt + 1}/"
-                            f"{MAX_FETCH_RETRIES + 1}) — retrying in {backoff:.0f}s")
+                            f"{MAX_FETCH_RETRIES + 1}) -- retrying in {backoff:.0f}s")
             time.sleep(backoff)
 
     raise PersistentTileFetchError(f"Persistent failure downloading {url}: {last_error}")
@@ -183,7 +183,7 @@ def build_band_mosaic(rp_key: str, bbox: Tuple[float, float, float, float], scal
             logger.info(f"    {i + 1}/{len(tile_index)} tiles downloaded")
 
     if not tile_paths:
-        raise RuntimeError(f"{folder}: no tiles intersect bbox {bbox} — check bbox")
+        raise RuntimeError(f"{folder}: no tiles intersect bbox {bbox} -- check bbox")
 
     logger.info(f"  {folder}: mosaicking {len(tile_paths)} tiles ...")
     # bounds/res are pinned to the FULL requested bbox/scale (not derived from
@@ -224,12 +224,12 @@ def build_band_mosaic(rp_key: str, bbox: Tuple[float, float, float, float], scal
     # one uncompressed array. Peak memory here is bounded by a single tile's
     # window (a few MB), not the whole mosaic.
     #
-    # reproject(destination=rasterio.band(dst, 1)) does NOT read-modify-write —
+    # reproject(destination=rasterio.band(dst, 1)) does NOT read-modify-write:
     # each call fills dst_nodata across the ENTIRE destination extent outside
     # the source's own footprint, silently wiping out every previously-written
     # tile (confirmed directly: writing tile 2 zeroed out tile 1's already-
     # written pixels). Same class of bug as the combine_tier() overlap bug
-    # fixed earlier — fixed the same way: reproject into a small array scoped
+    # fixed earlier; fixed the same way: reproject into a small array scoped
     # to just this tile's own destination window, then np.where() it against
     # the window's EXISTING contents before writing back.
     nodata = profile.get("nodata")
@@ -315,7 +315,7 @@ def main():
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
-    logger.info(f"JRC v2.1 flood-extent cache setup — bbox {bbox}, scale {args.scale}m")
+    logger.info(f"JRC v2.1 flood-extent cache setup -- bbox {bbox}, scale {args.scale}m")
     logger.info(f"Source: direct JRC download (no GEE, no auth, no quota)")
     logger.info("=" * 70)
 
@@ -352,27 +352,27 @@ def main():
         if not out_path.exists():
             build_band_mosaic(rp_key, bbox, args.scale, dest_dir / "raw_tiles", out_path, tile_index)
         else:
-            logger.info(f"  {OUTPUT_FILENAME[rp_key]} already built — skipping")
+            logger.info(f"  {OUTPUT_FILENAME[rp_key]} already built -- skipping")
         out_paths[rp_key] = out_path
 
     water_out = dest_dir / OUTPUT_FILENAME["water"]
     if not water_out.exists():
         build_band_mosaic("water", bbox, args.scale, dest_dir / "raw_tiles", water_out, tile_index)
     else:
-        logger.info(f"  {OUTPUT_FILENAME['water']} already built — skipping")
+        logger.info(f"  {OUTPUT_FILENAME['water']} already built -- skipping")
     out_paths["water"] = water_out
 
-    # Co-registration check — glofas_extent_masking.py hard-requires this.
+    # Co-registration check: glofas_extent_masking.py hard-requires this.
     with rasterio.open(out_paths["10.0"]) as ref:
         ref_transform, ref_shape = ref.transform, ref.shape
     for key, p in out_paths.items():
         with rasterio.open(p) as src:
             if src.transform != ref_transform or src.shape != ref_shape:
                 logger.error(f"  {p.name} is not co-registered with {out_paths['10.0'].name} "
-                              f"({src.shape} vs {ref_shape}) — glofas_extent_masking.py requires "
+                              f"({src.shape} vs {ref_shape}) -- glofas_extent_masking.py requires "
                               f"identical grids across all cached bands")
                 sys.exit(1)
-    logger.info("  Co-registration check passed — all bands share one grid")
+    logger.info("  Co-registration check passed -- all bands share one grid")
 
     if args.local_only:
         local_only_dir = Path(args.local_only)
@@ -381,7 +381,7 @@ def main():
             target = local_only_dir / p.name
             if p.resolve() != target.resolve():
                 target.write_bytes(p.read_bytes())
-        logger.info(f"Done — {len(out_paths)} files kept locally in {local_only_dir} "
+        logger.info(f"Done -- {len(out_paths)} files kept locally in {local_only_dir} "
                     f"(GLOFAS_JRC_SOURCE=local should point here)")
         return
 
@@ -390,11 +390,11 @@ def main():
     for var in ('SNOWFLAKE_ACCOUNT', 'SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD',
                 'SNOWFLAKE_WAREHOUSE', 'SNOWFLAKE_DATABASE', 'SNOWFLAKE_SCHEMA'):
         if not os.getenv(var):
-            logger.error(f"{var} not set — required for Snowflake stage upload")
+            logger.error(f"{var} not set -- required for Snowflake stage upload")
             sys.exit(1)
     stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
     if not stage_name:
-        logger.error("SNOWFLAKE_STAGE_NAME not set — required for Snowflake stage upload")
+        logger.error("SNOWFLAKE_STAGE_NAME not set -- required for Snowflake stage upload")
         sys.exit(1)
 
     conn = get_snowflake_connection()
@@ -406,7 +406,7 @@ def main():
     finally:
         conn.close()
 
-    logger.info(f"Done — {len(out_paths)} JRC cache files staged at @{stage_name}/{STAGE_PREFIX}/")
+    logger.info(f"Done -- {len(out_paths)} JRC cache files staged at @{stage_name}/{STAGE_PREFIX}/")
 
 
 if __name__ == "__main__":

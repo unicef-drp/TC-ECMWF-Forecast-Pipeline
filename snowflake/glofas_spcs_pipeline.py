@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SPCS entry point — standalone GloFAS riverine discharge pipeline (SPCS OAuth /
+SPCS entry point: standalone GloFAS riverine discharge pipeline (SPCS OAuth /
 private-key / password auth).
 
 A fully separate job from spcs_pipeline.py (the main TC forecast pipeline), NOT
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineConfig(BaseGlofasConfig):
-    """Configuration for the SPCS GloFAS pipeline (OAuth / private key auth) — adds
+    """Configuration for the SPCS GloFAS pipeline (OAuth / private key auth): adds
     only SPCS-specific fields on top of the shared base, mirroring how
     snowflake/spcs_pipeline.py's own PipelineConfig extends BasePipelineConfig."""
 
@@ -65,7 +65,7 @@ class PipelineConfig(BaseGlofasConfig):
         self.sf_private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
         self.sf_private_key_passphrase = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')
         # SPCS deployments commonly rely on these defaults rather than requiring
-        # every env var set explicitly — matches spcs_pipeline.py's own PipelineConfig.
+        # every env var set explicitly; matches spcs_pipeline.py's own PipelineConfig.
         self.sf_warehouse = os.getenv('SNOWFLAKE_WAREHOUSE', 'MY_WH')
         self.sf_database = os.getenv('SNOWFLAKE_DATABASE', 'MY_DB')
         self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
@@ -74,25 +74,45 @@ class PipelineConfig(BaseGlofasConfig):
         self.spcs_token_path = os.getenv('SPCS_TOKEN_PATH', '/snowflake/session/token')
 
     def validate(self) -> bool:
-        """Overrides the base (simple password-only) validation — SPCS supports
-        OAuth, private-key, or password auth, each with different requirements."""
+        """Overrides the base (simple password-only) validation: SPCS supports
+        OAuth, private-key, or password auth, each with different requirements.
+        BLOB, SNOWFLAKE, and LOCAL are genuinely independent, mirroring the base
+        class's own validate() (glofas_pipeline_core.py)."""
+        if self.data_pipeline_db not in ('SNOWFLAKE', 'BLOB', 'LOCAL'):
+            logger.error(f"Invalid DATA_PIPELINE_DB: {self.data_pipeline_db}. "
+                         "Must be 'SNOWFLAKE', 'BLOB', or 'LOCAL'")
+            return False
+
         if self.glofas_mode not in ('submit', 'process'):
             logger.error(f"Invalid GLOFAS_MODE: {self.glofas_mode}. Must be 'submit' or 'process'")
             return False
 
-        if self.glofas_threshold_source not in ('snowflake', 'local'):
+        if self.glofas_threshold_source not in ('snowflake', 'local', 'blob'):
             logger.error(f"Invalid GLOFAS_THRESHOLD_SOURCE: {self.glofas_threshold_source}. "
-                         "Must be 'snowflake' or 'local'")
+                         "Must be 'snowflake', 'local', or 'blob'")
             return False
 
-        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local'):
+        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local', 'blob'):
             logger.error(f"Invalid GLOFAS_JRC_SOURCE: {self.glofas_jrc_source}. "
-                         "Must be 'snowflake' or 'local'")
+                         "Must be 'snowflake', 'local', or 'blob'")
             return False
+
+        # Checked unconditionally, before the Snowflake early-return below: a fully-
+        # BLOB config needs zero Snowflake creds and must not skip this as a side effect.
+        if self.needs_blob_creds():
+            blob_missing = [var for var, val in (
+                ('ACCOUNT_URL', self.blob_account_url),
+                ('SAS_TOKEN', self.blob_sas_token),
+                ('CONTAINER_NAME', self.blob_container),
+            ) if not val]
+            if blob_missing:
+                logger.error(f"Missing required Blob environment variables: {', '.join(blob_missing)}")
+                return False
 
         if not self.needs_snowflake_creds():
-            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local, and "
-                        "(extent disabled or GLOFAS_JRC_SOURCE=local) — Snowflake credentials not required")
+            logger.info("No Snowflake-sourced path is configured (DATA_PIPELINE_DB, "
+                        "GLOFAS_THRESHOLD_SOURCE, and GLOFAS_JRC_SOURCE are all 'local'/'blob', "
+                        "or extent masking is disabled) -- Snowflake credentials not required")
             return True
 
         if not self.sf_account:
@@ -134,7 +154,7 @@ class PipelineConfig(BaseGlofasConfig):
 
 
 def _open_snowflake_conn(config: PipelineConfig):
-    """Open a Snowflake connection using the auth mode active in config — mirrors
+    """Open a Snowflake connection using the auth mode active in config, mirrors
     spcs_pipeline.py's _open_snowflake_conn."""
     os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
     os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
@@ -175,7 +195,9 @@ def main():
         logger.error("Configuration validation failed. Exiting.")
         sys.exit(1)
 
-    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+    # Gates the RIVER_FORECASTS metadata-row load, not the file upload itself: see
+    # github_actions/glofas_pipeline.py's identical fix for the full rationale.
+    upload_to_stage = config.data_pipeline_db in ('SNOWFLAKE', 'BLOB')
 
     conn = None
     if config.needs_snowflake_creds():
@@ -196,7 +218,7 @@ def main():
                 if existing:
                     logger.info(f"CDS requests already submitted for "
                                 f"{existing['actual_date'].strftime('%Y-%m-%d')} "
-                                f"({existing['requests']}) — skipping duplicate submission")
+                                f"({existing['requests']}) -- skipping duplicate submission")
                     sys.exit(0)
 
             submitted = run_glofas_submit_pipeline(config, snowflake_conn=conn)
@@ -222,7 +244,7 @@ def main():
                     sys.exit(1)
                 logger.info(f"Saved {rows} CDS request ID(s) for the later process step to resume")
             else:
-                logger.warning("No Snowflake connection — submitted request IDs cannot be "
+                logger.warning("No Snowflake connection -- submitted request IDs cannot be "
                                 "resumed later; the process step will submit fresh instead")
 
             logger.info("GloFAS submit step completed successfully!")
@@ -260,7 +282,7 @@ def main():
             else:
                 logger.warning(
                     "No stage_path in result (local day-cache hit before this run's "
-                    "data was ever staged) — skipping metadata load this run"
+                    "data was ever staged) -- skipping metadata load this run"
                 )
 
         # Extent-masking step (GloFAS x JRC v2.1)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Actions entry point — sequential pipeline execution with password auth.
+GitHub Actions entry point: sequential pipeline execution with password auth.
 
 Orchestrates steps 1–7 from pipeline_core, then loads the results to Snowflake
 using the github_actions/snowflake_loader (password-based connection).
@@ -51,20 +51,130 @@ class PipelineConfig(BasePipelineConfig):
 
 def step7_load(config: PipelineConfig, stats: PipelineStats,
                transformed_files: List[Path], envelope_files: List[Path],
-               precip_metadata: list):
-    """Step 7: Load all data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL."""
+               precip_metadata: list, raster_files: List[Path] = None):
+    """Step 7: Load all data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL.
+
+    raster_files: wind/gust speed-field GeoTIFFs from step5_process_wind().
+        Optional (defaults to none) so existing callers that haven't been
+        updated yet keep working. Uploaded via upload_to_blob() in BLOB mode
+        (own prefix per dataset) and via upload_to_snowflake_stage() in
+        SNOWFLAKE mode, in each case as a plain additive PUT alongside the
+        existing CSV MERGE logic below, never able to fail the run.
+    """
+    raster_files = raster_files or []
     logger.info("=" * 70)
     logger.info("STEP 7: Loading data to Snowflake...")
     logger.info("=" * 70)
 
     if config.data_pipeline_db == 'LOCAL':
-        logger.info("DATA_PIPELINE_DB=LOCAL — skipping Snowflake load, files kept locally")
+        logger.info("DATA_PIPELINE_DB=LOCAL -- skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
+        logger.info(f"  Wind rasters       : {len(raster_files)} file(s) in {config.wind_extracted_dir}")
         logger.info(f"  Met ZipStores      : {config.met_data_dir}")
-        stats.files_loaded = len(transformed_files) + len(envelope_files)
+        stats.files_loaded = len(transformed_files) + len(envelope_files) + len(raster_files)
         stats.rows_loaded = 0
         stats._local_mode = True
+        return
+
+    if config.data_pipeline_db == 'BLOB':
+        # Uploads the same track/envelope CSVs the SNOWFLAKE branch would MERGE
+        # directly, to the shared Blob container instead, under 'tracks/' and
+        # 'envelopes/' at the container root, parallel to 'met/' and 'glofas/'.
+        # This only covers the write side: TC_TRACKS/TC_ENVELOPES_COMBINED
+        # themselves are not updated from these files yet: loading Blob-resident
+        # CSVs into the actual Snowflake tables is a separate, not-yet-built piece
+        # (unlike MET_FORECASTS/RIVER_FORECASTS, there is no pointer-table row or
+        # refresh procedure for tracks/envelopes at all today; see this repo's own
+        # BasePipelineConfig docstring in pipeline_core.py for the load-side note).
+        logger.info("DATA_PIPELINE_DB=BLOB -- uploading CSVs to Blob, TC_TRACKS/TC_ENVELOPES_COMBINED not updated")
+        from ecmwf_met_downloader import upload_to_blob
+        uploaded = 0
+        for csv_file in transformed_files:
+            if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
+                               config.blob_container, f'tracks/{csv_file.name}'):
+                uploaded += 1
+        for csv_file in envelope_files:
+            if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
+                               config.blob_container, f'envelopes/{csv_file.name}'):
+                uploaded += 1
+        # Wind/gust rasters: own prefix per dataset, parallel to tracks/envelopes.
+        # No Snowflake pointer table needed (unlike MET_FORECASTS/RIVER_FORECASTS),
+        # since these are cleanly file-per-(storm, forecast_time, lead_time), the
+        # same pure-filename-parseable shape tracks/envelopes already use (see
+        # get_storms_local()/get_tracks_local() in the DATAPIPELINE repo, so a
+        # downstream BLOB-mode reader can list either prefix directly, no Snowflake
+        # dependency needed to discover these files). Prefix is derived from the
+        # filename's own `{dataset_label}_raster_` token (see
+        # _save_wind_rasters_for_lead_time()'s own docstring in
+        # ecmwf_tc_wind_combination.py), not a separate parameter, so wind and gust
+        # rasters can arrive in the same raster_files list without the caller
+        # having to keep them apart.
+        raster_uploaded = 0
+        for tif_file in raster_files:
+            prefix = 'gust_raster' if 'gust_raster' in tif_file.name else 'wind_raster'
+            if upload_to_blob(tif_file, config.blob_account_url, config.blob_sas_token,
+                               config.blob_container, f'{prefix}/{tif_file.name}'):
+                raster_uploaded += 1
+        if raster_files and raster_uploaded < len(raster_files):
+            error_msg = f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) uploaded to Blob successfully"
+            logger.warning(error_msg)  # warning, not error: additive output, must not fail an otherwise-successful run
+        elif raster_files:
+            logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Blob (wind_raster//gust_raster/)")
+        stats.files_loaded = uploaded + raster_uploaded
+        stats.rows_loaded = 0
+        stats._local_mode = True
+        if uploaded < len(transformed_files) + len(envelope_files):
+            error_msg = (f"Only {uploaded}/{len(transformed_files) + len(envelope_files)} "
+                         f"track/envelope CSVs uploaded to Blob successfully")
+            logger.error(error_msg)
+            stats.errors.append(error_msg)
+
+        # MET_FORECASTS pointer rows: unlike tracks/envelopes (which have no
+        # pointer-table equivalent at all yet, see the comment above), MET_FORECASTS
+        # is a real Snowflake table that anything downstream queries to find where a
+        # forecast cycle's precip/runoff Zarr actually lives. step6_download_precip
+        # already uploads the Zarr itself to Blob and builds precip_metadata with the
+        # real Blob stage_path regardless of mode; this was previously never written
+        # here, so the file existed in Blob with nothing in Snowflake ever pointing at
+        # it. Best-effort and never fatal to this otherwise-successful Blob upload: a
+        # mixed-mode deployment (real Snowflake creds configured alongside Blob, the
+        # case in this repo's actual .env) writes it for real; a genuinely
+        # credential-less BLOB-only deployment logs a warning and skips it, matching
+        # how the sibling RIVER_FORECASTS pointer write is treated as optional in a
+        # fully-independent BLOB glofas config (see github_actions/glofas_pipeline.py).
+        if precip_metadata:
+            have_snowflake_creds = all([
+                config.sf_account, config.sf_user, config.sf_password,
+                config.sf_warehouse, config.sf_database, config.sf_schema,
+            ])
+            if have_snowflake_creds:
+                conn = None
+                try:
+                    os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+                    os.environ['SNOWFLAKE_USER'] = config.sf_user
+                    os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+                    os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+                    os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+                    os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+                    conn = get_snowflake_connection()
+                    rows = load_precip_metadata_to_snowflake(precip_metadata, conn)
+                    stats.rows_loaded += rows
+                    logger.info(f"Loaded {rows} metadata row(s) into MET_FORECASTS (BLOB mode)")
+                except Exception as e:
+                    error_msg = f"Could not write MET_FORECASTS pointer row(s) in BLOB mode: {e}"
+                    logger.error(error_msg)
+                    stats.errors.append(error_msg)
+                finally:
+                    if conn is not None:
+                        conn.close()
+            else:
+                logger.warning(
+                    "No Snowflake credentials configured -- MET_FORECASTS pointer row(s) not "
+                    "written; the precip/runoff data is safely in Blob, but nothing in "
+                    "Snowflake records where it is until a MET_FORECASTS row is written "
+                    "separately"
+                )
         return
 
     try:
@@ -81,13 +191,13 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
 
             def _load_and_track(csv_file, table_type):
                 """load_csv_to_snowflake wrapper that tells a real failure
-                (None) apart from a legitimate empty file (0) — a None means
+                (None) apart from a legitimate empty file (0): a None means
                 the load itself broke and must be recorded as a real error,
                 not silently treated as zero rows loaded."""
                 nonlocal total_rows
                 rows = load_csv_to_snowflake(csv_file, conn, table_type=table_type)
                 if rows is None:
-                    error_msg = f"Failed to load {csv_file.name} into {table_type} — see error above"
+                    error_msg = f"Failed to load {csv_file.name} into {table_type} -- see error above"
                     logger.error(error_msg)
                     stats.errors.append(error_msg)
                     return
@@ -112,6 +222,34 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
 
             if precip_metadata:
                 total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
+
+            # Wind/gust rasters. SNOWFLAKE mode had no generic binary-file-to-stage
+            # upload path in this function until now. Reuses upload_to_snowflake_stage() (already used
+            # for precip's own Zarr uploads elsewhere in this pipeline, ecmwf_met_
+            # downloader.py), a real PUT to config.snowflake_stage_name, same
+            # wind_raster//gust_raster/ prefix convention as the BLOB branch above
+            # (derived from the filename's own `{dataset_label}_raster_` token). No
+            # Snowflake pointer-table row: same reasoning as BLOB mode, these files
+            # are cleanly file-per-(storm, forecast_time, lead_time) and
+            # pure-filename-parseable, a downstream SNOWFLAKE-mode reader can LIST
+            # the stage prefix directly.
+            raster_uploaded = 0
+            if raster_files and config.snowflake_stage_name:
+                from ecmwf_met_downloader import upload_to_snowflake_stage
+                for tif_file in raster_files:
+                    prefix = 'gust_raster' if 'gust_raster' in tif_file.name else 'wind_raster'
+                    if upload_to_snowflake_stage(tif_file, config.snowflake_stage_name,
+                                                  f'{prefix}/{tif_file.name}', conn):
+                        raster_uploaded += 1
+                if raster_uploaded < len(raster_files):
+                    logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) "
+                                    f"uploaded to Snowflake stage successfully")
+                else:
+                    logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Snowflake stage "
+                                f"(wind_raster//gust_raster/)")
+            elif raster_files:
+                logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust raster(s) not "
+                                "uploaded to Snowflake stage")
 
             def _safe_table_count(cursor, table_name):
                 """COUNT(*) for a diagnostic-only summary log line. Returns
@@ -157,7 +295,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {_fmt_count(gust_combined_count)}")
             logger.info(f"  MET_FORECASTS:                 {_fmt_count(met_count)}")
 
-            stats.files_loaded = len(transformed_files) + len(envelope_files)
+            stats.files_loaded = len(transformed_files) + len(envelope_files) + raster_uploaded
             stats.rows_loaded = total_rows
             logger.info(f"Loaded {total_rows:,} rows from {stats.files_loaded} files")
 
@@ -210,9 +348,9 @@ def main():
 
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
-            logger.warning("No named storms found in BUFR data — skipping wind processing.")
+            logger.warning("No named storms found in BUFR data -- skipping wind processing.")
             if config.process_met:
-                logger.info("PROCESS_MET=true — running met download anyway.")
+                logger.info("PROCESS_MET=true -- running met download anyway.")
                 tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
                 _precip_conn = None
                 if config.data_pipeline_db == 'SNOWFLAKE':
@@ -241,8 +379,8 @@ def main():
 
         step4_download_wind(config, stats, tc_data_info)
         step4b_download_gust(config, stats, tc_data_info)
-        envelope_files = step5_process_wind(config, stats)
-        gust_files = step5b_extract_gust_envelopes(config, stats)
+        envelope_files, raster_files = step5_process_wind(config, stats)
+        gust_files, gust_raster_files = step5b_extract_gust_envelopes(config, stats)
 
         # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
         _precip_conn = None
@@ -262,7 +400,8 @@ def main():
             if _precip_conn:
                 _precip_conn.close()
 
-        step7_load(config, stats, transformed_files, envelope_files + gust_files, precip_metadata)
+        step7_load(config, stats, transformed_files, envelope_files + gust_files, precip_metadata,
+                   raster_files=raster_files + gust_raster_files)
 
         cleanup_files(config)
         stats.log_summary()

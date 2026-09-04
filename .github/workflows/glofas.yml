@@ -4,7 +4,7 @@ on:
   # Two triggers, splitting the CDS interaction to avoid paying for idle compute
   # while waiting on the CDS queue:
   #  - submit  (15:00 UTC): fires the 2 CDS requests and exits in seconds
-  #  - process (15:40 UTC -- CDS_PROCESS_DELAY_MINUTES=40 in glofas_downloader.py):
+  #  - process (15:40 UTC, CDS_PROCESS_DELAY_MINUTES=40 in glofas_downloader.py):
   #    resumes those request IDs, waiting-then-downloading. Real observed CDS
   #    queue times so far: ~12-40 min across several real test runs; 40 min is a
   #    real-data-informed starting point with headroom, not a guess. If CDS still
@@ -21,7 +21,7 @@ on:
         required: false
         type: string
       mode:
-        description: 'GLOFAS_MODE override — submit (fire CDS requests, exit) or process (resume/full run, waits for CDS if needed)'
+        description: 'GLOFAS_MODE override -- submit (fire CDS requests, exit) or process (resume/full run, waits for CDS if needed)'
         required: false
         type: choice
         options:
@@ -60,18 +60,27 @@ jobs:
 
       - name: Run GloFAS Pipeline
         env:
+          # Still required: GLOFAS_MODE=submit always needs a plain Snowflake connection
+          # for the GLOFAS_CDS_REQUESTS table MERGE regardless of DATA_PIPELINE_DB (see
+          # glofas_pipeline_core.py's own needs_snowflake_creds()).
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
-          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
 
-          DATA_PIPELINE_DB: 'SNOWFLAKE'
+          # Azure Blob Storage: the per-cycle discharge/extent output, plus the static
+          # RP threshold and JRC extent/water reference rasters, all land here instead of
+          # the Snowflake stage. GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE default to
+          # DATA_PIPELINE_DB below, so leaving them unset here means both follow BLOB too.
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+
+          DATA_PIPELINE_DB: 'BLOB'
           DOWNLOAD_DATE: ${{ github.event.inputs.download_date }}
           GLOFAS_DATA_DIR: 'glofas_data'
-          GLOFAS_THRESHOLD_SOURCE: 'snowflake'
           # workflow_dispatch: honors the mode input (defaults to 'process').
           # schedule: 'submit' only for the 15:00 UTC trigger, 'process' for
           # everything else (the 15:40 UTC trigger, and any run type where
@@ -79,7 +88,7 @@ jobs:
           GLOFAS_MODE: ${{ github.event.inputs.mode || (github.event.schedule == '0 15 * * *' && 'submit') || 'process' }}
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
 
-          # CDS API credentials — see ~/.cdsapirc format at https://cds.climate.copernicus.eu
+          # CDS API credentials: see ~/.cdsapirc format at https://cds.climate.copernicus.eu
           CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
         run: |

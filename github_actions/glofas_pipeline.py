@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-GitHub Actions entry point — standalone GloFAS riverine discharge pipeline
+GitHub Actions entry point: standalone GloFAS riverine discharge pipeline
 (password auth).
 
 A fully separate job from the main TC forecast pipeline (ecmwf-tc-pipline.yml /
 github_actions/main.py), NOT wired into its steps. Two reasons this is standalone:
 
 1. GloFAS is TC-independent (a global, always-on hazard layer, not tied to any storm)
-   and only publishes once per calendar day, ~11h after the 00Z ECMWF cycle — that
+   and only publishes once per calendar day, ~11h after the 00Z ECMWF cycle: that
    doesn't map cleanly onto any of the TC pipeline's 4 daily run slots (03/09/15/21 UTC,
    themselves aligned to the 18Z/00Z/06Z/12Z TC cycles).
 2. A full global GloFAS fetch (60S-60N, 51 members, 7 daily steps) can take far longer
@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineConfig(BaseGlofasConfig):
-    """Configuration for the GitHub Actions GloFAS pipeline (password auth) — no
+    """Configuration for the GitHub Actions GloFAS pipeline (password auth): no
     additions needed over the shared base, matching github_actions/main.py's own
     empty PipelineConfig(BasePipelineConfig) subclass."""
 
@@ -72,7 +72,14 @@ def main():
         logger.error("Configuration validation failed. Exiting.")
         sys.exit(1)
 
-    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+    # Gates the RIVER_FORECASTS metadata-row load below, not the actual discharge/extent
+    # file upload itself (that's config.data_pipeline_db-aware internally, in
+    # download_glofas_forecast()/run_glofas_extent_masking()). Must include BLOB too, not
+    # just SNOWFLAKE: a real remote upload happens in both modes, so the pointer row should
+    # be recorded in both, gated on `conn` below for whether a Snowflake connection is
+    # actually available to write it with (not required at all in a fully-independent BLOB
+    # config; see blob_to_snowflake_loader.py for loading it separately in that case).
+    upload_to_stage = config.data_pipeline_db in ('SNOWFLAKE', 'BLOB')
 
     conn = None
     if config.needs_snowflake_creds():
@@ -100,7 +107,7 @@ def main():
                 if existing:
                     logger.info(f"CDS requests already submitted for "
                                 f"{existing['actual_date'].strftime('%Y-%m-%d')} "
-                                f"({existing['requests']}) — skipping duplicate submission")
+                                f"({existing['requests']}) -- skipping duplicate submission")
                     sys.exit(0)
 
             submitted = run_glofas_submit_pipeline(config, snowflake_conn=conn)
@@ -126,7 +133,7 @@ def main():
                     sys.exit(1)
                 logger.info(f"Saved {rows} CDS request ID(s) for the later process step to resume")
             else:
-                logger.warning("No Snowflake connection — submitted request IDs cannot be "
+                logger.warning("No Snowflake connection -- submitted request IDs cannot be "
                                 "resumed later; the process step will submit fresh instead")
 
             logger.info("GloFAS submit step completed successfully!")
@@ -164,7 +171,7 @@ def main():
             else:
                 logger.warning(
                     "No stage_path in result (local day-cache hit before this run's "
-                    "data was ever staged) — skipping metadata load this run"
+                    "data was ever staged) -- skipping metadata load this run"
                 )
 
         # Extent-masking step (GloFAS x JRC v2.1), best-effort, never fails this

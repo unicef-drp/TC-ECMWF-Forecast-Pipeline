@@ -4,7 +4,7 @@ One-time setup: cache the official GloFAS v4.0 RP threshold files.
 
 NOT part of the recurring pipeline, run this manually once (or again only if
 ECMWF releases a new GloFAS version). Downloads ECMWF's official, pre-computed
-return-period discharge threshold grids and PUTs them to a fixed Snowflake stage path. 
+return-period discharge threshold grids and PUTs them to a fixed Snowflake stage path.
 
 Source: https://confluence.ecmwf.int/spaces/CEMS/pages/242067380/Auxiliary+Data
         ("GloFAS Flood Thresholds" section)
@@ -99,7 +99,7 @@ def main():
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
-    logger.info(f"GloFAS RP threshold setup — {len(RP_LEVELS)} levels: {', '.join(RP_LEVELS)}")
+    logger.info(f"GloFAS RP threshold setup -- {len(RP_LEVELS)} levels: {', '.join(RP_LEVELS)}")
     logger.info("=" * 70)
 
     local_paths = []
@@ -117,7 +117,7 @@ def main():
             target = local_only_dir / p.name
             if p.resolve() != target.resolve():
                 target.write_bytes(p.read_bytes())
-        logger.info(f"Done — {len(local_paths)} files kept locally in {local_only_dir} "
+        logger.info(f"Done -- {len(local_paths)} files kept locally in {local_only_dir} "
                     f"(GLOFAS_THRESHOLD_SOURCE=local should point here)")
         return
 
@@ -126,11 +126,11 @@ def main():
     for var in ('SNOWFLAKE_ACCOUNT', 'SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD',
                 'SNOWFLAKE_WAREHOUSE', 'SNOWFLAKE_DATABASE', 'SNOWFLAKE_SCHEMA'):
         if not os.getenv(var):
-            logger.error(f"{var} not set — required for Snowflake stage upload")
+            logger.error(f"{var} not set -- required for Snowflake stage upload")
             sys.exit(1)
     stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
     if not stage_name:
-        logger.error("SNOWFLAKE_STAGE_NAME not set — required for Snowflake stage upload")
+        logger.error("SNOWFLAKE_STAGE_NAME not set -- required for Snowflake stage upload")
         sys.exit(1)
 
     conn = get_snowflake_connection()
@@ -142,7 +142,7 @@ def main():
     finally:
         conn.close()
 
-    logger.info(f"Done — {len(local_paths)} threshold files staged at "
+    logger.info(f"Done -- {len(local_paths)} threshold files staged at "
                 f"@{stage_name}/{STAGE_PREFIX}/")
 
 

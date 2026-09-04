@@ -2,7 +2,7 @@
 """
 ECMWF Tropical Cyclone Track Data Transformer
 
-This module provides functions to transform raw tropical cyclone track data 
+This module provides functions to transform raw tropical cyclone track data
 extracted from ECMWF BUFR files into standardized format.
 
 The transformer processes:
@@ -219,7 +219,7 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
     if not any([r_ne, r_se, r_sw, r_nw]):
         return None
 
-    # Convert km to degrees — latitude scaling is constant; longitude shrinks with cos(lat)
+    # Convert km to degrees: latitude scaling is constant; longitude shrinks with cos(lat)
     lat_deg_per_km = 1.0 / 111.0
     lon_deg_per_km = 1.0 / (111.0 * math.cos(math.radians(lat))) if lat != 90.0 else lat_deg_per_km
 
@@ -234,11 +234,11 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
     # boundary (e.g. lon=177.6 with a wide NE/SE radius can push lon_max
     # to 183.1). Snowflake's GEOGRAPHY type rejects longitudes outside
     # -180..180 outright, and TRY_TO_GEOGRAPHY(...) on that WKT silently
-    # returns NULL instead of erroring -- so an unwrapped polygon here
+    # returns NULL instead of erroring, so an unwrapped polygon here
     # would vanish downstream with no error surfaced anywhere. Split into
     # two rectangles, one per side of the date line, rather than naively
-    # wrapping just the overshooting coordinate (e.g. 183.1 -> -176.9)
-    # -- a naive wrap would invert lon_min > lon_max and balloon the
+    # wrapping just the overshooting coordinate (e.g. 183.1 -> -176.9):
+    # a naive wrap would invert lon_min > lon_max and balloon the
     # rectangle to cover ~350deg of longitude instead of the intended
     # narrow band.
     if lon_max > 180.0 and lon_min < -180.0:
@@ -368,7 +368,7 @@ def _nudge_antimeridian_vertices(geom):
     exact -180 (or +180) vertex outright ("Invalid Lng/Lat pair"), and the
     real production loaders parse this table's WKT via
     TRY_TO_GEOGRAPHY(...), which silently returns NULL on that rejection
-    rather than erroring -- so an unwrapped, un-nudged polygon here would
+    rather than erroring, so an unwrapped, un-nudged polygon here would
     vanish from Snowflake with no error surfaced anywhere. This mirrors
     the identical fix already applied to the separate wind/gust envelope
     path's own polygon_to_wkt() in ecmwf_wind_data_extractor.py (kept as a
@@ -378,7 +378,7 @@ def _nudge_antimeridian_vertices(geom):
 
     shapely.ops.transform (shapely 2.x) calls its callback once per
     coordinate *ring*, passing all of that ring's x values as a single
-    batched array/tuple, not scalar-per-call -- the nudge must be
+    batched array/tuple, not scalar-per-call: the nudge must be
     vectorized.
     """
     from shapely.ops import transform
@@ -606,12 +606,12 @@ def transform_tc_data(raw_csv_path: str,
         # reported wind speed at this forecast point never reaches that
         # threshold. WIND_SPEED_KNOTS is the storm's peak sustained wind
         # anywhere at this instant, so a nonzero quadrant radius for a
-        # HIGHER threshold is physically impossible -- confirmed as a real,
+        # HIGHER threshold is physically impossible: confirmed as a real,
         # live data-quality bug against production data (e.g. a row
         # reporting wind_speed_knots=29.9 alongside a 34kt-wind radius up
         # to 272km). The raw BUFR wind-radii fields are extracted
         # independently of the storm's own peak-wind field, so nothing
-        # upstream already guarantees this consistency -- guard it here,
+        # upstream already guarantees this consistency: guard it here,
         # once, right after both are available and before any downstream
         # consumer (wind field polygons, Snowflake load) reads the radius
         # columns.
@@ -788,7 +788,7 @@ def transform_all_in_directory(input_dir: str,
 
     for csv_file in csv_files:
         try:
-            # Generate output base (no extension) — transform_tc_data appends _transformed.csv
+            # Generate output base (no extension): transform_tc_data appends _transformed.csv
             output_base = output_path / csv_file.stem
 
             # Transform
