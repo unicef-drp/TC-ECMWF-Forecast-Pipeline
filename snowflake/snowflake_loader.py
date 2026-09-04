@@ -482,6 +482,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.LEAD_TIME = s.LEAD_TIME
                         AND t.WIND_THRESHOLD = s.WIND_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        VALID_TIME = s.VALID_TIME,
+                        LOADED_AT = CURRENT_TIMESTAMP()
                     WHEN NOT MATCHED THEN INSERT (
                         FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
                         WIND_THRESHOLD, ENVELOPE_REGION
@@ -561,6 +565,10 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.LEAD_TIME = s.LEAD_TIME
                         AND t.GUST_THRESHOLD = s.GUST_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        VALID_TIME = s.VALID_TIME,
+                        LOADED_AT = CURRENT_TIMESTAMP()
                     WHEN NOT MATCHED THEN INSERT (
                         FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
                         GUST_THRESHOLD, ENVELOPE_REGION, LOADED_AT

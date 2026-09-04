@@ -52,7 +52,9 @@ class PipelineConfig(BasePipelineConfig):
 def step7_load(config: PipelineConfig, stats: PipelineStats,
                transformed_files: List[Path], envelope_files: List[Path],
                precip_metadata: list, raster_files: List[Path] = None):
-    """Step 7: Load all data to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL.
+    """Step 7: Load all data. Real MERGE into Snowflake tables in SNOWFLAKE
+    mode, plain CSV/raster upload to Blob in BLOB mode, or a no-op (files
+    kept locally) in LOCAL mode.
 
     raster_files: wind/gust speed-field GeoTIFFs from step5_process_wind().
         Optional (defaults to none) so existing callers that haven't been
@@ -82,11 +84,13 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
         # directly, to the shared Blob container instead, under 'tracks/' and
         # 'envelopes/' at the container root, parallel to 'met/' and 'glofas/'.
         # This only covers the write side: TC_TRACKS/TC_ENVELOPES_COMBINED
-        # themselves are not updated from these files yet: loading Blob-resident
-        # CSVs into the actual Snowflake tables is a separate, not-yet-built piece
-        # (unlike MET_FORECASTS/RIVER_FORECASTS, there is no pointer-table row or
-        # refresh procedure for tracks/envelopes at all today; see this repo's own
-        # BasePipelineConfig docstring in pipeline_core.py for the load-side note).
+        # themselves are not updated from these files directly by this function.
+        # A separate, already-built manual loader (blob_to_snowflake_loader.py,
+        # not run automatically by any real scheduled workflow today) reads
+        # these same Blob prefixes back and MERGEs them into TC_TRACKS/
+        # TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_*; unlike MET_FORECASTS/
+        # RIVER_FORECASTS, there is no pointer-table row or automatic refresh
+        # procedure for tracks/envelopes.
         logger.info("DATA_PIPELINE_DB=BLOB -- uploading CSVs to Blob, TC_TRACKS/TC_ENVELOPES_COMBINED not updated")
         from ecmwf_met_downloader import upload_to_blob
         uploaded = 0
@@ -94,10 +98,14 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'tracks/{csv_file.name}'):
                 uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(csv_file.name)
         for csv_file in envelope_files:
             if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'envelopes/{csv_file.name}'):
                 uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(csv_file.name)
         # Wind/gust rasters: own prefix per dataset, parallel to tracks/envelopes.
         # No Snowflake pointer table needed (unlike MET_FORECASTS/RIVER_FORECASTS),
         # since these are cleanly file-per-(storm, forecast_time, lead_time), the
@@ -116,6 +124,8 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             if upload_to_blob(tif_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'{prefix}/{tif_file.name}'):
                 raster_uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(tif_file.name)
         if raster_files and raster_uploaded < len(raster_files):
             error_msg = f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) uploaded to Blob successfully"
             logger.warning(error_msg)  # warning, not error: additive output, must not fail an otherwise-successful run
@@ -200,6 +210,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                     error_msg = f"Failed to load {csv_file.name} into {table_type} -- see error above"
                     logger.error(error_msg)
                     stats.errors.append(error_msg)
+                    stats.upload_failed_filenames.add(csv_file.name)
                     return
                 total_rows += rows
 
@@ -241,6 +252,8 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                     if upload_to_snowflake_stage(tif_file, config.snowflake_stage_name,
                                                   f'{prefix}/{tif_file.name}', conn):
                         raster_uploaded += 1
+                    else:
+                        stats.upload_failed_filenames.add(tif_file.name)
                 if raster_uploaded < len(raster_files):
                     logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) "
                                     f"uploaded to Snowflake stage successfully")
@@ -250,6 +263,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             elif raster_files:
                 logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust raster(s) not "
                                 "uploaded to Snowflake stage")
+                stats.upload_failed_filenames.update(f.name for f in raster_files)
 
             def _safe_table_count(cursor, table_name):
                 """COUNT(*) for a diagnostic-only summary log line. Returns
@@ -368,7 +382,18 @@ def main():
                     if _precip_conn:
                         _precip_conn.close()
                 step7_load(config, stats, [], [], precip_metadata)
-                cleanup_files(config)
+                cleanup_files(config, stats.upload_failed_filenames)
+            else:
+                # step7_load() is what normally sets stats._local_mode (for
+                # the summary log's own label below, True for LOCAL and BLOB
+                # alike, only SNOWFLAKE leaves it False); PROCESS_MET=false
+                # skips that call entirely on this no-named-storms path, so
+                # set it directly here too. In an `else` specifically, not
+                # unconditionally: the PROCESS_MET=true branch above already
+                # ran step7_load() for real and set this correctly (True for
+                # BLOB too), an unconditional assignment here would silently
+                # overwrite that back to the wrong value for BLOB mode.
+                stats._local_mode = config.data_pipeline_db in ('LOCAL', 'BLOB')
             stats.log_summary()
             sys.exit(1 if stats.errors else 0)
 
@@ -403,7 +428,7 @@ def main():
         step7_load(config, stats, transformed_files, envelope_files + gust_files, precip_metadata,
                    raster_files=raster_files + gust_raster_files)
 
-        cleanup_files(config)
+        cleanup_files(config, stats.upload_failed_filenames)
         stats.log_summary()
 
         if stats.errors:

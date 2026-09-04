@@ -62,7 +62,10 @@ class BasePipelineConfig:
         # step7_load() (github_actions/main.py) uploads the track/envelope CSVs and the
         # gridded Zarr files to Blob instead of Snowflake, and does NOT write
         # TC_TRACKS/TC_ENVELOPES_COMBINED at all (loading Blob-resident CSVs into those
-        # tables is a separate, not-yet-built piece). The MET_FORECASTS pointer-table row
+        # tables directly; a separate, already-built manual loader,
+        # github_actions/blob_to_snowflake_loader.py, reads these same Blob prefixes
+        # back and MERGEs them in, but is not run automatically by any real scheduled
+        # workflow today). The MET_FORECASTS pointer-table row
         # IS written in BLOB mode, but only best-effort: if real Snowflake credentials
         # happen to also be configured (a legitimate mixed-mode deployment) it writes for
         # real, otherwise it's skipped with a logged warning rather than failing the run.
@@ -171,6 +174,20 @@ class BasePipelineConfig:
             )
             return False
 
+        # Non-fatal, discoverability only: raster output is deliberately
+        # optional/additive (see publish_wind_raster's own comment above),
+        # so a missing stage name here must not fail validate() the way the
+        # PROCESS_MET check above does. Without this warning, an operator
+        # who sets PUBLISH_WIND_RASTER=true without also setting
+        # SNOWFLAKE_STAGE_NAME (e.g. because PROCESS_MET=false skipped the
+        # hard check above) would only ever see a WARNING-level log deep in
+        # step7_load()/phase4_snowflake_loading(), easy to miss.
+        if self.publish_wind_raster and self.data_pipeline_db == 'SNOWFLAKE' and not self.snowflake_stage_name:
+            logger.warning(
+                "PUBLISH_WIND_RASTER=true but SNOWFLAKE_STAGE_NAME is not set: "
+                "wind/gust rasters will be generated but never uploaded this run."
+            )
+
         return self._validate_run_time()
 
     def create_directories(self):
@@ -202,6 +219,15 @@ class PipelineStats:
         self.files_loaded = 0
         self.rows_loaded = 0
         self.errors: List[str] = []
+        # Filenames (not full paths, since a given local file only ever
+        # lives in one real directory per run) that a real upload call
+        # (Blob or Snowflake stage) reported as failed, populated at each
+        # upload loop in step7_load()/phase4_snowflake_loading(). Read by
+        # cleanup_files() so a file that never actually made it to its real
+        # remote destination is not also deleted locally, real data loss a
+        # transient upload failure must not cause even when the failure
+        # itself (e.g. a raster) is deliberately non-fatal to the run.
+        self.upload_failed_filenames: set = set()
 
     def log_summary(self):
         """Log pipeline execution summary."""
@@ -585,7 +611,14 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
                 if 'gust' not in f.name
             ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
-            raster_files = list(config.wind_extracted_dir.glob("*_wind_raster_*.tif"))
+            # Gated on publish_raster, not just globbed unconditionally: a stale
+            # *.tif left over from an earlier cycle (e.g. a run that wrote
+            # rasters then crashed before cleanup_files() could remove them)
+            # must never get discovered and uploaded on a later cycle where the
+            # flag is off. Turning the flag off is expected to fully disable
+            # this feature, not just the write half of it.
+            raster_files = (list(config.wind_extracted_dir.glob("*_wind_raster_*.tif"))
+                             if config.publish_wind_raster else [])
             logger.info(f"Wind raster files: {len(raster_files)}")
             return envelope_files, raster_files
         else:
@@ -629,7 +662,11 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
             logger.info(f"Gust envelope files: {[f.name for f in gust_files]}")
         else:
             logger.warning("No gust envelope files generated")
-        raster_files = list(config.wind_extracted_dir.glob('*_gust_raster_*.tif'))
+        # Gated on publish_raster: see step5_process_wind()'s own identical
+        # comment for the full rationale (stale *.tif from an earlier cycle
+        # must never get discovered/uploaded once the flag is off).
+        raster_files = (list(config.wind_extracted_dir.glob('*_gust_raster_*.tif'))
+                         if config.publish_wind_raster else [])
         logger.info(f"Gust raster files: {len(raster_files)}")
         return gust_files, raster_files
     except Exception as e:
@@ -732,18 +769,31 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
 # Cleanup
 # ---------------------------------------------------------------------------
 
-def cleanup_files(config: BasePipelineConfig):
-    """Remove temporary data files after a successful pipeline run."""
+def cleanup_files(config: BasePipelineConfig, upload_failed_filenames=None):
+    """Remove temporary data files after a pipeline run.
+
+    upload_failed_filenames: optional set of filenames (basenames, not full
+    paths) that a real upload call reported as failed this run (see
+    PipelineStats.upload_failed_filenames' own docstring). Any real local
+    file matching one of these names is skipped here regardless of which
+    glob pattern/directory below would otherwise remove it, so a file that
+    never actually reached its real remote destination is not also deleted
+    locally. Deliberately matched by filename, not full path: every real
+    output type here has exactly one real source directory per run, so a
+    basename match is unambiguous.
+    """
     if not config.cleanup_after_load:
         logger.info("Cleanup skipped (CLEANUP_AFTER_LOAD=false)")
         return
 
     local_mode = getattr(config, 'data_pipeline_db', 'SNOWFLAKE') == 'LOCAL'
+    upload_failed_filenames = upload_failed_filenames or set()
 
     logger.info("Cleaning up temporary files...")
     try:
         import shutil
         removed = 0
+        skipped = 0
         for pattern, directory in [
             ("*.bufr4", config.raw_data_dir),
             ("*.bin", config.raw_data_dir),
@@ -767,6 +817,9 @@ def cleanup_files(config: BasePipelineConfig):
         ]:
             if directory.exists():
                 for f in directory.glob(pattern):
+                    if f.name in upload_failed_filenames:
+                        skipped += 1
+                        continue
                     f.unlink()
                     removed += 1
 
@@ -778,5 +831,12 @@ def cleanup_files(config: BasePipelineConfig):
             logger.info("Removed .idx_cache directory")
 
         logger.info(f"Removed {removed} temporary file(s)")
+        if skipped:
+            logger.warning(f"Kept {skipped} local file(s) that failed to upload this run, "
+                            f"not deleted (a real filename-matching glob in a later run, "
+                            f"same or subsequent cycle, may still pick these up and retry "
+                            f"the upload; each filename already encodes its own real storm/"
+                            f"cycle/lead-time identity, so a delayed upload still lands "
+                            f"correctly labeled even if it arrives later than expected)")
     except Exception as e:
         logger.warning(f"Cleanup failed (non-critical): {e}")

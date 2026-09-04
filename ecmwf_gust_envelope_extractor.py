@@ -75,8 +75,8 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]
     Returns:
         List[xr.DataArray]: One loaded, cropped DataArray per real longitude
             window (length 1, bbox clipped exactly as before, for the
-            overwhelming majority of storms, length 2 only when bbox
-            straddles the antimeridian. Callers must extract contours once
+            overwhelming majority of storms; length 2 only when bbox
+            straddles the antimeridian). Callers must extract contours once
             per element and merge results (see merge_contour_dicts), never
             concatenate these arrays directly.
     """

@@ -195,11 +195,12 @@ Uses a **staging table → MERGE** pattern:
 
 **`DATA_PIPELINE_DB=BLOB`** takes a different path entirely: track/envelope CSVs and met Zarr files are
 uploaded straight to Azure Blob Storage instead of Snowflake, under `tracks/`, `envelopes/`, and `met/`
-at the container root. `TC_TRACKS`/`TC_ENVELOPES_COMBINED`/`TC_GUST_ENVELOPES_*` are **not** written in
-this mode (loading Blob-resident CSVs into those tables is a separate, not-yet-built piece). The
-`MET_FORECASTS` pointer row is written best-effort: if real Snowflake credentials also happen to be
-configured (a legitimate mixed-mode deployment) it writes for real, otherwise it's skipped with a
-logged warning rather than failing the run.
+at the container root. `TC_TRACKS`/`TC_ENVELOPES_COMBINED`/`TC_GUST_ENVELOPES_*` are **not** written
+directly in this mode; a separate, already-built manual loader, `github_actions/blob_to_snowflake_loader.py`,
+reads these same Blob prefixes back and MERGEs them in, but is not run automatically by any real
+scheduled workflow today. The `MET_FORECASTS` pointer row is written best-effort: if real Snowflake
+credentials also happen to be configured (a legitimate mixed-mode deployment) it writes for real,
+otherwise it's skipped with a logged warning rather than failing the run.
 
 ## Running the Pipeline
 
@@ -209,7 +210,10 @@ logged warning rather than failing the run.
 # Interactive exploration via Jupyter notebook
 jupyter notebook pipeline_demonstration.ipynb
 
-# Full pipeline run (latest available forecast)
+# Full pipeline run (latest available forecast). .env must already be
+# sourced into the shell first (see Quick Start above); this script does
+# not load it itself.
+set -a; source .env; set +a
 python github_actions/main.py
 
 # Specific date and run time
@@ -340,6 +344,11 @@ pip install -r requirements.txt
 
 # 2. Configure credentials
 cp sample_env.txt .env
+# Edit .env with real values, then load it into the shell: neither
+# github_actions/main.py nor snowflake/spcs_pipeline.py auto-loads .env
+# (no python-dotenv call anywhere in this repo), so a direct script run
+# needs the file sourced first, not just edited:
+set -a; source .env; set +a
 
 # 3. Test locally
 jupyter notebook pipeline_demonstration.ipynb

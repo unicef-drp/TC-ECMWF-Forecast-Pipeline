@@ -165,6 +165,14 @@ class PipelineConfig(BasePipelineConfig):
             )
             return False
 
+        # Non-fatal, discoverability only: see BasePipelineConfig.validate()'s
+        # own identical check (pipeline_core.py) for the full rationale.
+        if self.publish_wind_raster and self.data_pipeline_db == 'SNOWFLAKE' and not self.snowflake_stage_name:
+            logger.warning(
+                "PUBLISH_WIND_RASTER=true but SNOWFLAKE_STAGE_NAME is not set: "
+                "wind/gust rasters will be generated but never uploaded this run."
+            )
+
         return self._validate_run_time()
 
 
@@ -253,7 +261,9 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                               envelope_files: List[Path],
                               precip_metadata: list = None,
                               raster_files: List[Path] = None):
-    """Phase 4: Load all results to Snowflake, or skip if DATA_PIPELINE_DB=LOCAL.
+    """Phase 4: Load all results. Real MERGE into Snowflake tables in
+    SNOWFLAKE mode, plain CSV/raster upload to Blob in BLOB mode, or a no-op
+    (files kept locally) in LOCAL mode.
 
     raster_files: wind/gust speed-field GeoTIFFs from step5_process_wind().
         Uploaded in both BLOB and SNOWFLAKE mode below, same shape as
@@ -285,8 +295,9 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         # container root, matching github_actions/main.py's step7_load() BLOB branch for
         # the identical pipeline (this file is the SPCS entry point for the same pipeline).
         # TC_TRACKS/TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_* are not written from these
-        # CSVs: that is a separate, not-yet-built piece, same open item as the GHA entry
-        # point's own step7_load comment.
+        # CSVs directly: a separate, already-built manual loader
+        # (blob_to_snowflake_loader.py, not run automatically by any real scheduled
+        # workflow today) reads these same Blob prefixes back and MERGEs them in.
         logger.info("DATA_PIPELINE_DB=BLOB -- uploading CSVs to Blob, TC_TRACKS/TC_ENVELOPES_COMBINED not updated")
         from ecmwf_met_downloader import upload_to_blob
         uploaded = 0
@@ -294,10 +305,14 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
             if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'tracks/{csv_file.name}'):
                 uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(csv_file.name)
         for csv_file in envelope_files:
             if upload_to_blob(csv_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'envelopes/{csv_file.name}'):
                 uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(csv_file.name)
         # Wind/gust rasters: own prefix per dataset, parallel to tracks/envelopes. See
         # github_actions/main.py's step7_load() BLOB branch for the full rationale (no
         # Snowflake pointer table needed, cleanly file-per-(storm, forecast_time,
@@ -311,6 +326,8 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
             if upload_to_blob(tif_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'{prefix}/{tif_file.name}'):
                 raster_uploaded += 1
+            else:
+                stats.upload_failed_filenames.add(tif_file.name)
         if raster_files and raster_uploaded < len(raster_files):
             logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) uploaded to Blob successfully")
         elif raster_files:
@@ -387,6 +404,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                     error_msg = f"Failed to load {csv_file.name} into {table_type} -- see error above"
                     logger.error(error_msg)
                     stats.errors.append(error_msg)
+                    stats.upload_failed_filenames.add(csv_file.name)
                     return
                 total_rows += rows
 
@@ -427,6 +445,8 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                     if upload_to_snowflake_stage(tif_file, config.snowflake_stage_name,
                                                   f'{prefix}/{tif_file.name}', conn):
                         raster_uploaded += 1
+                    else:
+                        stats.upload_failed_filenames.add(tif_file.name)
                 if raster_uploaded < len(raster_files):
                     logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) "
                                     f"uploaded to Snowflake stage successfully")
@@ -436,6 +456,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
             elif raster_files:
                 logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust raster(s) not "
                                 "uploaded to Snowflake stage")
+                stats.upload_failed_filenames.update(f.name for f in raster_files)
 
             def _safe_table_count(cursor, table_name):
                 """COUNT(*) for a diagnostic-only summary log line. Returns
@@ -567,7 +588,11 @@ def main():
                     if _precip_conn:
                         _precip_conn.close()
                 phase4_snowflake_loading(config, stats, [], [], precip_metadata)
-                cleanup_files(config)
+                cleanup_files(config, stats.upload_failed_filenames)
+            # No _local_mode bookkeeping needed here unlike github_actions/main.py's
+            # own equivalent branch: this file's own PipelineStats.log_summary()
+            # override (above) uses one plain, mode-agnostic "Files Loaded:" label,
+            # it never branches on _local_mode at all.
             stats.log_summary()
             sys.exit(1 if stats.errors else 0)
 
@@ -614,7 +639,7 @@ def main():
         phase4_snowflake_loading(config, stats, transformed_files, envelope_files + gust_files, precip_metadata,
                                   raster_files=raster_files + gust_raster_files)
 
-        cleanup_files(config)
+        cleanup_files(config, stats.upload_failed_filenames)
         stats.log_summary()
 
         if stats.errors:
