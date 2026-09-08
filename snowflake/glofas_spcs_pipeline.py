@@ -153,6 +153,23 @@ class PipelineConfig(BaseGlofasConfig):
         return True
 
 
+def _have_real_snowflake_creds(config: PipelineConfig) -> bool:
+    """Whether enough real Snowflake credentials are present to open a connection,
+    independent of whether the configured MODE (needs_snowflake_creds()) says one is
+    required. Mirrors validate()'s own credential-sufficiency checks (SPCS OAuth vs.
+    private key vs. password) so a fully-independent BLOB config that nonetheless has
+    real credentials sitting in the environment isn't treated as credential-less."""
+    if not config.sf_account:
+        return False
+    if config.spcs_run:
+        return Path(config.spcs_token_path).is_file() and bool(os.getenv('SNOWFLAKE_HOST')) and bool(os.getenv('SNOWFLAKE_PORT'))
+    if not config.sf_user:
+        return False
+    if config.sf_private_key_path:
+        return Path(config.sf_private_key_path).is_file()
+    return bool(config.sf_password)
+
+
 def _open_snowflake_conn(config: PipelineConfig):
     """Open a Snowflake connection using the auth mode active in config, mirrors
     spcs_pipeline.py's _open_snowflake_conn."""
@@ -263,40 +280,63 @@ def main():
         if result is None:
             sys.exit(1)
 
-        if upload_to_stage and conn:
-            if result.get('stage_path'):
-                metadata_rows = [{
-                    'forecast_time': result['forecast_date'],
-                    'param': result['param'],
-                    'stage_path': result['stage_path'],
-                }]
-                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
-                logger.info(f"Loaded {rows} metadata row(s) into RIVER_FORECASTS")
+        # RIVER_FORECASTS pointer rows: `conn` above is only opened when needs_snowflake_
+        # creds() says the configured MODE requires it, so a fully-independent BLOB config
+        # leaves it None even when real credentials are sitting right there in the
+        # environment -- write_conn reuses `conn` if already open, otherwise opens its own
+        # ad-hoc connection whenever real credentials are present, matching
+        # github_actions/glofas_pipeline.py's identical fix.
+        write_conn = conn
+        write_conn_is_ad_hoc = False
+        if upload_to_stage and write_conn is None and _have_real_snowflake_creds(config):
+            write_conn = _open_snowflake_conn(config)
+            write_conn_is_ad_hoc = True
 
-                cursor = conn.cursor()
-                try:
-                    cursor.execute("SELECT COUNT(*) FROM RIVER_FORECASTS")
-                    logger.info(f"RIVER_FORECASTS total rows: {cursor.fetchone()[0]:,}")
-                finally:
-                    cursor.close()
-            else:
+        try:
+            if upload_to_stage and write_conn:
+                if result.get('stage_path'):
+                    metadata_rows = [{
+                        'forecast_time': result['forecast_date'],
+                        'param': result['param'],
+                        'stage_path': result['stage_path'],
+                    }]
+                    rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    logger.info(f"Loaded {rows} metadata row(s) into RIVER_FORECASTS")
+
+                    cursor = write_conn.cursor()
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM RIVER_FORECASTS")
+                        logger.info(f"RIVER_FORECASTS total rows: {cursor.fetchone()[0]:,}")
+                    finally:
+                        cursor.close()
+                else:
+                    logger.warning(
+                        "No stage_path in result (local day-cache hit before this run's "
+                        "data was ever staged) -- skipping metadata load this run"
+                    )
+            elif upload_to_stage:
                 logger.warning(
-                    "No stage_path in result (local day-cache hit before this run's "
-                    "data was ever staged) -- skipping metadata load this run"
+                    "No Snowflake credentials configured -- RIVER_FORECASTS pointer row(s) "
+                    "not written; the discharge/extent data is safely in Blob, but nothing "
+                    "in Snowflake records where it is until a RIVER_FORECASTS row is "
+                    "written separately"
                 )
 
-        # Extent-masking step (GloFAS x JRC v2.1)
-        extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
-        if extent_results and upload_to_stage and conn:
-            metadata_rows = [{
-                'forecast_time': result['forecast_date'],
-                'param': f"extent_rp{int(float(r['rp']))}_bymember",
-                'is_standin': r['is_standin'],
-                'stage_path': r['stage_path'],
-            } for r in extent_results if r.get('stage_path')]
-            if metadata_rows:
-                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
-                logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
+            # Extent-masking step (GloFAS x JRC v2.1)
+            extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
+            if extent_results and upload_to_stage and write_conn:
+                metadata_rows = [{
+                    'forecast_time': result['forecast_date'],
+                    'param': f"extent_rp{int(float(r['rp']))}_bymember",
+                    'is_standin': r['is_standin'],
+                    'stage_path': r['stage_path'],
+                } for r in extent_results if r.get('stage_path')]
+                if metadata_rows:
+                    rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
+        finally:
+            if write_conn_is_ad_hoc:
+                write_conn.close()
 
         logger.info("GloFAS pipeline completed successfully!")
         sys.exit(0)
