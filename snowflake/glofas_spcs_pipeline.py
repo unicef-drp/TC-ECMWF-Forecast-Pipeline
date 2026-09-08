@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SPCS entry point — standalone GloFAS riverine discharge pipeline (SPCS OAuth /
+SPCS entry point: standalone GloFAS riverine discharge pipeline (SPCS OAuth /
 private-key / password auth).
 
 A fully separate job from spcs_pipeline.py (the main TC forecast pipeline), NOT
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineConfig(BaseGlofasConfig):
-    """Configuration for the SPCS GloFAS pipeline (OAuth / private key auth) — adds
+    """Configuration for the SPCS GloFAS pipeline (OAuth / private key auth): adds
     only SPCS-specific fields on top of the shared base, mirroring how
     snowflake/spcs_pipeline.py's own PipelineConfig extends BasePipelineConfig."""
 
@@ -65,7 +65,7 @@ class PipelineConfig(BaseGlofasConfig):
         self.sf_private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
         self.sf_private_key_passphrase = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')
         # SPCS deployments commonly rely on these defaults rather than requiring
-        # every env var set explicitly — matches spcs_pipeline.py's own PipelineConfig.
+        # every env var set explicitly; matches spcs_pipeline.py's own PipelineConfig.
         self.sf_warehouse = os.getenv('SNOWFLAKE_WAREHOUSE', 'MY_WH')
         self.sf_database = os.getenv('SNOWFLAKE_DATABASE', 'MY_DB')
         self.sf_schema = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
@@ -74,25 +74,45 @@ class PipelineConfig(BaseGlofasConfig):
         self.spcs_token_path = os.getenv('SPCS_TOKEN_PATH', '/snowflake/session/token')
 
     def validate(self) -> bool:
-        """Overrides the base (simple password-only) validation — SPCS supports
-        OAuth, private-key, or password auth, each with different requirements."""
+        """Overrides the base (simple password-only) validation: SPCS supports
+        OAuth, private-key, or password auth, each with different requirements.
+        BLOB, SNOWFLAKE, and LOCAL are genuinely independent, mirroring the base
+        class's own validate() (glofas_pipeline_core.py)."""
+        if self.data_pipeline_db not in ('SNOWFLAKE', 'BLOB', 'LOCAL'):
+            logger.error(f"Invalid DATA_PIPELINE_DB: {self.data_pipeline_db}. "
+                         "Must be 'SNOWFLAKE', 'BLOB', or 'LOCAL'")
+            return False
+
         if self.glofas_mode not in ('submit', 'process'):
             logger.error(f"Invalid GLOFAS_MODE: {self.glofas_mode}. Must be 'submit' or 'process'")
             return False
 
-        if self.glofas_threshold_source not in ('snowflake', 'local'):
+        if self.glofas_threshold_source not in ('snowflake', 'local', 'blob'):
             logger.error(f"Invalid GLOFAS_THRESHOLD_SOURCE: {self.glofas_threshold_source}. "
-                         "Must be 'snowflake' or 'local'")
+                         "Must be 'snowflake', 'local', or 'blob'")
             return False
 
-        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local'):
+        if self.glofas_extent_enabled and self.glofas_jrc_source not in ('snowflake', 'local', 'blob'):
             logger.error(f"Invalid GLOFAS_JRC_SOURCE: {self.glofas_jrc_source}. "
-                         "Must be 'snowflake' or 'local'")
+                         "Must be 'snowflake', 'local', or 'blob'")
             return False
+
+        # Checked unconditionally, before the Snowflake early-return below: a fully-
+        # BLOB config needs zero Snowflake creds and must not skip this as a side effect.
+        if self.needs_blob_creds():
+            blob_missing = [var for var, val in (
+                ('ACCOUNT_URL', self.blob_account_url),
+                ('SAS_TOKEN', self.blob_sas_token),
+                ('CONTAINER_NAME', self.blob_container),
+            ) if not val]
+            if blob_missing:
+                logger.error(f"Missing required Blob environment variables: {', '.join(blob_missing)}")
+                return False
 
         if not self.needs_snowflake_creds():
-            logger.info("DATA_PIPELINE_DB=LOCAL, GLOFAS_THRESHOLD_SOURCE=local, and "
-                        "(extent disabled or GLOFAS_JRC_SOURCE=local) — Snowflake credentials not required")
+            logger.info("No Snowflake-sourced path is configured (DATA_PIPELINE_DB, "
+                        "GLOFAS_THRESHOLD_SOURCE, and GLOFAS_JRC_SOURCE are all 'local'/'blob', "
+                        "or extent masking is disabled) -- Snowflake credentials not required")
             return True
 
         if not self.sf_account:
@@ -133,8 +153,25 @@ class PipelineConfig(BaseGlofasConfig):
         return True
 
 
+def _have_real_snowflake_creds(config: PipelineConfig) -> bool:
+    """Whether enough real Snowflake credentials are present to open a connection,
+    independent of whether the configured MODE (needs_snowflake_creds()) says one is
+    required. Mirrors validate()'s own credential-sufficiency checks (SPCS OAuth vs.
+    private key vs. password) so a fully-independent BLOB config that nonetheless has
+    real credentials sitting in the environment isn't treated as credential-less."""
+    if not config.sf_account:
+        return False
+    if config.spcs_run:
+        return Path(config.spcs_token_path).is_file() and bool(os.getenv('SNOWFLAKE_HOST')) and bool(os.getenv('SNOWFLAKE_PORT'))
+    if not config.sf_user:
+        return False
+    if config.sf_private_key_path:
+        return Path(config.sf_private_key_path).is_file()
+    return bool(config.sf_password)
+
+
 def _open_snowflake_conn(config: PipelineConfig):
-    """Open a Snowflake connection using the auth mode active in config — mirrors
+    """Open a Snowflake connection using the auth mode active in config, mirrors
     spcs_pipeline.py's _open_snowflake_conn."""
     os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
     os.environ['SNOWFLAKE_USER'] = config.sf_user or ''
@@ -175,7 +212,9 @@ def main():
         logger.error("Configuration validation failed. Exiting.")
         sys.exit(1)
 
-    upload_to_stage = (config.data_pipeline_db == 'SNOWFLAKE')
+    # Gates the RIVER_FORECASTS metadata-row load, not the file upload itself: see
+    # github_actions/glofas_pipeline.py's identical fix for the full rationale.
+    upload_to_stage = config.data_pipeline_db in ('SNOWFLAKE', 'BLOB')
 
     conn = None
     if config.needs_snowflake_creds():
@@ -196,7 +235,7 @@ def main():
                 if existing:
                     logger.info(f"CDS requests already submitted for "
                                 f"{existing['actual_date'].strftime('%Y-%m-%d')} "
-                                f"({existing['requests']}) — skipping duplicate submission")
+                                f"({existing['requests']}) -- skipping duplicate submission")
                     sys.exit(0)
 
             submitted = run_glofas_submit_pipeline(config, snowflake_conn=conn)
@@ -222,7 +261,7 @@ def main():
                     sys.exit(1)
                 logger.info(f"Saved {rows} CDS request ID(s) for the later process step to resume")
             else:
-                logger.warning("No Snowflake connection — submitted request IDs cannot be "
+                logger.warning("No Snowflake connection -- submitted request IDs cannot be "
                                 "resumed later; the process step will submit fresh instead")
 
             logger.info("GloFAS submit step completed successfully!")
@@ -241,40 +280,63 @@ def main():
         if result is None:
             sys.exit(1)
 
-        if upload_to_stage and conn:
-            if result.get('stage_path'):
-                metadata_rows = [{
-                    'forecast_time': result['forecast_date'],
-                    'param': result['param'],
-                    'stage_path': result['stage_path'],
-                }]
-                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
-                logger.info(f"Loaded {rows} metadata row(s) into RIVER_FORECASTS")
+        # RIVER_FORECASTS pointer rows: `conn` above is only opened when needs_snowflake_
+        # creds() says the configured MODE requires it, so a fully-independent BLOB config
+        # leaves it None even when real credentials are sitting right there in the
+        # environment -- write_conn reuses `conn` if already open, otherwise opens its own
+        # ad-hoc connection whenever real credentials are present, matching
+        # github_actions/glofas_pipeline.py's identical fix.
+        write_conn = conn
+        write_conn_is_ad_hoc = False
+        if upload_to_stage and write_conn is None and _have_real_snowflake_creds(config):
+            write_conn = _open_snowflake_conn(config)
+            write_conn_is_ad_hoc = True
 
-                cursor = conn.cursor()
-                try:
-                    cursor.execute("SELECT COUNT(*) FROM RIVER_FORECASTS")
-                    logger.info(f"RIVER_FORECASTS total rows: {cursor.fetchone()[0]:,}")
-                finally:
-                    cursor.close()
-            else:
+        try:
+            if upload_to_stage and write_conn:
+                if result.get('stage_path'):
+                    metadata_rows = [{
+                        'forecast_time': result['forecast_date'],
+                        'param': result['param'],
+                        'stage_path': result['stage_path'],
+                    }]
+                    rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    logger.info(f"Loaded {rows} metadata row(s) into RIVER_FORECASTS")
+
+                    cursor = write_conn.cursor()
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM RIVER_FORECASTS")
+                        logger.info(f"RIVER_FORECASTS total rows: {cursor.fetchone()[0]:,}")
+                    finally:
+                        cursor.close()
+                else:
+                    logger.warning(
+                        "No stage_path in result (local day-cache hit before this run's "
+                        "data was ever staged) -- skipping metadata load this run"
+                    )
+            elif upload_to_stage:
                 logger.warning(
-                    "No stage_path in result (local day-cache hit before this run's "
-                    "data was ever staged) — skipping metadata load this run"
+                    "No Snowflake credentials configured -- RIVER_FORECASTS pointer row(s) "
+                    "not written; the discharge/extent data is safely in Blob, but nothing "
+                    "in Snowflake records where it is until a RIVER_FORECASTS row is "
+                    "written separately"
                 )
 
-        # Extent-masking step (GloFAS x JRC v2.1)
-        extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
-        if extent_results and upload_to_stage and conn:
-            metadata_rows = [{
-                'forecast_time': result['forecast_date'],
-                'param': f"extent_rp{int(float(r['rp']))}_bymember",
-                'is_standin': r['is_standin'],
-                'stage_path': r['stage_path'],
-            } for r in extent_results if r.get('stage_path')]
-            if metadata_rows:
-                rows = load_riverine_metadata_to_snowflake(metadata_rows, conn)
-                logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
+            # Extent-masking step (GloFAS x JRC v2.1)
+            extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
+            if extent_results and upload_to_stage and write_conn:
+                metadata_rows = [{
+                    'forecast_time': result['forecast_date'],
+                    'param': f"extent_rp{int(float(r['rp']))}_bymember",
+                    'is_standin': r['is_standin'],
+                    'stage_path': r['stage_path'],
+                } for r in extent_results if r.get('stage_path')]
+                if metadata_rows:
+                    rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
+        finally:
+            if write_conn_is_ad_hoc:
+                write_conn.close()
 
         logger.info("GloFAS pipeline completed successfully!")
         sys.exit(0)

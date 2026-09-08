@@ -8,17 +8,30 @@
 # Core Environment Variables (used by multiple components)
 # ==============================================================================
 
-# Storage backend: SNOWFLAKE (push to Snowflake, default) or LOCAL (keep files locally, skip load)
-# When LOCAL, Snowflake credentials below are not required.
+# Storage backend: SNOWFLAKE (push to Snowflake, default), BLOB (upload to Azure Blob
+# Storage), or LOCAL (keep files locally, skip load). GLOFAS_THRESHOLD_SOURCE and
+# GLOFAS_JRC_SOURCE below default to this same value, so switching this alone redirects
+# everything the pipeline touches unless one of those is set explicitly to something
+# different (a legitimate mixed-mode config, e.g. Blob for per-cycle output but Snowflake
+# for those static reference files). When LOCAL, Snowflake credentials below are not
+# required; when BLOB, Snowflake credentials are still not required, but the Blob
+# credentials below are.
 DATA_PIPELINE_DB=SNOWFLAKE
 
-# Snowflake Connection (required when DATA_PIPELINE_DB=SNOWFLAKE)
+# Snowflake Connection (required when DATA_PIPELINE_DB=SNOWFLAKE, or when
+# GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE=snowflake)
 SNOWFLAKE_ACCOUNT=your_account_identifier
 SNOWFLAKE_USER=your_username
 SNOWFLAKE_PASSWORD=your_password
 SNOWFLAKE_WAREHOUSE=your_warehouse
 SNOWFLAKE_DATABASE=your_database
 SNOWFLAKE_SCHEMA=your_schema
+
+# Azure Blob Storage Connection (required when DATA_PIPELINE_DB=BLOB, or when
+# GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE=blob)
+ACCOUNT_URL=https://your_account.blob.core.windows.net/
+SAS_TOKEN=your_container_scoped_sas_token
+CONTAINER_NAME=your_container_name
 
 # ==============================================================================
 # Pipeline-specific (see github_actions/sample_env.txt for full reference)
@@ -27,8 +40,12 @@ SNOWFLAKE_SCHEMA=your_schema
 # Download tp + ro as Zarr to Snowflake stage (true/false, default: true)
 PROCESS_MET=true
 
-# Snowflake internal stage for met Zarr — REQUIRED when PROCESS_MET=true
+# Snowflake internal stage for met Zarr: REQUIRED when PROCESS_MET=true
 SNOWFLAKE_STAGE_NAME=your_stage_name
+
+# Enable gust envelope processing (true/false, default: true), independent of
+# PROCESS_WIND_DATA
+PROCESS_GUST=true
 
 # Filter to named storms only (true/false, default: true)
 NAMED_STORMS_ONLY=true
@@ -40,9 +57,15 @@ NAMED_STORMS_ONLY=true
 # Local dir for GloFAS forecast Zarr files
 GLOFAS_DATA_DIR=glofas_data
 
-# Where the RP2 threshold file is read from: snowflake (default, works even when
-# DATA_PIPELINE_DB=LOCAL) or local (fully offline dev — requires
-# setup_glofas_thresholds.py --local-only to have been run first)
+# submit: fires the 2 CDS requests and exits (fast, no queue wait). process
+# (default): resumes a prior submit's saved request IDs, or falls back to a
+# fresh submit-and-block if nothing was saved.
+GLOFAS_MODE=process
+
+# Where the RP2 threshold file is read from: snowflake, blob, or local (fully offline
+# dev, requires setup_glofas_thresholds.py --local-only to have been run first).
+# Defaults to DATA_PIPELINE_DB above; set explicitly to use a different source for this
+# static reference file than for the per-cycle output.
 GLOFAS_THRESHOLD_SOURCE=snowflake
 
 # Local dir containing rl_2.0.nc, used only when GLOFAS_THRESHOLD_SOURCE=local
@@ -62,9 +85,10 @@ CDSAPI_KEY=your_ewds_api_key
 # discharge
 GLOFAS_EXTENT_ENABLED=true
 
-# Where the cached JRC RP10/20/50/100 + permanent-water GeoTIFFs are read
-# from: snowflake (default) or local (fully offline dev — requires
-# setup_jrc_extents.py --local-only to have been run first)
+# Where the cached JRC RP10/20/50/100 + permanent-water GeoTIFFs are read from:
+# snowflake, blob, or local (fully offline dev, requires setup_jrc_extents.py
+# --local-only to have been run first). Defaults to DATA_PIPELINE_DB above, same as
+# GLOFAS_THRESHOLD_SOURCE.
 GLOFAS_JRC_SOURCE=snowflake
 
 # Local dir containing jrc_rp10.tif etc., used only when GLOFAS_JRC_SOURCE=local
@@ -77,7 +101,8 @@ GLOFAS_JRC_LOCAL_DIR=glofas_jrc_extents
 # Usage
 # ==============================================================================
 # 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env
-#    Set DATA_PIPELINE_DB=LOCAL to skip Snowflake load and keep files locally.
+#    Set DATA_PIPELINE_DB=LOCAL to skip Snowflake load and keep files locally, or
+#    DATA_PIPELINE_DB=BLOB to upload to Azure Blob Storage instead.
 # 2. For web app development: Copy web/sample_env.txt to .env
 # 3. For GitHub Actions: Set values as GitHub Secrets in repository settings
 # 4. Never commit .env files with real credentials to version control

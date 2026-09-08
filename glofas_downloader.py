@@ -11,14 +11,14 @@ Data source: `cdsapi` against `cems-glofas-forecast` on
   CEMS product, not part of ECMWF's Open Data dissemination).
 
 Storage format:
-  Zarr ZipStore (.zarr.zip) — single file, chunked (1, 1, lat, lon), float32, zstd.
+  Zarr ZipStore (.zarr.zip): single file, chunked (1, 1, lat, lon), float32, zstd.
   dims: (member=51, step=7, lat, lon)
   values: river discharge in the last 24h (m3/s), one value per day, not accumulated
           (unlike tp/ro; no period-difference math needed at read time).
   spatial: 60°S–60°N (matches ecmwf_met_downloader.py's clip, for consistency across
            all "always-on, TC-independent" hazard layers).
 
-Cadence — the key difference from tp/ro:
+Cadence, the key difference from tp/ro:
   GloFAS's operational medium-range product is driven only by the 00 UTC IFS ENS
   cycle and is published to CDS at most ONCE PER CALENDAR DAY (the `cems-glofas-
   forecast` CDS schema has no run-hour selector, only year/month/day). The TC
@@ -94,7 +94,7 @@ THRESHOLD_STAGE_PREFIX = "glofas/thresholds_cache"
 # RP threshold loading (for sparse cell filtering, and for the extent-masking
 # step's per-tier exceedance-probability lookups)
 #
-# IMPORTANT: this is the RP DISCHARGE threshold source only -- "does this
+# IMPORTANT: this is the RP DISCHARGE threshold source only: "does this
 # member's forecasted discharge exceed the X-year return period?" It has
 # NOTHING to do with historical flood-EXTENT geometry (depth/inundation
 # shape). That's a completely separate source: JRC's own file server
@@ -132,7 +132,7 @@ def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
     import requests
     fname = f"flood_threshold_glofas_v4_rl_{rp}.nc"
     url = f"{THRESHOLD_BASE_URL}/{fname}"
-    logger.info(f"  RP{rp} threshold not cached anywhere — downloading directly from {url} ...")
+    logger.info(f"  RP{rp} threshold not cached anywhere -- downloading directly from {url} ...")
     with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
@@ -142,17 +142,22 @@ def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
 
 def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str, Path],
                            snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                           cache_dir: Optional[Path] = None, rp: str = FILTER_RP) -> Path:
+                           cache_dir: Optional[Path] = None, rp: str = FILTER_RP,
+                           blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                           blob_container: Optional[str] = None) -> Path:
     """
     Return a local path to one cached RP threshold file (rp, e.g. "2.0", "10.0").
 
     threshold_source='snowflake': local runtime cache -> Snowflake stage GET ->
       (miss) download directly from ECMWF, save locally AND PUT to the stage so
       future runs (this or other containers) hit the now-populated stage cache.
+    threshold_source='blob': same self-healing shape as 'snowflake', against
+      the shared Blob container instead, no Snowflake connection needed or
+      used at any point in this branch.
     threshold_source='local': threshold_local_dir -> (miss, if a Snowflake
       connection happens to be available) stage GET -> (miss or no connection)
       download directly from ECMWF, save to threshold_local_dir only (no stage
-      push — 'local' means prefer to keep this run's data local).
+      push; 'local' means prefer to keep this run's data local).
     """
     fname = f"rl_{rp}.nc"
 
@@ -165,6 +170,21 @@ def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str,
         if snowflake_conn and snowflake_stage_name:
             local_dir.mkdir(parents=True, exist_ok=True)
             if _try_stage_get(snowflake_stage_name, fname, local_dir, snowflake_conn):
+                return local_path
+
+        # Blob check, same opportunistic-cache purpose as the Snowflake-stage check
+        # above. GLOFAS_THRESHOLD_SOURCE=local is documented as independently
+        # overridable from DATA_PIPELINE_DB (a legitimate mixed-mode config), and
+        # run_glofas_pipeline()/run_glofas_extent_pipeline() always forward the
+        # blob_* params regardless of threshold_source's own value, so a real
+        # DATA_PIPELINE_DB=BLOB deployment can reach this branch with Blob
+        # credentials populated. Without this check, a local-cache miss (e.g.
+        # after a container restart on ephemeral storage) would skip an
+        # already-populated Blob cache and re-download from ECMWF every time.
+        if blob_account_url and blob_sas_token and blob_container:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            blob_path = f'{THRESHOLD_STAGE_PREFIX}/{fname}'
+            if download_from_blob(blob_account_url, blob_sas_token, blob_container, blob_path, local_path):
                 return local_path
 
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -191,12 +211,34 @@ def _fetch_threshold_file(threshold_source: str, threshold_local_dir: Union[str,
         upload_to_snowflake_stage(local_path, snowflake_stage_name, stage_path, snowflake_conn)
         return local_path
 
-    raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local' or 'snowflake')")
+    if threshold_source == "blob":
+        if not blob_account_url or not blob_sas_token or not blob_container:
+            raise ValueError("blob_account_url, blob_sas_token, and blob_container required for "
+                              "GLOFAS_THRESHOLD_SOURCE=blob")
+        cache_dir = Path(cache_dir) if cache_dir else Path(DEFAULT_GLOFAS_DIR) / "thresholds_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / fname
+        if local_path.exists():
+            return local_path
+
+        blob_path = f'{THRESHOLD_STAGE_PREFIX}/{fname}'
+        if download_from_blob(blob_account_url, blob_sas_token, blob_container, blob_path, local_path):
+            return local_path
+
+        # Self-healing: not cached anywhere: fetch directly and populate Blob
+        # so future runs (this container or any other) hit the cache.
+        _download_threshold_from_ecmwf(rp, local_path)
+        upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, blob_path)
+        return local_path
+
+    raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local', 'snowflake', or 'blob')")
 
 
 def _fetch_uparea_file(threshold_source: str, threshold_local_dir: Union[str, Path],
                         snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                        cache_dir: Optional[Path] = None) -> Path:
+                        cache_dir: Optional[Path] = None,
+                        blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                        blob_container: Optional[str] = None) -> Path:
     """Same self-healing cascade as _fetch_threshold_file, for the single static
     uparea auxiliary file (not per-RP) instead of a threshold grid."""
     fname = "uparea_glofas_v4_0.nc"
@@ -209,6 +251,13 @@ def _fetch_uparea_file(threshold_source: str, threshold_local_dir: Union[str, Pa
         if snowflake_conn and snowflake_stage_name:
             local_dir.mkdir(parents=True, exist_ok=True)
             if _try_stage_get(snowflake_stage_name, fname, local_dir, snowflake_conn):
+                return local_path
+        # Blob check, same purpose as _fetch_threshold_file()'s own 'local' branch;
+        # see that function's comment for the full rationale.
+        if blob_account_url and blob_sas_token and blob_container:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            if download_from_blob(blob_account_url, blob_sas_token, blob_container,
+                                   UPAREA_STAGE_PATH, local_path):
                 return local_path
         local_dir.mkdir(parents=True, exist_ok=True)
         _download_uparea_from_ecmwf(local_path)
@@ -229,12 +278,27 @@ def _fetch_uparea_file(threshold_source: str, threshold_local_dir: Union[str, Pa
         upload_to_snowflake_stage(local_path, snowflake_stage_name, UPAREA_STAGE_PATH, snowflake_conn)
         return local_path
 
-    raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local' or 'snowflake')")
+    if threshold_source == "blob":
+        if not blob_account_url or not blob_sas_token or not blob_container:
+            raise ValueError("blob_account_url, blob_sas_token, and blob_container required for "
+                              "GLOFAS_THRESHOLD_SOURCE=blob")
+        cache_dir = Path(cache_dir) if cache_dir else Path(DEFAULT_GLOFAS_DIR) / "thresholds_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / fname
+        if local_path.exists():
+            return local_path
+        if download_from_blob(blob_account_url, blob_sas_token, blob_container, UPAREA_STAGE_PATH, local_path):
+            return local_path
+        _download_uparea_from_ecmwf(local_path)
+        upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, UPAREA_STAGE_PATH)
+        return local_path
+
+    raise ValueError(f"Unknown threshold_source: {threshold_source!r} (must be 'local', 'snowflake', or 'blob')")
 
 
 def _download_uparea_from_ecmwf(dest_path: Path) -> None:
     import requests
-    logger.info(f"  uparea not cached anywhere — downloading directly from {UPAREA_URL} ...")
+    logger.info(f"  uparea not cached anywhere -- downloading directly from {UPAREA_URL} ...")
     with requests.get(UPAREA_URL, stream=True, timeout=600) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
@@ -244,7 +308,7 @@ def _download_uparea_from_ecmwf(dest_path: Path) -> None:
 
 def _try_stage_get(stage_name: str, fname: str, dest_dir: Path, conn) -> bool:
     """Best-effort GET of a threshold file from the Snowflake stage. Returns False
-    (not raises) on any failure — missing file, no permissions, network issue —
+    (not raises) on any failure (missing file, no permissions, network issue),
     so the caller can fall through to the direct-ECMWF-download tier."""
     local_path = dest_dir / fname
     try:
@@ -266,8 +330,8 @@ def _load_rp2_grid(lats: np.ndarray, lons: np.ndarray, threshold_path: Path) -> 
     """
     Load the RP2 threshold, clipped to the forecast's exact lat/lon bounds.
 
-    Official files use lat/lon coord names (descending lat) — different from the
-    forecast's own latitude/longitude — and cover the full GloFAS domain, wider than
+    Official files use lat/lon coord names (descending lat), different from the
+    forecast's own latitude/longitude, and cover the full GloFAS domain, wider than
     our 60S-60N clip, hence the .sel() slice. Non-positive values (no river/ocean
     cells, per GloFAS convention) become NaN so they never count as "exceeded."
     """
@@ -285,7 +349,7 @@ def _load_rp2_grid(lats: np.ndarray, lons: np.ndarray, threshold_path: Path) -> 
         if thr.shape != (len(lats), len(lons)):
             raise ValueError(
                 f"RP2 threshold grid shape {thr.shape} does not match forecast grid "
-                f"({len(lats)}, {len(lons)}) — check for a resolution/version mismatch"
+                f"({len(lats)}, {len(lons)}) -- check for a resolution/version mismatch"
             )
         return np.where(thr > 0, thr, np.nan)
     finally:
@@ -348,7 +412,7 @@ def _download_for_date(client, forecast_date: datetime, raw_dir: Path) -> Option
     """Attempt to download both products for one calendar date. Returns None (not raises)
     if GloFAS hasn't published that date yet, so the caller can fall back a day.
 
-    Submits both CDS requests concurrently — client.retrieve() blocks on the full
+    Submits both CDS requests concurrently: client.retrieve() blocks on the full
     submit -> queue-wait -> download cycle, and the two requests' queue waits are
     independent of each other, so running them sequentially means the ensemble
     request's queue wait (often the bulk of the total time, given it's the larger
@@ -389,7 +453,7 @@ def download_with_fallback(forecast_date: datetime, raw_dir: Path,
     or None if nothing was available within the lag window.
     """
     import cdsapi
-    # Prefer explicit env vars (SPCS/GHA — no ~/.cdsapirc dotfile mounted) over the
+    # Prefer explicit env vars (SPCS/GHA has no ~/.cdsapirc dotfile mounted) over the
     # default ~/.cdsapirc-file discovery (local dev). cdsapi.Client(url=None, key=None)
     # falls back to the dotfile automatically when both are None.
     client = cdsapi.Client(url=os.getenv('CDSAPI_URL'), key=os.getenv('CDSAPI_KEY'))
@@ -404,7 +468,7 @@ def download_with_fallback(forecast_date: datetime, raw_dir: Path,
             return {"paths": paths, "actual_date": candidate}
 
     logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
-                 f"and {max_lag_days} day(s) prior — skipping")
+                 f"and {max_lag_days} day(s) prior -- skipping")
     return None
 
 
@@ -481,7 +545,7 @@ def submit_glofas_requests(forecast_date: datetime,
             continue
 
     logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
-                 f"and {max_lag_days} day(s) prior — skipping submit")
+                 f"and {max_lag_days} day(s) prior -- skipping submit")
     return None
 
 
@@ -514,7 +578,7 @@ def resume_glofas_download(requests: Dict[str, str], actual_date: datetime,
         # types depending on how CDSAPI_URL/CDSAPI_KEY are malformed or
         # missing (a bare Exception when both are unset and no usable
         # ~/.cdsapirc exists; an AssertionError for a legacy-format key with
-        # the wrong number of ':'-separated parts) — normalized to
+        # the wrong number of ':'-separated parts), normalized to
         # RuntimeError here so download_glofas_forecast()'s existing
         # `except RuntimeError` (the intended "config problem, fall back to
         # a fresh submit" path) actually catches it, instead of an
@@ -573,15 +637,15 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     Build a Zarr ZipStore from the ensemble + control NetCDFs, keeping only cells
     where at least one member on at least one day exceeds the RP2 threshold.
 
-    data array:  shape (member=51, step=7, n_cells) — sparse, filtered
-    cell_lat/cell_lon: shape (n_cells,) — coordinates of each kept cell
-    cell_uparea_km2: shape (n_cells,) — GloFAS's own official upstream drainage
+    data array:  shape (member=51, step=7, n_cells), sparse, filtered
+    cell_lat/cell_lon: shape (n_cells,): coordinates of each kept cell
+    cell_uparea_km2: shape (n_cells,): GloFAS's own official upstream drainage
       area per cell (only populated if uparea_path is given); a non-destructive
       tag, not a filter)
     dtype:  float32
     comp:   Blosc/zstd-3/bitshuffle
 
-    Cache key is DATE-ONLY (no run_time) — matches GloFAS's once-daily cadence.
+    Cache key is DATE-ONLY (no run_time), matching GloFAS's once-daily cadence.
     Returns path to the .zarr.zip file.
     """
     date_str = actual_date.strftime("%Y%m%d")
@@ -592,7 +656,7 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     zip_path = output_dir / date_str / f"river_{date_str}.zarr.zip"
 
     if zip_path.exists():
-        logger.info(f"  {zip_path.name} already exists — skipping build")
+        logger.info(f"  {zip_path.name} already exists -- skipping build")
         return zip_path
 
     logger.info(f"  Building Zarr for GloFAS discharge ({len(LEADTIME_HOURS)} steps x 51 members) ...")
@@ -713,15 +777,15 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
                     "Zarr index i -> ECMWF member member_numbers[i] (1-50=ENS pf, 51=control). "
                     "Matches TC_TRACKS.ENSEMBLE_MEMBER and wind/met pipeline member numbering. "
                     f"Steps: {LEADTIME_HOURS} hours (daily resolution). "
-                    f"Clip: {LAT_MIN}S-{LAT_MAX}N. Values are NOT accumulated (unlike tp/ro) — "
+                    f"Clip: {LAT_MIN}S-{LAT_MAX}N. Values are NOT accumulated (unlike tp/ro) -- "
                     "each step is discharge in the preceding 24h, read directly, no differencing needed. "
-                    "SPARSE FORMAT: 'data' is (member, step, n_cells), NOT a dense lat/lon grid — "
+                    "SPARSE FORMAT: 'data' is (member, step, n_cells), NOT a dense lat/lon grid -- "
                     "only cells where >=1 member on >=1 day exceeded the RP2yr threshold are "
                     "included (see n_cells_kept/n_cells_total/filter_threshold attrs). Use "
                     "cell_lat/cell_lon (parallel arrays, same n_cells length) to locate each "
-                    "stored cell — do not assume a rectangular lat/lon index. cell_uparea_km2 "
+                    "stored cell -- do not assume a rectangular lat/lon index. cell_uparea_km2 "
                     "(same length, if present) is GloFAS's own official upstream drainage area "
-                    "per cell, a non-destructive tag not a filter — NaN where lookup failed."
+                    "per cell, a non-destructive tag not a filter -- NaN where lookup failed."
                 ),
             })
         except BaseException:
@@ -783,6 +847,56 @@ def stage_file_exists(stage_name: str, stage_path: str, conn) -> bool:
         return False
 
 
+def upload_to_blob(zip_path: Path, account_url: str, sas_token: str,
+                    container: str, blob_path: str) -> bool:
+    """Upload a ZipStore file to Azure Blob Storage. Same interface and blob_path
+    shape as upload_to_snowflake_stage(); see ecmwf_met_downloader.py's own
+    upload_to_blob() for the identical implementation and full docstring."""
+    from azure.storage.blob import BlobServiceClient
+    try:
+        service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
+        blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
+        with open(zip_path, 'rb') as f:
+            blob_client.upload_blob(f, overwrite=True)
+        logger.info(f'  Uploaded {zip_path.name} -> blob:{container}/{blob_path}')
+        return True
+    except Exception as e:
+        logger.error(f'  Blob upload failed: {e}')
+        return False
+
+
+def blob_file_exists(account_url: str, sas_token: str, container: str, blob_path: str) -> bool:
+    """Blob equivalent of stage_file_exists(): same same-day dedup purpose."""
+    from azure.storage.blob import BlobServiceClient
+    try:
+        service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
+        blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
+        return blob_client.exists()
+    except Exception as e:
+        logger.warning(f"  Could not check Blob for existing file: {e}")
+        return False
+
+
+def download_from_blob(account_url: str, sas_token: str, container: str,
+                        blob_path: str, local_path: Path) -> bool:
+    """Blob equivalent of the Snowflake-stage GET used by _try_stage_get():
+    downloads one blob to a local path. Returns False (not raises) on any
+    failure (missing blob, no permissions, network issue), so callers can
+    fall through to a direct-from-source download tier, same contract as
+    _try_stage_get()."""
+    from azure.storage.blob import BlobServiceClient
+    try:
+        service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
+        blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, 'wb') as f:
+            f.write(blob_client.download_blob().readall())
+        return True
+    except Exception as e:
+        logger.info(f"  Blob GET for {blob_path} failed or file not present: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -793,6 +907,10 @@ def download_glofas_forecast(
         snowflake_conn=None,
         snowflake_stage_name: Optional[str] = None,
         upload_to_stage: bool = True,
+        data_pipeline_db: str = 'SNOWFLAKE',
+        blob_account_url: Optional[str] = None,
+        blob_sas_token: Optional[str] = None,
+        blob_container: Optional[str] = None,
         cleanup_raw: bool = True,
         verbose: bool = True,
         threshold_source: str = "snowflake",
@@ -804,16 +922,23 @@ def download_glofas_forecast(
 
     Args:
         date:                 Forecast date as 'YYYY-MM-DD' or datetime (the TC pipeline's
-                               run date — GloFAS's cache key is date-only regardless of run_time)
+                               run date; GloFAS's cache key is date-only regardless of run_time)
         output_dir:           Working directory for raw NetCDF + ZipStore files
         snowflake_conn:       Active Snowflake connection (required if upload_to_stage=True,
                                or if threshold_source='snowflake')
         snowflake_stage_name: Stage name without @ (e.g. 'AOTS_ANALYSIS')
-        upload_to_stage:      If True, PUT ZipStore to Snowflake stage; if False, keep local
+        upload_to_stage:      If True, upload ZipStore to the destination named by
+                               data_pipeline_db; if False, keep local
+        data_pipeline_db:     'SNOWFLAKE' (PUT to Snowflake stage) or 'BLOB' (upload to Azure
+                               Blob Storage): which remote destination upload_to_stage=True
+                               actually uploads to
+        blob_account_url:     Azure Storage account URL (required if data_pipeline_db=='BLOB')
+        blob_sas_token:       Container-scoped SAS token (required if data_pipeline_db=='BLOB')
+        blob_container:       Blob container name (required if data_pipeline_db=='BLOB')
         cleanup_raw:          Delete raw NetCDF files after Zarr is built
         verbose:              Log progress
-        threshold_source:     'snowflake' (default) or 'local' — where to read the cached
-                               RP2 threshold file from for sparse cell filtering (see
+        threshold_source:     'snowflake' (default), 'local', or 'blob': where to read the
+                               cached RP2 threshold file from for sparse cell filtering (see
                                setup_glofas_thresholds.py; GLOFAS_THRESHOLD_SOURCE env var)
         threshold_local_dir:  Local dir containing rl_2.0.nc, used when threshold_source='local'
         pre_submitted:        Optional {'actual_date', 'requests'} from an earlier
@@ -826,7 +951,7 @@ def download_glofas_forecast(
                                before: submits fresh and blocks through the full wait.
 
     Returns dict: success, zip_path, stage_path, forecast_date (date actually used,
-                  may lag the requested date — see module docstring), param.
+                  may lag the requested date; see module docstring), param.
     """
     forecast_date = datetime.strptime(date, '%Y-%m-%d') if isinstance(date, str) else date
     date_str = forecast_date.strftime("%Y%m%d")
@@ -838,7 +963,7 @@ def download_glofas_forecast(
 
     if verbose:
         logger.info('=' * 70)
-        logger.info(f'GloFAS v4.0 — riverine discharge  {forecast_date.strftime("%Y-%m-%d")}')
+        logger.info(f'GloFAS v4.0 -- riverine discharge  {forecast_date.strftime("%Y-%m-%d")}')
         logger.info(f'  Steps: {len(LEADTIME_HOURS)} (24-168h daily)  |  Members: 51 (50 pf + 1 control)')
         logger.info(f'  Spatial: {LAT_MIN} deg - {LAT_MAX} deg  |  Cadence: once/calendar day')
         logger.info('=' * 70)
@@ -859,27 +984,41 @@ def download_glofas_forecast(
     candidate = forecast_date
     candidate_str = date_str
     candidate_path = output_path / candidate_str / f'river_{candidate_str}.zarr.zip'
+    remote_ready = upload_to_stage and (
+        (data_pipeline_db == 'BLOB' and blob_account_url and blob_sas_token and blob_container)
+        or (data_pipeline_db != 'BLOB' and snowflake_conn and snowflake_stage_name)
+    )
+
+    def _remote_exists(path: str) -> bool:
+        if data_pipeline_db == 'BLOB':
+            return blob_file_exists(blob_account_url, blob_sas_token, blob_container, path)
+        return stage_file_exists(snowflake_stage_name, path, snowflake_conn)
+
+    def _remote_upload(local_path: Path, path: str) -> bool:
+        if data_pipeline_db == 'BLOB':
+            return upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, path)
+        return upload_to_snowflake_stage(local_path, snowflake_stage_name, path, snowflake_conn)
+
     if candidate_path.exists():
-        if upload_to_stage and snowflake_conn and snowflake_stage_name:
+        if remote_ready:
             candidate_stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
-            if not stage_file_exists(snowflake_stage_name, candidate_stage_path, snowflake_conn):
-                ok = upload_to_snowflake_stage(candidate_path, snowflake_stage_name,
-                                                candidate_stage_path, snowflake_conn)
+            if not _remote_exists(candidate_stage_path):
+                ok = _remote_upload(candidate_path, candidate_stage_path)
                 if not ok:
                     return {'success': False, 'zip_path': candidate_path, 'stage_path': None,
                              'forecast_date': candidate, 'param': 'dis24', 'cached': False}
-            logger.info(f'  {candidate_stage_path} — day-level cache hit (local file, verified staged)')
+            logger.info(f'  {candidate_stage_path} -- day-level cache hit (local file, verified staged)')
             return {'success': True, 'zip_path': candidate_path, 'stage_path': candidate_stage_path,
                      'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
-        logger.info(f'  {candidate_path.name} already exists locally — skipping (day-level cache hit)')
+        logger.info(f'  {candidate_path.name} already exists locally -- skipping (day-level cache hit)')
         return {'success': True, 'zip_path': candidate_path, 'stage_path': None,
                  'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
-    if upload_to_stage and snowflake_conn and snowflake_stage_name:
+    if remote_ready:
         candidate_stage_path = f'glofas/{date_str}/river_{date_str}.zarr.zip'
-        if stage_file_exists(snowflake_stage_name, candidate_stage_path, snowflake_conn):
-            logger.info(f'  {candidate_stage_path} already staged — skipping (day-level cache hit)')
+        if _remote_exists(candidate_stage_path):
+            logger.info(f'  {candidate_stage_path} already staged -- skipping (day-level cache hit)')
             return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
                      'forecast_date': forecast_date, 'param': 'dis24', 'cached': True}
 
@@ -932,6 +1071,7 @@ def download_glofas_forecast(
             threshold_source, threshold_local_dir,
             snowflake_conn=snowflake_conn, snowflake_stage_name=snowflake_stage_name,
             cache_dir=output_path / 'thresholds_cache',
+            blob_account_url=blob_account_url, blob_sas_token=blob_sas_token, blob_container=blob_container,
         )
     except Exception as e:
         logger.error(f'  Could not load RP2 threshold file: {e}')
@@ -947,6 +1087,7 @@ def download_glofas_forecast(
             threshold_source, threshold_local_dir,
             snowflake_conn=snowflake_conn, snowflake_stage_name=snowflake_stage_name,
             cache_dir=output_path / 'thresholds_cache',
+            blob_account_url=blob_account_url, blob_sas_token=blob_sas_token, blob_container=blob_container,
         )
     except Exception as e:
         logger.warning(f'  Could not load uparea file, continuing without cell_uparea_km2 tagging: {e}')
@@ -960,17 +1101,19 @@ def download_glofas_forecast(
         return {'success': False, 'zip_path': None, 'stage_path': None,
                  'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
 
-    # Step 3: Upload to Snowflake stage (or keep local)
+    # Step 3: Upload to the configured remote destination (or keep local)
     stage_path = None
     if upload_to_stage:
-        if not snowflake_conn or not snowflake_stage_name:
-            logger.error('  snowflake_conn and snowflake_stage_name required for stage upload')
+        if not remote_ready:
+            missing = ('blob_account_url/blob_sas_token/blob_container' if data_pipeline_db == 'BLOB'
+                       else 'snowflake_conn/snowflake_stage_name')
+            logger.error(f'  {missing} required for upload (data_pipeline_db={data_pipeline_db})')
             return {'success': False, 'zip_path': zip_path, 'stage_path': None,
                      'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
 
         actual_date_str = actual_date.strftime("%Y%m%d")
         stage_path = f'glofas/{actual_date_str}/{zip_path.name}'
-        ok = upload_to_snowflake_stage(zip_path, snowflake_stage_name, stage_path, snowflake_conn)
+        ok = _remote_upload(zip_path, stage_path)
         if not ok:
             return {'success': False, 'zip_path': zip_path, 'stage_path': None,
                      'forecast_date': forecast_date, 'param': 'dis24', 'cached': False}
@@ -983,7 +1126,13 @@ def download_glofas_forecast(
             logger.info(f'  Cleaned up raw NetCDF files from {raw_dir}')
 
     if verbose:
-        logger.info(f'  Done — {"@" + snowflake_stage_name + "/" + stage_path if stage_path else zip_path}')
+        if stage_path and data_pipeline_db == 'BLOB':
+            destination = f'blob:{blob_container}/{stage_path}'
+        elif stage_path:
+            destination = f'@{snowflake_stage_name}/{stage_path}'
+        else:
+            destination = str(zip_path)
+        logger.info(f'  Done -- {destination}')
 
     return {
         'success': True,

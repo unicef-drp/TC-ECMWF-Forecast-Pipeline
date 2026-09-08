@@ -77,7 +77,7 @@ def _unwrap_track_longitudes(track_data: pd.DataFrame) -> pd.DataFrame:
 
     This function only feeds the internal buffered-polygon/bounding-box
     computation used to size the GRIB extraction window (see
-    get_longitude_windows below) — it is never itself stored as an
+    get_longitude_windows below); it is never itself stored as an
     envelope, so no corresponding "wrap back into [-180, 180]" step is
     needed here.
     """
@@ -156,7 +156,7 @@ def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
 
     widest_internal_idx = int(np.argmax(internal_gaps))
     if internal_gaps[widest_internal_idx] <= wrap_gap:
-        # The wraparound gap is the widest (or tied) -- not antimeridian-
+        # The wraparound gap is the widest (or tied): not antimeridian-
         # adjacent as a group. No-op.
         return df
 
@@ -193,7 +193,7 @@ def create_buffered_track_polygon(track_data: pd.DataFrame, buffer_radius_km: fl
     Returns:
         Polygon: Buffered track polygon. May extend beyond the valid
             [-180, 180] longitude range when the track (or ensemble spread)
-            crosses the antimeridian — see _unwrap_track_longitudes above
+            crosses the antimeridian: see _unwrap_track_longitudes above
             and get_longitude_windows below, which is how callers turn this
             back into real, native-range GRIB extraction window(s). This
             polygon itself is never stored as an envelope.
@@ -227,8 +227,8 @@ def get_bounding_box(polygon: Polygon, buffer: float = 2.0) -> Dict[str, float]:
     Returns:
         dict: Bounding box coordinates. 'lon_min'/'lon_max' may fall outside
             [-180, 180] when the input polygon was built from unwrapped,
-            antimeridian-crossing track data (see create_buffered_track_polygon)
-            — pass this dict through get_longitude_windows() before using it
+            antimeridian-crossing track data (see create_buffered_track_polygon):
+            pass this dict through get_longitude_windows() before using it
             to slice a real GRIB file's longitude coordinate.
     """
     bounds = polygon.bounds  # (minx, miny, maxx, maxy)
@@ -265,14 +265,14 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
     lon_max > 180 and lon_min < -180 together guarantee lon_max - lon_min
     > 360, and since longitude is periodic with period 360, any request
     spanning more than a full circle covers every native value at least
-    once -- the correct window really is the whole globe. An earlier
+    once: the correct window really is the whole globe. An earlier
     version of this function got this backwards (returned two ~4deg-wide
     slivers, silently dropping ~96% of the real requested area with no
-    error) -- caught by a real council review that reproduced it directly
+    error): caught by a real council review that reproduced it directly
     against the real code. Reaching this branch at all should be rare in
     practice once the caller's own bbox has been through
     _reconcile_cross_member_longitudes() first (which keeps a real
-    storm's reconciled span well under 360 -- confirmed via a real,
+    storm's reconciled span well under 360: confirmed via a real,
     realistic-scale reproduction), so hitting it is itself a signal of an
     anomalously wide upstream input, not a normal antimeridian case.
     """
@@ -313,7 +313,7 @@ def merge_contour_dicts(
     dicts (see get_longitude_windows) into the final combined per-threshold
     result.
 
-    A single-element input list is returned as that one dict, unchanged —
+    A single-element input list is returned as that one dict, unchanged:
     the common non-antimeridian-crossing case (one window) is therefore a
     verified no-op: the exact same dict create_wind_threshold_contours
     already produced today, with no extra union/copy step.
@@ -350,7 +350,7 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
         grib_file (str): Path to wind GRIB file
         member_number (int): Ensemble member number
         bbox (dict): Bounding box coordinates. May have lon_min/lon_max
-            outside [-180, 180] (see get_bounding_box) — this function
+            outside [-180, 180] (see get_bounding_box): this function
             slices the real GRIB longitude range once per real window
             returned by get_longitude_windows(bbox), rather than assuming
             a single contiguous slice.
@@ -361,12 +361,12 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
                                    to avoid concurrent index file conflicts.
 
     Returns:
-        List[xr.DataArray]: One DataArray per real longitude window — length
+        List[xr.DataArray]: One DataArray per real longitude window: length
             1 for the overwhelming majority (non-antimeridian-crossing) case,
             identical to what this function used to return directly; length
             2 only when bbox straddles the antimeridian. Callers must run
             contour extraction once per element and merge results (see
-            merge_contour_dicts) rather than concatenating these arrays —
+            merge_contour_dicts) rather than concatenating these arrays:
             a raw concat would reintroduce a coordinate discontinuity at the
             180/-180 seam that contour tracing can't interpret correctly.
     """
@@ -376,23 +376,23 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
         # Each process gets its own index cache, preventing race conditions
         # while still benefiting from index file caching performance
         import threading
-        
+
         # Get unique identifier for this process/thread
         pid = os.getpid()
         thread_id = threading.get_ident()
-        
+
         # Create process-specific subdirectory
         process_index_dir = os.path.join(indexpath, f"process_{pid}_thread_{thread_id}")
         os.makedirs(process_index_dir, exist_ok=True)
-        
+
         # Build the index file path
         import pathlib
         grib_filename = pathlib.Path(grib_file).name
         index_file_path = os.path.join(process_index_dir, grib_filename + '.idx')
-        
+
         # Open with process-specific index path
         ds = xr.open_dataset(
-            grib_file, 
+            grib_file,
             engine='cfgrib',
             backend_kwargs={
                 'indexpath': index_file_path,
@@ -421,7 +421,7 @@ def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
             if verbose:
                 print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
 
-        # Subset to bounding box — one real native-range window in the
+        # Subset to bounding box: one real native-range window in the
         # overwhelming majority of cases, two only when bbox straddles the
         # antimeridian (see get_longitude_windows)
         windows = get_longitude_windows(bbox)
@@ -461,7 +461,7 @@ def load_wind_data_all_members(
     number dim).
 
     Returns:
-        List[xr.DataArray]: One DataArray per real longitude window — length
+        List[xr.DataArray]: One DataArray per real longitude window: length
             1 (bbox clipped exactly as before) for the overwhelming majority
             of storms; length 2 only when bbox straddles the antimeridian
             (see get_bounding_box / get_longitude_windows). Callers must
@@ -503,7 +503,7 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
     Args:
         wind_data (xr.DataArray): Wind speed data
-        thresholds (dict): Wind thresholds (key: m/s) — the dict key's own unit
+        thresholds (dict): Wind thresholds (key: m/s): the dict key's own unit
             depends on the caller: wind passes real kt values (34, 40, 50...),
             gust passes integer m/s labels (17, 21, 26...); see
             ecmwf_gust_envelope_extractor.py's own GUST_THRESHOLDS_MS docstring.
@@ -511,7 +511,7 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
         unit_label (str): Unit to print next to the threshold key in the
             progress log (default 'kt', matching wind's own convention).
             Gust's own caller passes 'm/s' here so the progress log doesn't
-            mislabel gust's m/s-keyed thresholds as knots — this is
+            mislabel gust's m/s-keyed thresholds as knots: this is
             display-only, it never affects the stored contour/envelope data,
             which always keys off the same dict key passed in either way.
 
@@ -610,7 +610,7 @@ def _nudge_antimeridian_vertices(geom):
 
     shapely.ops.transform (shapely 2.x) calls its callback once per
     coordinate *ring*, passing all of that ring's x values (and y, and
-    optionally z) as a single batched array/tuple, not scalar-per-call —
+    optionally z) as a single batched array/tuple, not scalar-per-call:
     the nudge must be vectorized, not a plain Python `if x == 180.0`.
     """
     from shapely.ops import transform

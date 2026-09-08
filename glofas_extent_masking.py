@@ -49,6 +49,8 @@ from glofas_downloader import (
     _fetch_threshold_file,
     _nearest_grid_value,
     upload_to_snowflake_stage,
+    upload_to_blob,
+    download_from_blob,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,24 +85,54 @@ JRC_WATER_FILENAME = "jrc_permanent_water.tif"
 
 
 # ---------------------------------------------------------------------------
-# JRC cache resolution (local cache -> Snowflake stage GET; NO direct-from-JRC
-# fallback: unlike the RP-threshold/uparea cascades in glofas_downloader.py,
-# this module never self-heals by re-fetching from JRC itself if both the
-# local cache and the stage miss. A miss here is a hard, loud failure with a 
-# clear pointer to setup_jrc_extents.py, not a silent skip.)
+# JRC cache resolution (local cache -> Snowflake stage GET or Blob GET; NO
+# direct-from-JRC fallback: unlike the RP-threshold/uparea cascades in
+# glofas_downloader.py, this module never self-heals by re-fetching from JRC
+# itself if both the local cache and the remote store miss. A miss here is a
+# hard, loud failure with a clear pointer to setup_jrc_extents.py, not a
+# silent skip.)
 # ---------------------------------------------------------------------------
 
 def _resolve_jrc_file(fname: str, jrc_source: str, jrc_local_dir: Union[str, Path],
                        snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                       cache_dir: Optional[Path] = None) -> Path:
+                       cache_dir: Optional[Path] = None,
+                       blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                       blob_container: Optional[str] = None) -> Path:
     if jrc_source == "local":
         local_path = Path(jrc_local_dir) / fname
-        if not local_path.exists():
-            raise FileNotFoundError(
-                f"JRC cache file {fname} not found in {jrc_local_dir} (GLOFAS_JRC_SOURCE=local). "
-                f"Run setup_jrc_extents.py --local-only {jrc_local_dir} first."
-            )
-        return local_path
+        if local_path.exists():
+            return local_path
+        # GLOFAS_JRC_SOURCE=local is documented as independently overridable from
+        # DATA_PIPELINE_DB (a legitimate mixed-mode config), and resolve_jrc_cache()'s
+        # only caller always forwards real snowflake_conn/blob_* credentials regardless
+        # of jrc_source's own value. On a local-cache miss (e.g. after a container
+        # restart on ephemeral storage), check whichever remote store has credentials
+        # available before giving up; same opportunistic-cache pattern as the sibling
+        # threshold/uparea 'local' branches in glofas_downloader.py. Still no
+        # direct-from-JRC self-heal, matching this module's own no-self-heal design
+        # above: a miss everywhere is still a hard, loud failure.
+        if snowflake_conn and snowflake_stage_name:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            cursor = snowflake_conn.cursor()
+            try:
+                cursor.execute(
+                    f"GET @{snowflake_stage_name}/{JRC_STAGE_PREFIX}/{fname} "
+                    f"'file://{local_path.parent.resolve().as_posix()}'"
+                )
+            finally:
+                cursor.close()
+            if local_path.exists():
+                return local_path
+        if blob_account_url and blob_sas_token and blob_container:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            blob_path = f'{JRC_STAGE_PREFIX}/{fname}'
+            if download_from_blob(blob_account_url, blob_sas_token, blob_container, blob_path, local_path):
+                return local_path
+        raise FileNotFoundError(
+            f"JRC cache file {fname} not found in {jrc_local_dir} (GLOFAS_JRC_SOURCE=local), "
+            f"and not found on any remote store with credentials available. "
+            f"Run setup_jrc_extents.py --local-only {jrc_local_dir} first."
+        )
 
     if jrc_source == "snowflake":
         if not snowflake_conn or not snowflake_stage_name:
@@ -125,12 +157,31 @@ def _resolve_jrc_file(fname: str, jrc_source: str, jrc_local_dir: Union[str, Pat
             )
         return local_path
 
-    raise ValueError(f"Unknown jrc_source: {jrc_source!r} (must be 'local' or 'snowflake')")
+    if jrc_source == "blob":
+        if not blob_account_url or not blob_sas_token or not blob_container:
+            raise ValueError("blob_account_url, blob_sas_token, and blob_container required for "
+                              "GLOFAS_JRC_SOURCE=blob")
+        cache_dir = Path(cache_dir) if cache_dir else Path("glofas_data") / "jrc_extent_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / fname
+        if local_path.exists():
+            return local_path
+        blob_path = f'{JRC_STAGE_PREFIX}/{fname}'
+        if not download_from_blob(blob_account_url, blob_sas_token, blob_container, blob_path, local_path):
+            raise FileNotFoundError(
+                f"JRC cache file {fname} not found on Blob at {blob_path}. "
+                f"Run setup_jrc_extents.py first (no credentials needed -- direct JRC download)."
+            )
+        return local_path
+
+    raise ValueError(f"Unknown jrc_source: {jrc_source!r} (must be 'local', 'snowflake', or 'blob')")
 
 
 def resolve_jrc_cache(jrc_source: str, jrc_local_dir: Union[str, Path],
                        snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                       cache_dir: Optional[Path] = None) -> Dict[str, Path]:
+                       cache_dir: Optional[Path] = None,
+                       blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                       blob_container: Optional[str] = None) -> Dict[str, Path]:
     """Returns whichever of {'10.0', '20.0', '50.0', '100.0', 'water'} were
     successfully resolved: per-file tolerant, NOT all-or-nothing. A single
     missing/corrupted JRC file (e.g. jrc_rp50.tif) only needs to disable the
@@ -140,12 +191,14 @@ def resolve_jrc_cache(jrc_source: str, jrc_local_dir: Union[str, Path],
     for rp, fname in JRC_DEPTH_FILENAME.items():
         try:
             paths[rp] = _resolve_jrc_file(fname, jrc_source, jrc_local_dir, snowflake_conn,
-                                           snowflake_stage_name, cache_dir)
+                                           snowflake_stage_name, cache_dir,
+                                           blob_account_url, blob_sas_token, blob_container)
         except Exception as e:
             logger.warning(f"  JRC cache file for RP{rp} unavailable, that tier will be skipped: {e}")
     try:
         paths["water"] = _resolve_jrc_file(JRC_WATER_FILENAME, jrc_source, jrc_local_dir, snowflake_conn,
-                                            snowflake_stage_name, cache_dir)
+                                            snowflake_stage_name, cache_dir,
+                                            blob_account_url, blob_sas_token, blob_container)
     except Exception as e:
         logger.warning(f"  JRC permanent-water cache file unavailable, every tier will be skipped "
                         f"(all tiers need it): {e}")
@@ -175,15 +228,17 @@ def compute_tier_probabilities(cell_lat: np.ndarray, cell_lon: np.ndarray, data:
                                 n_members: int, threshold_source: str,
                                 threshold_local_dir: Union[str, Path],
                                 snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                                cache_dir: Optional[Path] = None) -> Dict[str, np.ndarray]:
+                                cache_dir: Optional[Path] = None,
+                                blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                                blob_container: Optional[str] = None) -> Dict[str, np.ndarray]:
     """
     Returns {rp: array of shape (n_steps, n_cells)}, one entry per
-    EXTENT_RP_LEVELS tier -- fraction of members exceeding that tier's
+    EXTENT_RP_LEVELS tier: fraction of members exceeding that tier's
     threshold, per cell per lead step. RP thresholds are monotonic by
     construction, so this is well-defined for every cell already kept by the
     upstream RP2 sparse filter (see glofas_downloader.py).
 
-    ONLY used in the demo notebook for now. 
+    ONLY used in the demo notebook for now.
     """
     n_steps = data.shape[1]
     result = {}
@@ -191,6 +246,7 @@ def compute_tier_probabilities(cell_lat: np.ndarray, cell_lon: np.ndarray, data:
         threshold_path = _fetch_threshold_file(
             threshold_source, threshold_local_dir, snowflake_conn=snowflake_conn,
             snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir, rp=rp,
+            blob_account_url=blob_account_url, blob_sas_token=blob_sas_token, blob_container=blob_container,
         )
         thr = _load_threshold_at_cells(cell_lat, cell_lon, rp, threshold_path)  # (n_cells,)
         # (n_members, n_steps, n_cells) > (n_cells,) broadcasts correctly over the last axis
@@ -206,7 +262,9 @@ def compute_tier_probabilities(cell_lat: np.ndarray, cell_lon: np.ndarray, data:
 def compute_tier_member_exceedance(cell_lat: np.ndarray, cell_lon: np.ndarray, data: np.ndarray,
                                     threshold_source: str, threshold_local_dir: Union[str, Path],
                                     snowflake_conn=None, snowflake_stage_name: Optional[str] = None,
-                                    cache_dir: Optional[Path] = None) -> Dict[str, np.ndarray]:
+                                    cache_dir: Optional[Path] = None,
+                                    blob_account_url: Optional[str] = None, blob_sas_token: Optional[str] = None,
+                                    blob_container: Optional[str] = None) -> Dict[str, np.ndarray]:
     """
     Returns {rp: array of shape (n_members, n_steps, n_cells)} boolean: per-member
     exceedance of that tier's threshold, NOT collapsed across the member axis (unlike
@@ -233,6 +291,7 @@ def compute_tier_member_exceedance(cell_lat: np.ndarray, cell_lon: np.ndarray, d
             threshold_path = _fetch_threshold_file(
                 threshold_source, threshold_local_dir, snowflake_conn=snowflake_conn,
                 snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir, rp=rp,
+                blob_account_url=blob_account_url, blob_sas_token=blob_sas_token, blob_container=blob_container,
             )
             thr = _load_threshold_at_cells(cell_lat, cell_lon, rp, threshold_path)  # (n_cells,)
         except Exception as e:
@@ -322,7 +381,7 @@ def combine_tier(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
     Write one multi-band GeoTIFF (one band per lead step) for a single RP
     tier.
 
-    ONLY used in the demo notebook for now. 
+    ONLY used in the demo notebook for now.
     """
     source_tier = EXTENT_SOURCE_TIER[rp]
     depth_path = jrc_paths[source_tier]
@@ -390,7 +449,7 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
     step) that IS flooded for that member after JRC pixel-matching: sparse,
     True-only (the overwhelming majority of pixel/member/step combinations
     are NOT flooded, so only writing the positive case keeps this small).
-    
+
     Columns: pixel_lat, pixel_lon, member (real ECMWF member id, 1-50 pf /
     51 control), step_h, below_min_basin (True if this cell's own uparea is
     known to be below JRC's own 500km^2 minimum-catchment cutoff for
@@ -548,6 +607,10 @@ def run_glofas_extent_masking(
         snowflake_conn=None,
         snowflake_stage_name: Optional[str] = None,
         upload_to_stage: bool = True,
+        data_pipeline_db: str = 'SNOWFLAKE',
+        blob_account_url: Optional[str] = None,
+        blob_sas_token: Optional[str] = None,
+        blob_container: Optional[str] = None,
         min_basin_km2: float = MIN_BASIN_KM2,
 ) -> List[Dict]:
     """
@@ -609,6 +672,7 @@ def run_glofas_extent_masking(
         exceed_by_tier = compute_tier_member_exceedance(
             cell_lat, cell_lon, data, threshold_source, threshold_local_dir,
             snowflake_conn=snowflake_conn, snowflake_stage_name=snowflake_stage_name, cache_dir=cache_dir,
+            blob_account_url=blob_account_url, blob_sas_token=blob_sas_token, blob_container=blob_container,
         )
     except Exception as e:
         logger.error(f"  Could not compute per-tier member exceedance, aborting extent masking: {e}")
@@ -621,7 +685,9 @@ def run_glofas_extent_masking(
     try:
         jrc_paths = resolve_jrc_cache(jrc_source, jrc_local_dir, snowflake_conn=snowflake_conn,
                                        snowflake_stage_name=snowflake_stage_name,
-                                       cache_dir=output_path / "jrc_extent_cache")
+                                       cache_dir=output_path / "jrc_extent_cache",
+                                       blob_account_url=blob_account_url, blob_sas_token=blob_sas_token,
+                                       blob_container=blob_container)
     except Exception as e:
         logger.error(f"  Could not resolve JRC cache at all, aborting extent masking: {e}")
         return []
@@ -631,20 +697,20 @@ def run_glofas_extent_masking(
         source_tier = EXTENT_SOURCE_TIER[rp]
         if source_tier not in jrc_paths or "water" not in jrc_paths:
             logger.info(f"  RP{rp}: required JRC cache file(s) unavailable ({source_tier} depth "
-                        f"and/or permanent-water) — skipping this tier")
+                        f"and/or permanent-water) -- skipping this tier")
             continue
 
         if rp not in exceed_by_tier:
             # compute_tier_member_exceedance() already logged why (its own
             # per-tier try/except), this tier's threshold fetch/load failed
             # and was skipped there, not a bug here.
-            logger.info(f"  RP{rp}: member exceedance unavailable for this tier — skipping")
+            logger.info(f"  RP{rp}: member exceedance unavailable for this tier -- skipping")
             continue
 
         exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
         keep_mask = exceed.any(axis=(0, 1))
         if not keep_mask.any():
-            logger.info(f"  RP{rp}: no cells survive filtering — skipping")
+            logger.info(f"  RP{rp}: no cells survive filtering -- skipping")
             continue
 
         # rp_int (not the raw "10.0" string) so the filename matches the extent_rp{N}
@@ -667,13 +733,22 @@ def run_glofas_extent_masking(
 
         stage_path = None
         if upload_to_stage:
-            if not snowflake_conn or not snowflake_stage_name:
-                logger.warning(f"  RP{rp}: upload_to_stage requested but no Snowflake connection — keeping local only")
+            if data_pipeline_db == 'BLOB':
+                if not (blob_account_url and blob_sas_token and blob_container):
+                    logger.warning(f"  RP{rp}: upload_to_stage requested but no Blob credentials -- keeping local only")
+                else:
+                    stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{out_path.name}"
+                    ok = upload_to_blob(out_path, blob_account_url, blob_sas_token, blob_container, stage_path)
+                    if not ok:
+                        logger.error(f"  RP{rp}: Blob upload failed -- skipping metadata row for this tier")
+                        continue
+            elif not snowflake_conn or not snowflake_stage_name:
+                logger.warning(f"  RP{rp}: upload_to_stage requested but no Snowflake connection -- keeping local only")
             else:
                 stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{out_path.name}"
                 ok = upload_to_snowflake_stage(out_path, snowflake_stage_name, stage_path, snowflake_conn)
                 if not ok:
-                    logger.error(f"  RP{rp}: stage upload failed — skipping metadata row for this tier")
+                    logger.error(f"  RP{rp}: stage upload failed -- skipping metadata row for this tier")
                     continue
 
         results.append({

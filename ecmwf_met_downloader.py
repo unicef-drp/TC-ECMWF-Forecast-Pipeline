@@ -6,26 +6,30 @@ Downloads gridded IFS ENS parameters from ECMWF Open Data, converts to Zarr
 ZipStore, and uploads to a Snowflake internal stage.
 
 Parameters currently downloaded (both per pipeline run):
-  tp  — total precipitation (accumulated mm from T+0)
-  ro  — total runoff = surface runoff (sro) + subsurface drainage (ssro).
+  tp: total precipitation (accumulated mm from T+0)
+  ro: total runoff = surface runoff (sro) + subsurface drainage (ssro).
         Land-only (HTESSEL is a land surface model; ro=0 over ocean).
         Provides a soil-aware pluvial flood signal over land.
         Note: sro and ssro are NOT available separately in ECMWF Open Data.
 
 Storage format:
-  Zarr ZipStore (.zarr.zip) — single file, chunked (1, 1, lat, lon), float16, zstd.
+  Zarr ZipStore (.zarr.zip): single file, chunked (1, 1, lat, lon), float16, zstd.
   dims: (member=51, step=25, lat, lon)
   values: accumulated from T+0 (subtract consecutive steps for period values)
   spatial: 60°S–60°N (all TC-active basins; Arctic/Antarctica excluded)
 
 Storage destinations:
   DATA_PIPELINE_DB=SNOWFLAKE  →  PUT to Snowflake internal stage @{SNOWFLAKE_STAGE_NAME}
+  DATA_PIPELINE_DB=BLOB        →  uploaded to Azure Blob Storage container CONTAINER_NAME,
+                                   same account/container the sibling DATAPIPELINE repo's own
+                                   output uses (ACCOUNT_URL/SAS_TOKEN/CONTAINER_NAME, unprefixed,
+                                   same env var names as that repo, one shared Blob destination)
   DATA_PIPELINE_DB=LOCAL       →  ZipStore kept in met_data/ on disk
 
 Member 51 (HRES control):
   stream=enfo, type=cf was deprecated in IFS Cycle 50r1 (May 2026).
   Member 51 is now downloaded as stream=oper, type=fc (HRES deterministic forecast).
-  HRES open data is at 0.25° — same grid as ENS, no regridding needed.
+  HRES open data is at 0.25°, same grid as ENS, no regridding needed.
 """
 
 import logging
@@ -88,7 +92,7 @@ def _download_hres_step(client: Client, param: str, forecast_date: datetime,
     """
     Download one step of HRES control (member 51).
     stream=oper, type=fc replaces deprecated stream=enfo, type=cf since Cycle 50r1.
-    Published at 0.25° — same grid as ENS, stacks directly.
+    Published at 0.25°, same grid as ENS, stacks directly.
     """
     fname = f'{param}_hres_{forecast_date.strftime("%Y-%m-%d")}_r{run_time:02d}_f{step:03d}h.grib2'
     fpath = grib_dir / fname
@@ -154,7 +158,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
                              backend_kwargs={'errors': 'ignore', 'indexpath': idx_pf})
     try:
         if not ds_pf.data_vars:
-            raise ValueError(f"cfgrib decoded no variables from {pf_path} — check GRIB2 integrity")
+            raise ValueError(f"cfgrib decoded no variables from {pf_path} -- check GRIB2 integrity")
         if param not in ds_pf.data_vars:
             fallback = list(ds_pf.data_vars)[0]
             logger.warning(f"Variable '{param}' not in {list(ds_pf.data_vars)}; using '{fallback}' from {pf_path.name}")
@@ -174,7 +178,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
         ds_pf.close()
 
     if not hres_path.exists():
-        # HRES not published for this step (06Z/18Z run beyond T+90h) — fill with NaN
+        # HRES not published for this step (06Z/18Z run beyond T+90h); fill with NaN
         arrays.append(np.full_like(arrays[0], np.nan, dtype=np.float32))
     else:
         idx_hres = str(hres_path) + '.idx'
@@ -182,7 +186,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
                                    backend_kwargs={'errors': 'ignore', 'indexpath': idx_hres})
         try:
             if not ds_hres.data_vars:
-                raise ValueError(f"cfgrib decoded no variables from {hres_path} — check GRIB2 integrity")
+                raise ValueError(f"cfgrib decoded no variables from {hres_path} -- check GRIB2 integrity")
             if param not in ds_hres.data_vars:
                 fallback = list(ds_hres.data_vars)[0]
                 logger.warning(f"Variable '{param}' not in {list(ds_hres.data_vars)}; using '{fallback}' from {hres_path.name}")
@@ -214,7 +218,7 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
 
     dims:   (member=51, step=25, lat, lon)
     dtype:  float16  (sufficient precision for precipitation in mm)
-    chunks: (1, 1, lat, lon)  — one chunk per member per step; fast random access
+    chunks: (1, 1, lat, lon), one chunk per member per step; fast random access
     comp:   Blosc/zstd-3/bitshuffle
     values: accumulated mm from T+0 (raw ECMWF output)
              → period values = step_n − step_(n-6) computed at read time
@@ -225,7 +229,7 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
     zip_path = output_dir / f'{param}_{run_str}.zarr.zip'
 
     if zip_path.exists():
-        logger.info(f'  {zip_path.name} already exists — skipping')
+        logger.info(f'  {zip_path.name} already exists -- skipping')
         return zip_path
 
     logger.info(f'  Building Zarr for {param} ({len(FORECAST_STEPS)} steps × 51 members) ...')
@@ -348,6 +352,38 @@ def upload_to_snowflake_stage(zip_path: Path, stage_name: str,
         return False
 
 
+def upload_to_blob(zip_path: Path, account_url: str, sas_token: str,
+                    container: str, blob_path: str) -> bool:
+    """
+    Upload a ZipStore file to Azure Blob Storage.
+
+    Mirrors upload_to_snowflake_stage()'s interface and blob_path shape (the
+    same 'met/{run_str}/{filename}' layout, so both destinations use an
+    identical relative path: consumers reading from Blob via ADLSDataStore
+    or from the Snowflake stage via SnowflakeDataStore see the same structure).
+
+    Args:
+        zip_path:    Local path to the .zarr.zip file
+        account_url: Azure Storage account URL (e.g. 'https://saunidataaots.blob.core.windows.net/')
+        sas_token:   Container-scoped SAS token with write permission
+        container:   Blob container name
+        blob_path:   Path within the container (e.g. 'met/20260629_00/tp.zarr.zip')
+
+    Returns True on success.
+    """
+    from azure.storage.blob import BlobServiceClient
+    try:
+        service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
+        blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
+        with open(zip_path, 'rb') as f:
+            blob_client.upload_blob(f, overwrite=True)
+        logger.info(f'  Uploaded {zip_path.name} → blob:{container}/{blob_path}')
+        return True
+    except Exception as e:
+        logger.error(f'  Blob upload failed: {e}')
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -363,6 +399,10 @@ def download_ensemble_param(
         snowflake_conn=None,
         snowflake_stage_name: Optional[str] = None,
         upload_to_stage: bool = True,
+        data_pipeline_db: str = 'SNOWFLAKE',
+        blob_account_url: Optional[str] = None,
+        blob_sas_token: Optional[str] = None,
+        blob_container: Optional[str] = None,
         cleanup_grib: bool = True,
         max_workers: int = 4,
         verbose: bool = True,
@@ -375,10 +415,18 @@ def download_ensemble_param(
         date:                 Forecast date as 'YYYY-MM-DD' or datetime
         run_time:             Model run hour (0, 6, 12, or 18)
         output_dir:           Working directory for GRIB2 + ZipStore files
-        snowflake_conn:       Active Snowflake connection (required if upload_to_stage=True)
+        snowflake_conn:       Active Snowflake connection (required if upload_to_stage=True
+                              and data_pipeline_db=='SNOWFLAKE')
         snowflake_stage_name: Stage name without @ (e.g. 'AOTS_ANALYSIS')
-        upload_to_stage:      If True, PUT ZipStore to Snowflake stage (DATA_PIPELINE_DB=SNOWFLAKE)
-                              If False, keep ZipStore locally (DATA_PIPELINE_DB=LOCAL)
+        upload_to_stage:      If True, upload the ZipStore to the destination named by
+                              data_pipeline_db. If False, keep ZipStore locally regardless
+                              of data_pipeline_db (DATA_PIPELINE_DB=LOCAL).
+        data_pipeline_db:     'SNOWFLAKE' (PUT to Snowflake stage) or 'BLOB' (upload to Azure
+                              Blob Storage): which remote destination upload_to_stage=True
+                              actually uploads to. Ignored when upload_to_stage=False.
+        blob_account_url:     Azure Storage account URL (required if data_pipeline_db=='BLOB')
+        blob_sas_token:       Container-scoped SAS token (required if data_pipeline_db=='BLOB')
+        blob_container:       Blob container name (required if data_pipeline_db=='BLOB')
         cleanup_grib:         Delete GRIB2 files after Zarr is built
         max_workers:          Concurrent download workers
         verbose:              Log progress
@@ -386,7 +434,8 @@ def download_ensemble_param(
     Returns dict:
         success:       bool
         zip_path:      Path to local ZipStore (always present on success)
-        stage_path:    Stage path within stage_name, or None if LOCAL mode
+        stage_path:    Destination path (Snowflake stage or Blob container, same relative
+                       shape either way), or None if LOCAL mode
         forecast_date: datetime
         run_time:      int
         param:         str
@@ -405,7 +454,7 @@ def download_ensemble_param(
 
     if verbose:
         logger.info('=' * 70)
-        logger.info(f'ECMWF ENS — {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
+        logger.info(f'ECMWF ENS -- {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
         logger.info(f'  Steps: {len(FORECAST_STEPS)} (0–144h at 6h)  |  Members: 51 (50 pf + 1 hres)')
         logger.info(f'  Spatial: {LAT_MIN}°–{LAT_MAX}°  |  Upload: {"stage" if upload_to_stage else "local"}')
         logger.info('=' * 70)
@@ -428,16 +477,22 @@ def download_ensemble_param(
         return {'success': False, 'zip_path': None, 'stage_path': None,
                 'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
 
-    # Step 3: Upload to Snowflake stage (or keep local)
+    # Step 3: Upload to the configured remote destination (or keep local)
     stage_path = None
     if upload_to_stage:
-        if not snowflake_conn or not snowflake_stage_name:
-            logger.error('  snowflake_conn and snowflake_stage_name required for stage upload')
-            return {'success': False, 'zip_path': zip_path, 'stage_path': None,
-                    'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
-
         stage_path = f'met/{run_str}/{zip_path.name}'
-        ok = upload_to_snowflake_stage(zip_path, snowflake_stage_name, stage_path, snowflake_conn)
+        if data_pipeline_db == 'BLOB':
+            if not blob_account_url or not blob_sas_token or not blob_container:
+                logger.error('  blob_account_url, blob_sas_token, and blob_container required for Blob upload')
+                return {'success': False, 'zip_path': zip_path, 'stage_path': None,
+                        'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
+            ok = upload_to_blob(zip_path, blob_account_url, blob_sas_token, blob_container, stage_path)
+        else:
+            if not snowflake_conn or not snowflake_stage_name:
+                logger.error('  snowflake_conn and snowflake_stage_name required for stage upload')
+                return {'success': False, 'zip_path': zip_path, 'stage_path': None,
+                        'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
+            ok = upload_to_snowflake_stage(zip_path, snowflake_stage_name, stage_path, snowflake_conn)
         if not ok:
             return {'success': False, 'zip_path': zip_path, 'stage_path': None,
                     'forecast_date': forecast_date, 'run_time': run_time, 'param': param}
@@ -455,7 +510,13 @@ def download_ensemble_param(
             logger.info(f'  Cleaned up GRIB2 files from {grib_dir}')
 
     if verbose:
-        logger.info(f'  ✓ {param.upper()} done — {"@" + snowflake_stage_name + "/" + stage_path if stage_path else zip_path}')
+        if stage_path and data_pipeline_db == 'BLOB':
+            destination = f'blob:{blob_container}/{stage_path}'
+        elif stage_path:
+            destination = f'@{snowflake_stage_name}/{stage_path}'
+        else:
+            destination = str(zip_path)
+        logger.info(f'  ✓ {param.upper()} done -- {destination}')
 
     return {
         'success':       True,

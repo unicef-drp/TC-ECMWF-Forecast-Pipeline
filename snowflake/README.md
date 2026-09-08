@@ -17,7 +17,7 @@ Execution sequence:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
 2. **Phase 2**: Transform per-storm CSVs (concurrently if `USE_PROCESS_POOL=true`)
 3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons
-4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons; skipped if no named storms
 5. **Phase 3c** *(optional)*: Download global met GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
 6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
@@ -44,51 +44,51 @@ Execution sequence:
 3. **Snowflake account** with SPCS enabled
 
 4. **Network Security Configuration**
-   
+
    The pipeline requires network connectivity to external systems (ECMWF servers). Configure network rules and external access integration:
-   
+
    ```sql
    USE ROLE ACCOUNTADMIN;
-   
+
    -- Create network rule for egress access (allows outbound HTTP/HTTPS)
    CREATE OR REPLACE NETWORK RULE tc_wind_data_egress_access
      MODE = EGRESS
      TYPE = HOST_PORT
      VALUE_LIST = ('0.0.0.0:80', '0.0.0.0:443');
-   
+
    -- Create external access integration
    CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION tc_wind_data_egress_access_integration
      ALLOWED_NETWORK_RULES = (tc_wind_data_egress_access)
      ENABLED = true;
    ```
-   
+
    **Note:** The network rule allows outbound HTTP (port 80) and HTTPS (port 443) to any destination (0.0.0.0). This is required for accessing ECMWF's services:
-   - `https://data.ecmwf.int/` (ECMWF Open Data — TC tracks and wind forecasts)
+   - `https://data.ecmwf.int/` (ECMWF Open Data: TC tracks and wind forecasts)
 
 5. **Compute Pool**
-   
+
    Create a compute pool for running SPCS services:
-   
+
    ```sql
    -- View available compute pool instance families
    SHOW COMPUTE POOL INSTANCE FAMILIES;
-   
+
    -- Create compute pool (adjust instance family as needed)
    CREATE COMPUTE POOL IF NOT EXISTS my_compute_pool
      MIN_NODES = 1
      MAX_NODES = 1
      INSTANCE_FAMILY = CPU_X64_M;
    ```
-   
+
    Adjust the `INSTANCE_FAMILY` based on your requirements and available options from `SHOW COMPUTE POOL INSTANCE FAMILIES`.
 
 6. **Image Repository** created in Snowflake
-   
+
    Before pushing images, you must create an image repository in your Snowflake database:
    ```sql
    CREATE OR REPLACE IMAGE REPOSITORY SERVICES;
    ```
-   
+
    This should be run in the database and schema where you plan to deploy your SPCS service.
 
 ## Building the Docker Image
@@ -210,8 +210,8 @@ EXECUTE JOB SERVICE
      platformMonitor:
        metricConfig:
          groups:
-         - system 
-         - network 
+         - system
+         - network
    $$;
 ```
 
@@ -315,7 +315,7 @@ docker run -e DOWNLOAD_DATE=20251102 -e RUN_TIME=12 ... tc-ecmwf-pipeline:latest
 ```
 
 **Notes**:
-- `DOWNLOAD_DATE` requires `RUN_TIME` — the API retrieves a specific run, not a full day
+- `DOWNLOAD_DATE` requires `RUN_TIME`: the API retrieves a specific run, not a full day
 - `RUN_TIME` must be `00`, `06`, `12`, or `18` (no `Z` suffix)
 - Date format: `YYYYMMDD` (8 digits, no dashes)
 - If data is unavailable for the requested date/time, the pipeline logs an error and exits
@@ -336,9 +336,9 @@ Wind data download depends on TC data:
 ## Pipeline Phases
 
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
-2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`) — skipped if no named storms
-3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons — skipped if no named storms
-4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons — skipped if no named storms
+2. **Phase 2**: Transform per-storm CSVs into Snowflake-ready format (concurrent when `USE_PROCESS_POOL=true`); skipped if no named storms
+3. **Phase 3**: Download wind GRIB files → create wind threshold envelope polygons; skipped if no named storms
+4. **Phase 3b**: Download gust GRIB files (10fg) → create gust threshold envelope polygons; skipped if no named storms
 5. **Phase 3c** *(optional)*: Download global GRIB files for `tp` (total precipitation) and `ro` (total runoff) → convert each to a Zarr ZipStore → PUT to Snowflake stage. Runs regardless of whether named storms were found.
 6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
@@ -414,7 +414,7 @@ EXECUTE JOB SERVICE
    $$;
 ```
 
-**CDS idle-wait-time cost fix — submit/process split:** schedule via **two**
+**CDS idle-wait-time cost fix (submit/process split):** schedule via **two**
 Snowflake TASKs calling this `EXECUTE JOB SERVICE`, not one: one with `GLOFAS_MODE: "submit"`
 at the original once-daily time (past GloFAS's ~11h publication latency, e.g.
 12-13 UTC), and a second with `GLOFAS_MODE: "process"` `CDS_PROCESS_DELAY_MINUTES` later
@@ -423,7 +423,7 @@ in seconds, saving the returned request IDs to a new `GLOFAS_CDS_REQUESTS` table
 resumes those requests (patient wait-then-download, same behavior the original single-step flow
 always had), falling back to a fresh submit-and-block if nothing was saved. This is what makes
 `GLOFAS_MODE` default to `process` and safe to omit entirely for a deployment that only wants
-one task, at the cost of not benefiting from the split. 
+one task, at the cost of not benefiting from the split.
 
 **Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
 (manually, not part of any recurring job) to populate
@@ -433,12 +433,12 @@ with a pre-populated local directory instead).
 
 Extent masking (GloFAS x JRC v2.1 flood-extent, enabled by default via
 `GLOFAS_EXTENT_ENABLED`) additionally requires `setup_jrc_extents.py` to have been
-run once already (manually) to populate `@{stage}/glofas/jrc_extent_cache/v2_1/*.tif`, 
+run once already (manually) to populate `@{stage}/glofas/jrc_extent_cache/v2_1/*.tif`,
 a plain script with no credentials of its own, it fetches directly from JRC's own
 file server (unless `GLOFAS_JRC_SOURCE=local` with a pre-populated local directory
 instead).
 
-**Snowflake table:** `RIVER_FORECASTS` — same staging+MERGE pattern as the main
+**Snowflake table:** `RIVER_FORECASTS`: same staging+MERGE pattern as the main
 pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`. Shared by both products:
 raw discharge rows use `PARAM='dis24'`; per-member flood-extent rows use
 `PARAM='extent_rp{2,5,10,20,50,100}_bymember'` plus an `IS_STANDIN` column (true only

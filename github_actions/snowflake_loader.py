@@ -122,7 +122,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
         int: rows actually loaded/merged (0 is a legitimate, non-error result
              for a genuinely empty input CSV).
         None: the load itself failed (Snowflake error, write_pandas failure,
-             etc.) — distinct from a real 0, so callers can tell "nothing to
+             etc.), distinct from a real 0, so callers can tell "nothing to
              load" apart from "the load broke" and record the latter as a
              real error instead of silently treating it as zero rows.
     """
@@ -291,7 +291,7 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_TRACKS t
                     USING {staging_table} s
-                    ON t.TRACK_ID = s.TRACK_ID 
+                    ON t.TRACK_ID = s.TRACK_ID
                         AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
                         AND t.FORECAST_TIME = s.FORECAST_TIME
                         AND t.LEAD_TIME = s.LEAD_TIME
@@ -333,12 +333,12 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 merge_sql = f"""
                     MERGE INTO TC_ENVELOPES_INDIVIDUAL t
                     USING (
-                        SELECT 
+                        SELECT
                             FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
                             WIND_THRESHOLD,
-                            CASE 
-                                WHEN ENVELOPE_REGION IS NOT NULL 
-                                     AND ENVELOPE_REGION != '' 
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
                                      AND ENVELOPE_REGION != 'None'
                                      AND ENVELOPE_REGION != 'null'
                                 THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
@@ -536,7 +536,7 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     Load met forecast metadata rows into MET_FORECASTS table.
 
     Creates the table if it does not exist. Uses staging + MERGE to deduplicate
-    on (FORECAST_TIME, PARAM) — re-runs are safe.
+    on (FORECAST_TIME, PARAM); re-runs are safe.
 
     The zarr is a global file (one per model run), so there is one row per
     (FORECAST_TIME, PARAM), not one per storm.

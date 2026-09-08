@@ -7,8 +7,8 @@ from ECMWF's Open Data service.
 
 The downloader processes:
 - Ensemble forecasts (50 perturbed members: 1-50, + control member 51)
-- 10m wind components (u10 and v10) — sustained wind, used for TC_ENVELOPES_*
-- 10fg (maximum 10m wind gust) — indexed as '10fg' for steps ≤ 90h, '10fg3' for steps > 90h;
+- 10m wind components (u10 and v10): sustained wind, used for TC_ENVELOPES_*
+- 10fg (maximum 10m wind gust): indexed as '10fg' for steps ≤ 90h, '10fg3' for steps > 90h;
   used for TC_GUST_ENVELOPES_*
 - Multiple forecast lead times (every 6 hours up to 144 hours for wind, 6-144 hours for gust)
 - Different forecast run times (00Z, 06Z, 12Z, 18Z)
@@ -29,7 +29,7 @@ from ecmwf.opendata import Client
 # Configuration
 DEFAULT_OUTPUT_DIR = "wind_data"
 
-# ENS perturbed (pf) forecast steps — 0–144h for all run times
+# ENS perturbed (pf) forecast steps: 0–144h for all run times
 FORECAST_STEPS = {
     0:  list(range(0, 145, 6)),
     6:  list(range(0, 145, 6)),
@@ -688,7 +688,7 @@ def get_file_info(filepath: str) -> Dict[str, Union[str, int]]:
 
     filename = os.path.basename(filepath)
 
-    # Parse filename — matches both _pf.grib2 and _cf.grib2 suffixes
+    # Parse filename: matches both _pf.grib2 and _cf.grib2 suffixes
     pattern = r'wind_ens_(\d{4}-\d{2}-\d{2})_r(\d{2})_f(\d{3})h_(?:pf|cf)\.grib2'
     match = re.match(pattern, filename)
 
