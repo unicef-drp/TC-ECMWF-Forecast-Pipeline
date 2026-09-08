@@ -26,6 +26,11 @@ blosc2>=2.0.0      # required by zarr BloscCodec at write time (not in zarr's ow
 snowflake-connector-python[pandas]>=3.0.0
 cryptography>=41.0.0  # private-key auth (SPCS entry point)
 
+# Azure Blob Storage (DATA_PIPELINE_DB=BLOB / GLOFAS_THRESHOLD_SOURCE=blob / GLOFAS_JRC_SOURCE=blob):
+# glofas_downloader.py's blob_file_exists()/blob upload+download paths, SAS-token auth only,
+# no azure-identity needed
+azure-storage-blob>=12.19.0
+
 # GloFAS x JRC extent-masking (glofas_extent_masking.py)
 rasterio>=1.3.0
 pyarrow>=14.0.0

@@ -32,3 +32,7 @@ cryptography>=41.0.0
 zarr>=3.0.0
 numcodecs>=0.14.0
 blosc2>=2.0.0
+
+# Azure Blob Storage (DATA_PIPELINE_DB=BLOB): ecmwf_met_downloader.py's blob upload path,
+# SAS-token auth only, no azure-identity needed
+azure-storage-blob>=12.19.0
