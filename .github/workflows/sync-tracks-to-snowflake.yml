@@ -1,0 +1,85 @@
+name: Sync Tracks/Envelopes to Snowflake
+
+# Manual-only backstop for the DATA_PIPELINE_DB=BLOB pipeline (ecmwf-tc-pipline.yml). That
+# workflow already syncs TC_TRACKS/TC_ENVELOPES_* into Snowflake in-process, immediately
+# after its own Blob upload succeeds (see step7_load()'s BLOB branch in github_actions/
+# main.py). This workflow exists only to catch a cycle where that in-process sync was
+# skipped (no Snowflake credentials configured for that run) or failed partway through an
+# otherwise-successful pipeline run, so a real forecast cycle's tracks/envelopes are never
+# permanently stuck in Blob with no Snowflake copy.
+#
+# The recurring `on: schedule` cron that used to run this every 30 minutes has been REMOVED:
+# a serverless, stream-triggered Snowflake task (SYNC_TRACKS_ENVELOPES_TASK, calling
+# SYNC_TRACKS_ENVELOPES_FROM_BLOB(), see Ahead-of-the-Storm-ORCHESTRATION/09_orchestration/
+# 06_sync_tracks_envelopes_from_blob.sql) now covers this same periodic-safety-net role.
+# It reads new tracks/envelopes files directly from the Blob stage via SQL and MERGEs them
+# on Snowflake-managed serverless compute, checked every 10 minutes at negligible cost when
+# there is nothing new (no 60-second warehouse-resume minimum on every check, unlike this
+# workflow's own plain Snowflake client connection). This workflow is kept as a `workflow_dispatch`-only
+# manual tool: useful for an ad-hoc backfill (e.g. `--since-hours` covering a longer outage
+# window than the Snowflake task's own retry queue would reach) or local debugging against a
+# real Blob container, without needing a live GHA cron to exist for that purpose.
+#
+# blob_to_snowflake_loader.py's --since-hours/CLI support (added alongside this workflow) is
+# kept as-is, still the mechanism this manual dispatch (and any local debugging) uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      since_hours:
+        description: 'Only sync blobs modified within the last N hours'
+        required: false
+        type: string
+        default: '3'
+      execute:
+        description: 'Actually write to Snowflake (false = dry run, lists what would load)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements-blob-sync.txt'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-blob-sync.txt
+
+      - name: Sync tracks/envelopes CSVs from Blob into Snowflake
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+
+          SINCE_HOURS: ${{ github.event.inputs.since_hours || '3' }}
+        run: |
+          ARGS="--tracks-envelopes --since-hours $SINCE_HOURS"
+          if [ "${{ github.event.inputs.execute }}" != "false" ]; then
+            ARGS="$ARGS --execute"
+          fi
+          python github_actions/blob_to_snowflake_loader.py $ARGS
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Tracks/envelopes Snowflake sync failed! Check logs for details."
+          exit 1

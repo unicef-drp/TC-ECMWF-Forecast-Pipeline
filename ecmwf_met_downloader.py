@@ -158,7 +158,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
                              backend_kwargs={'errors': 'ignore', 'indexpath': idx_pf})
     try:
         if not ds_pf.data_vars:
-            raise ValueError(f"cfgrib decoded no variables from {pf_path} -- check GRIB2 integrity")
+            raise ValueError(f"cfgrib decoded no variables from {pf_path}, check GRIB2 integrity")
         if param not in ds_pf.data_vars:
             fallback = list(ds_pf.data_vars)[0]
             logger.warning(f"Variable '{param}' not in {list(ds_pf.data_vars)}; using '{fallback}' from {pf_path.name}")
@@ -186,7 +186,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
                                    backend_kwargs={'errors': 'ignore', 'indexpath': idx_hres})
         try:
             if not ds_hres.data_vars:
-                raise ValueError(f"cfgrib decoded no variables from {hres_path} -- check GRIB2 integrity")
+                raise ValueError(f"cfgrib decoded no variables from {hres_path}, check GRIB2 integrity")
             if param not in ds_hres.data_vars:
                 fallback = list(ds_hres.data_vars)[0]
                 logger.warning(f"Variable '{param}' not in {list(ds_hres.data_vars)}; using '{fallback}' from {hres_path.name}")
@@ -229,7 +229,7 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
     zip_path = output_dir / f'{param}_{run_str}.zarr.zip'
 
     if zip_path.exists():
-        logger.info(f'  {zip_path.name} already exists -- skipping')
+        logger.info(f'  {zip_path.name} already exists, skipping')
         return zip_path
 
     logger.info(f'  Building Zarr for {param} ({len(FORECAST_STEPS)} steps × 51 members) ...')
@@ -376,7 +376,11 @@ def upload_to_blob(zip_path: Path, account_url: str, sas_token: str,
         service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
         blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
         with open(zip_path, 'rb') as f:
-            blob_client.upload_blob(f, overwrite=True)
+            # max_concurrency enables the Azure SDK's chunked parallel upload
+            # path; the default (1) uploads large files over a single
+            # connection, which runs roughly 10-30x slower than Snowflake's own
+            # multi-threaded stage PUT for files of this size (~200MB-1.2GB).
+            blob_client.upload_blob(f, overwrite=True, max_concurrency=4)
         logger.info(f'  Uploaded {zip_path.name} → blob:{container}/{blob_path}')
         return True
     except Exception as e:
@@ -454,7 +458,7 @@ def download_ensemble_param(
 
     if verbose:
         logger.info('=' * 70)
-        logger.info(f'ECMWF ENS -- {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
+        logger.info(f'ECMWF ENS, {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
         logger.info(f'  Steps: {len(FORECAST_STEPS)} (0–144h at 6h)  |  Members: 51 (50 pf + 1 hres)')
         logger.info(f'  Spatial: {LAT_MIN}°–{LAT_MAX}°  |  Upload: {"stage" if upload_to_stage else "local"}')
         logger.info('=' * 70)
@@ -516,7 +520,7 @@ def download_ensemble_param(
             destination = f'@{snowflake_stage_name}/{stage_path}'
         else:
             destination = str(zip_path)
-        logger.info(f'  ✓ {param.upper()} done -- {destination}')
+        logger.info(f'  ✓ {param.upper()} done, {destination}')
 
     return {
         'success':       True,

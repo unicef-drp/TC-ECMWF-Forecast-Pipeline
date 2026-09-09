@@ -1,0 +1,17 @@
+# Dependencies for the periodic Blob -> Snowflake tracks/envelopes sync
+# (.github/workflows/sync-tracks-to-snowflake.yml, github_actions/blob_to_snowflake_loader.py),
+# separate from requirements-ci.txt on purpose: this job only lists/downloads plain CSVs from
+# Blob and MERGEs them into Snowflake via pandas -- it never touches BUFR/GRIB/wind/geospatial
+# processing, so it doesn't need eccodes, shapely, cfgrib, matplotlib, or zarr.
+
+# Data processing (load_csv_to_snowflake's own DataFrame prep in snowflake_loader.py)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Snowflake (MERGE load via write_pandas)
+snowflake-connector-python[pandas]>=3.0.0
+cryptography>=41.0.0
+
+# Azure Blob Storage: list/download tracks/envelopes CSVs, SAS-token auth only,
+# no azure-identity needed
+azure-storage-blob>=12.19.0

@@ -132,7 +132,7 @@ def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
     import requests
     fname = f"flood_threshold_glofas_v4_rl_{rp}.nc"
     url = f"{THRESHOLD_BASE_URL}/{fname}"
-    logger.info(f"  RP{rp} threshold not cached anywhere -- downloading directly from {url} ...")
+    logger.info(f"  RP{rp} threshold not cached anywhere, downloading directly from {url} ...")
     with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
@@ -298,7 +298,7 @@ def _fetch_uparea_file(threshold_source: str, threshold_local_dir: Union[str, Pa
 
 def _download_uparea_from_ecmwf(dest_path: Path) -> None:
     import requests
-    logger.info(f"  uparea not cached anywhere -- downloading directly from {UPAREA_URL} ...")
+    logger.info(f"  uparea not cached anywhere, downloading directly from {UPAREA_URL} ...")
     with requests.get(UPAREA_URL, stream=True, timeout=600) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
@@ -349,7 +349,7 @@ def _load_rp2_grid(lats: np.ndarray, lons: np.ndarray, threshold_path: Path) -> 
         if thr.shape != (len(lats), len(lons)):
             raise ValueError(
                 f"RP2 threshold grid shape {thr.shape} does not match forecast grid "
-                f"({len(lats)}, {len(lons)}) -- check for a resolution/version mismatch"
+                f"({len(lats)}, {len(lons)}). Check for a resolution/version mismatch"
             )
         return np.where(thr > 0, thr, np.nan)
     finally:
@@ -468,7 +468,7 @@ def download_with_fallback(forecast_date: datetime, raw_dir: Path,
             return {"paths": paths, "actual_date": candidate}
 
     logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
-                 f"and {max_lag_days} day(s) prior -- skipping")
+                 f"and {max_lag_days} day(s) prior, skipping")
     return None
 
 
@@ -533,19 +533,19 @@ def submit_glofas_requests(forecast_date: datetime,
             if remotes:
                 logger.error(f"  {len(remotes)} CDS request(s) already submitted for "
                              f"{candidate.strftime('%Y%m%d')} before this failure "
-                             f"({list(request_ids.values())}) -- cancelling to avoid leaking "
+                             f"({list(request_ids.values())}), cancelling to avoid leaking "
                              f"running jobs")
                 for product_type, remote in remotes.items():
                     try:
                         remote.delete()
                     except Exception as cancel_err:
                         logger.error(f"  Failed to cancel orphaned {product_type} request "
-                                     f"{remote.request_id}: {cancel_err} -- it will keep running "
+                                     f"{remote.request_id}: {cancel_err}. It will keep running "
                                      f"server-side, unreferenced, until it expires on its own")
             continue
 
     logger.error(f"  GloFAS unavailable for {forecast_date.strftime('%Y-%m-%d')} "
-                 f"and {max_lag_days} day(s) prior -- skipping submit")
+                 f"and {max_lag_days} day(s) prior, skipping submit")
     return None
 
 
@@ -567,7 +567,7 @@ def resume_glofas_download(requests: Dict[str, str], actual_date: datetime,
             raise RuntimeError(
                 f"resume_glofas_download() requires cdsapi.Client(...) to resolve to a "
                 f"LegacyClient (needs a token-format CDSAPI_KEY, not the legacy "
-                f"'UID:APIKEY' format) -- got {type(client).__name__} instead, which has "
+                f"'UID:APIKEY' format), got {type(client).__name__} instead, which has "
                 f"no .client attribute for get_remote(). Fix CDSAPI_KEY's format; this is "
                 f"a configuration problem, not a transient CDS unavailability."
             )
@@ -656,7 +656,7 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     zip_path = output_dir / date_str / f"river_{date_str}.zarr.zip"
 
     if zip_path.exists():
-        logger.info(f"  {zip_path.name} already exists -- skipping build")
+        logger.info(f"  {zip_path.name} already exists, skipping build")
         return zip_path
 
     logger.info(f"  Building Zarr for GloFAS discharge ({len(LEADTIME_HOURS)} steps x 51 members) ...")
@@ -777,15 +777,15 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
                     "Zarr index i -> ECMWF member member_numbers[i] (1-50=ENS pf, 51=control). "
                     "Matches TC_TRACKS.ENSEMBLE_MEMBER and wind/met pipeline member numbering. "
                     f"Steps: {LEADTIME_HOURS} hours (daily resolution). "
-                    f"Clip: {LAT_MIN}S-{LAT_MAX}N. Values are NOT accumulated (unlike tp/ro) -- "
+                    f"Clip: {LAT_MIN}S-{LAT_MAX}N. Values are NOT accumulated (unlike tp/ro), "
                     "each step is discharge in the preceding 24h, read directly, no differencing needed. "
-                    "SPARSE FORMAT: 'data' is (member, step, n_cells), NOT a dense lat/lon grid -- "
+                    "SPARSE FORMAT: 'data' is (member, step, n_cells), NOT a dense lat/lon grid, "
                     "only cells where >=1 member on >=1 day exceeded the RP2yr threshold are "
                     "included (see n_cells_kept/n_cells_total/filter_threshold attrs). Use "
                     "cell_lat/cell_lon (parallel arrays, same n_cells length) to locate each "
-                    "stored cell -- do not assume a rectangular lat/lon index. cell_uparea_km2 "
+                    "stored cell, do not assume a rectangular lat/lon index. cell_uparea_km2 "
                     "(same length, if present) is GloFAS's own official upstream drainage area "
-                    "per cell, a non-destructive tag not a filter -- NaN where lookup failed."
+                    "per cell, a non-destructive tag not a filter, NaN where lookup failed."
                 ),
             })
         except BaseException:
@@ -857,7 +857,11 @@ def upload_to_blob(zip_path: Path, account_url: str, sas_token: str,
         service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
         blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
         with open(zip_path, 'rb') as f:
-            blob_client.upload_blob(f, overwrite=True)
+            # max_concurrency enables the Azure SDK's chunked parallel upload
+            # path; the default (1) uploads large files over a single
+            # connection, which runs roughly 10-30x slower than Snowflake's own
+            # multi-threaded stage PUT for files of this size (~200MB-1.2GB).
+            blob_client.upload_blob(f, overwrite=True, max_concurrency=4)
         logger.info(f'  Uploaded {zip_path.name} -> blob:{container}/{blob_path}')
         return True
     except Exception as e:
@@ -963,7 +967,7 @@ def download_glofas_forecast(
 
     if verbose:
         logger.info('=' * 70)
-        logger.info(f'GloFAS v4.0 -- riverine discharge  {forecast_date.strftime("%Y-%m-%d")}')
+        logger.info(f'GloFAS v4.0, riverine discharge  {forecast_date.strftime("%Y-%m-%d")}')
         logger.info(f'  Steps: {len(LEADTIME_HOURS)} (24-168h daily)  |  Members: 51 (50 pf + 1 control)')
         logger.info(f'  Spatial: {LAT_MIN} deg - {LAT_MAX} deg  |  Cadence: once/calendar day')
         logger.info('=' * 70)
@@ -1007,18 +1011,18 @@ def download_glofas_forecast(
                 if not ok:
                     return {'success': False, 'zip_path': candidate_path, 'stage_path': None,
                              'forecast_date': candidate, 'param': 'dis24', 'cached': False}
-            logger.info(f'  {candidate_stage_path} -- day-level cache hit (local file, verified staged)')
+            logger.info(f'  {candidate_stage_path}, day-level cache hit (local file, verified staged)')
             return {'success': True, 'zip_path': candidate_path, 'stage_path': candidate_stage_path,
                      'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
-        logger.info(f'  {candidate_path.name} already exists locally -- skipping (day-level cache hit)')
+        logger.info(f'  {candidate_path.name} already exists locally, skipping (day-level cache hit)')
         return {'success': True, 'zip_path': candidate_path, 'stage_path': None,
                  'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
     if remote_ready:
         candidate_stage_path = f'glofas/{date_str}/river_{date_str}.zarr.zip'
         if _remote_exists(candidate_stage_path):
-            logger.info(f'  {candidate_stage_path} already staged -- skipping (day-level cache hit)')
+            logger.info(f'  {candidate_stage_path} already staged, skipping (day-level cache hit)')
             return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
                      'forecast_date': forecast_date, 'param': 'dis24', 'cached': True}
 
@@ -1040,7 +1044,7 @@ def download_glofas_forecast(
             # retried as an ordinary transient resume failure below.
             logger.error(f"  Resuming pre-submitted CDS requests for "
                          f"{actual_date.strftime('%Y-%m-%d')} hit a configuration problem, not a "
-                         f"transient failure: {e} -- falling back to a fresh submit-and-block "
+                         f"transient failure: {e}. Falling back to a fresh submit-and-block "
                          f"for this run, but the underlying CDSAPI_KEY format issue should be "
                          f"fixed so future GLOFAS_MODE=submit/process runs work as intended")
             paths = None
@@ -1050,7 +1054,7 @@ def download_glofas_forecast(
             # to a fresh submit-and-block, same resilience the original single-step
             # flow always had for an equivalent transient failure.
             logger.warning(f"  Resuming pre-submitted CDS requests for "
-                            f"{actual_date.strftime('%Y-%m-%d')} failed -- falling back to a "
+                            f"{actual_date.strftime('%Y-%m-%d')} failed, falling back to a "
                             f"fresh submit-and-block")
             result = download_with_fallback(forecast_date, raw_dir)
             if result is None:
@@ -1132,7 +1136,7 @@ def download_glofas_forecast(
             destination = f'@{snowflake_stage_name}/{stage_path}'
         else:
             destination = str(zip_path)
-        logger.info(f'  Done -- {destination}')
+        logger.info(f'  Done, {destination}')
 
     return {
         'success': True,

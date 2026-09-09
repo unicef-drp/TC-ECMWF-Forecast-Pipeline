@@ -67,10 +67,14 @@ jobs:
 
       - name: Run TC Forecast Pipeline
         env:
-          # Snowflake credentials from GitHub Secrets. DATA_PIPELINE_DB=BLOB below no
-          # longer requires these (validate() needs zero Snowflake creds in that mode),
-          # kept present so a workflow_dispatch override back to SNOWFLAKE still works
-          # without a separate secrets change.
+          # Snowflake credentials from GitHub Secrets. DATA_PIPELINE_DB=BLOB below still
+          # doesn't require these for validate() to pass (BLOB mode needs zero Snowflake
+          # creds to run at all), but step7_load()'s BLOB branch does use them, best-effort,
+          # for two real writes if they're present: the MET_FORECASTS pointer row, and
+          # (see github_actions/main.py) syncing this run's just-uploaded tracks/envelopes
+          # CSVs into TC_TRACKS/TC_ENVELOPES_*/TC_GUST_ENVELOPES_* immediately after the
+          # Blob upload succeeds. Also kept present so a workflow_dispatch override back to
+          # SNOWFLAKE still works without a separate secrets change.
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
