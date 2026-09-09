@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 """
-Blob -> Snowflake table loader (standalone, run separately from the per-cycle pipeline).
+Blob -> Snowflake table loader.
 
 The per-cycle pipeline (main.py / glofas_pipeline.py, DATA_PIPELINE_DB=BLOB) writes tracks/
 envelope CSVs and the raw discharge/extent Zarr/Parquet files to Blob, but deliberately opens
-no Snowflake connection at all in that mode -- that's what makes BLOB mode genuinely
-independent of Snowflake for the write side. TC_TRACKS/TC_ENVELOPES_COMBINED/RIVER_FORECASTS
-themselves are still real Snowflake tables, though, and nothing currently loads Blob-resident
-data into them. This script is that separate, later step: list what's in Blob, download each
-file to a temp local path, and call the SAME load_csv_to_snowflake()/
+no Snowflake connection at all in that mode for the pipeline's own data writes. That's what
+makes BLOB mode genuinely independent of Snowflake for the write side. TC_TRACKS/
+TC_ENVELOPES_COMBINED/RIVER_FORECASTS themselves are still real Snowflake tables, though, and
+this script is what loads Blob-resident data into them: list what's in Blob, download each file
+to a temp local path, and call the SAME load_csv_to_snowflake()/
 load_riverine_metadata_to_snowflake() functions the per-cycle pipeline already uses in
 SNOWFLAKE mode, unchanged.
+
+load_tracks_envelopes_from_blob() (tracks/envelopes only, not RIVER_FORECASTS) is called two
+ways, an immediate signal plus a periodic catch-up:
+  - Directly, in-process, from main.py's own step7_load() BLOB branch, immediately after that
+    same run's Blob upload succeeds, with the exact blob_paths of the files just uploaded,
+    the tightest possible coupling, so a new cycle's Snowflake copy exists the moment the cycle
+    itself lands in Blob.
+  - Via this module's CLI (below), on its own schedule (`.github/workflows/
+    sync-tracks-to-snowflake.yml`), with no blob_paths filter, scoped instead to files modified
+    within a recent time window (see --since-hours below), the safety net for a cycle whose
+    in-process sync above was skipped (no Snowflake creds available to that run) or failed
+    mid-way through an otherwise-successful pipeline run.
 
 Two real Snowflake table families, each with a different metadata shape:
   - TC_TRACKS / TC_ENVELOPES_COMBINED / TC_ENVELOPES_INDIVIDUAL / TC_GUST_ENVELOPES_COMBINED /
@@ -25,12 +37,15 @@ Two real Snowflake table families, each with a different metadata shape:
 
 Dry-run by default: lists exactly what would be loaded and does not open a Snowflake
 connection or write anything, unless --execute is passed explicitly. This is a deliberate
-safety structure, not just a documented convention -- running this script with no flags is
+safety structure, not just a documented convention. Running this script with no flags is
 always safe to do against real production Blob data.
 
 Usage:
     python github_actions/blob_to_snowflake_loader.py --tracks-envelopes           # dry run
     python github_actions/blob_to_snowflake_loader.py --tracks-envelopes --execute # real load
+    # Periodic safety net (sync-tracks-to-snowflake.yml): bounded to recent files only,
+    # so a frequent scheduled run doesn't re-list/re-download/re-MERGE the whole container.
+    python github_actions/blob_to_snowflake_loader.py --tracks-envelopes --since-hours 3 --execute
     python github_actions/blob_to_snowflake_loader.py --river-forecasts --date 2026-09-02
     python github_actions/blob_to_snowflake_loader.py --river-forecasts --date 2026-09-02 --execute
 """
@@ -41,6 +56,7 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -66,10 +82,18 @@ _EXTENT_RP_LEVELS = ["2.0", "5.0", "10.0", "20.0", "50.0", "100.0"]
 _IS_STANDIN = {"2.0": True, "5.0": True, "10.0": False, "20.0": False, "50.0": False, "100.0": False}
 
 
-def _list_blob_files(prefix: str, account_url: str, sas_token: str, container: str) -> List[str]:
+def _list_blob_files(prefix: str, account_url: str, sas_token: str, container: str,
+                      modified_after: Optional[datetime] = None) -> List[str]:
+    """Lists blob names under prefix. A single list_blobs() call already returns each blob's
+    last_modified regardless of modified_after, so filtering by it costs nothing extra over
+    the network, it only trims what gets returned (and therefore what a caller downloads/
+    loads next), not the listing itself."""
     from azure.storage.blob import BlobServiceClient
     client = BlobServiceClient(account_url=account_url, credential=sas_token)
-    return [b.name for b in client.get_container_client(container).list_blobs(name_starts_with=prefix)]
+    blobs = client.get_container_client(container).list_blobs(name_starts_with=prefix)
+    if modified_after is not None:
+        return [b.name for b in blobs if b.last_modified is not None and b.last_modified >= modified_after]
+    return [b.name for b in blobs]
 
 
 def _download_blob(blob_path: str, account_url: str, sas_token: str, container: str, local_dir: Path) -> Path:
@@ -95,20 +119,29 @@ def _table_type_for(blob_path: str) -> Optional[str]:
 
 def load_tracks_envelopes_from_blob(account_url: str, sas_token: str, container: str,
                                      conn=None, blob_paths: Optional[List[str]] = None,
-                                     execute: bool = False) -> dict:
+                                     execute: bool = False,
+                                     since_hours: Optional[float] = None) -> dict:
     """
-    Loads every tracks/ and envelopes/ CSV currently in Blob into the real Snowflake tables,
-    via the existing, unchanged load_csv_to_snowflake().
+    Loads tracks/ and envelopes/ CSVs from Blob into the real Snowflake tables, via the
+    existing, unchanged load_csv_to_snowflake().
 
     Args:
         blob_paths: explicit list of blob paths to load, e.g. from one specific forecast
-            cycle. If None, loads everything currently under tracks/ and envelopes/ -- the
-            caller is responsible for knowing whether that set has already been loaded before
-            (this function has no its-own-yet notion of "already loaded", it will happily
-            re-MERGE the same rows again, which load_csv_to_snowflake()'s own MERGE semantics
-            make idempotent, but at real Snowflake compute cost for files already loaded).
+            cycle. If None, loads everything currently under tracks/ and envelopes/ that
+            passes the since_hours filter below. The caller is responsible for knowing
+            whether that set has already been loaded before (this function has no its-own
+            notion of "already loaded", it will happily re-MERGE the same rows again, which
+            load_csv_to_snowflake()'s own MERGE semantics make idempotent, but at real
+            Snowflake compute cost for files already loaded).
         execute: real Snowflake writes only happen when this is True. False (default) only
             lists what would be loaded and returns without downloading or connecting.
+        since_hours: only consulted when blob_paths is None. Restricts the listing to blobs
+            whose last_modified is within the last since_hours hours, so a frequent periodic
+            caller (see sync-tracks-to-snowflake.yml) re-checks only recently-landed cycles
+            instead of every file ever uploaded under tracks/envelopes. The container has
+            no lifecycle deletion, so an unbounded listing only grows over a season and would
+            otherwise re-MERGE the entire history on every run. None (default) means no time
+            filter, appropriate for a one-off manual catch-up but not for a scheduled job.
 
     Returns:
         {'planned': [...], 'loaded': [...], 'skipped': [...], 'errors': [...]}
@@ -116,8 +149,10 @@ def load_tracks_envelopes_from_blob(account_url: str, sas_token: str, container:
     from snowflake_loader import load_csv_to_snowflake
 
     if blob_paths is None:
-        blob_paths = (_list_blob_files(TRACKS_PREFIX, account_url, sas_token, container)
-                      + _list_blob_files(ENVELOPES_PREFIX, account_url, sas_token, container))
+        modified_after = (datetime.now(timezone.utc) - timedelta(hours=since_hours)
+                           if since_hours is not None else None)
+        blob_paths = (_list_blob_files(TRACKS_PREFIX, account_url, sas_token, container, modified_after)
+                      + _list_blob_files(ENVELOPES_PREFIX, account_url, sas_token, container, modified_after))
 
     plan = []
     for blob_path in blob_paths:
@@ -130,7 +165,7 @@ def load_tracks_envelopes_from_blob(account_url: str, sas_token: str, container:
     result = {'planned': plan, 'loaded': [], 'skipped': [], 'errors': []}
 
     if not execute:
-        logger.info(f"DRY RUN: would load {len(plan)} file(s) into Snowflake -- pass execute=True to run for real")
+        logger.info(f"DRY RUN: would load {len(plan)} file(s) into Snowflake, pass execute=True to run for real")
         for blob_path, table_type in plan:
             logger.info(f"  {blob_path} -> {table_type}")
         return result
@@ -199,7 +234,7 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
     result = {'planned': metadata_rows, 'loaded_rows': 0, 'error': None}
 
     if not execute:
-        logger.info(f"DRY RUN: would load {len(metadata_rows)} RIVER_FORECASTS row(s) -- "
+        logger.info(f"DRY RUN: would load {len(metadata_rows)} RIVER_FORECASTS row(s), "
                     f"pass execute=True to run for real")
         for row in metadata_rows:
             logger.info(f"  {row}")
@@ -227,6 +262,10 @@ def main():
     parser.add_argument('--tracks-envelopes', action='store_true', help='Load tracks/envelopes CSVs from Blob')
     parser.add_argument('--river-forecasts', action='store_true', help='Load RIVER_FORECASTS metadata from Blob')
     parser.add_argument('--date', help='YYYY-MM-DD, required for --river-forecasts')
+    parser.add_argument('--since-hours', type=float, default=None,
+                         help='With --tracks-envelopes, only consider blobs modified within the last '
+                              'N hours (bounds cost for a frequent periodic run). Omit for a one-off '
+                              'catch-up over everything currently in Blob.')
     parser.add_argument('--execute', action='store_true',
                          help='Actually write to Snowflake. Without this, only lists what would happen.')
     args = parser.parse_args()
@@ -248,7 +287,8 @@ def main():
     try:
         if args.tracks_envelopes:
             result = load_tracks_envelopes_from_blob(account_url, sas_token, container,
-                                                       conn=conn, execute=args.execute)
+                                                       conn=conn, execute=args.execute,
+                                                       since_hours=args.since_hours)
             if result['errors']:
                 logger.error(f"{len(result['errors'])} file(s) failed to load")
                 sys.exit(1)

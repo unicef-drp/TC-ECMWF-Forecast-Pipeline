@@ -195,12 +195,18 @@ Uses a **staging table → MERGE** pattern:
 
 **`DATA_PIPELINE_DB=BLOB`** takes a different path entirely: track/envelope CSVs and met Zarr files are
 uploaded straight to Azure Blob Storage instead of Snowflake, under `tracks/`, `envelopes/`, and `met/`
-at the container root. `TC_TRACKS`/`TC_ENVELOPES_COMBINED`/`TC_GUST_ENVELOPES_*` are **not** written
-directly in this mode; a separate, already-built manual loader, `github_actions/blob_to_snowflake_loader.py`,
-reads these same Blob prefixes back and MERGEs them in, but is not run automatically by any real
-scheduled workflow today. The `MET_FORECASTS` pointer row is written best-effort: if real Snowflake
-credentials also happen to be configured (a legitimate mixed-mode deployment) it writes for real,
-otherwise it's skipped with a logged warning rather than failing the run.
+at the container root. `TC_TRACKS`/`TC_ENVELOPES_COMBINED`/`TC_ENVELOPES_INDIVIDUAL`/
+`TC_GUST_ENVELOPES_COMBINED`/`TC_GUST_ENVELOPES_INDIVIDUAL` are not written directly by the Blob upload
+itself, but `step7_load()` (`github_actions/main.py`) immediately syncs them afterward, in the same
+run, via `load_tracks_envelopes_from_blob()` (`github_actions/blob_to_snowflake_loader.py`), which
+reads back the exact files just uploaded and MERGEs them in through the same `load_csv_to_snowflake()`
+the SNOWFLAKE branch uses. This needs real Snowflake credentials to be present alongside the Blob ones
+(a legitimate mixed-mode deployment, the same requirement `MET_FORECASTS` below already has); without
+them it's skipped with a logged warning rather than failing the run, relying instead on the periodic
+`.github/workflows/sync-tracks-to-snowflake.yml` safety net (or a manual
+`blob_to_snowflake_loader.py --tracks-envelopes --execute` run) to catch up later. The `MET_FORECASTS`
+pointer row uses the identical best-effort pattern: if real Snowflake credentials also happen to be
+configured it writes for real, otherwise it's skipped with a logged warning rather than failing the run.
 
 ## Running the Pipeline
 
@@ -234,6 +240,19 @@ inputs:
 **Setup:** Configure GitHub Secrets with the six `SNOWFLAKE_*` variables plus `SNOWFLAKE_STAGE_NAME` for
 `DATA_PIPELINE_DB=SNOWFLAKE`, or `ACCOUNT_URL`/`SAS_TOKEN`/`CONTAINER_NAME` for `DATA_PIPELINE_DB=BLOB`
 (see `github_actions/README.md`).
+
+#### Tracks/Envelopes Snowflake sync safety net (`sync-tracks-to-snowflake.yml`)
+
+`DATA_PIPELINE_DB=BLOB` runs already sync `TC_TRACKS`/`TC_ENVELOPES_*` into Snowflake in-process (see
+"Snowflake Loading" above), but that in-process sync is skipped or lost if that run has no Snowflake
+credentials or fails partway through. `.github/workflows/sync-tracks-to-snowflake.yml` is the periodic
+catch-up: runs `blob_to_snowflake_loader.py --tracks-envelopes --since-hours <N> --execute` on its own
+schedule, bounded to blobs modified in the last `N` hours (not every file ever uploaded, to keep both
+the re-download and re-MERGE cost proportional to one or two recent cycles instead of a whole season's
+worth of history) and safe to overlap with the in-process sync or a prior run of itself: every load
+goes through `load_csv_to_snowflake()`'s own MERGE semantics, which are idempotent for rows already
+loaded. Needs the same `ACCOUNT_URL`/`SAS_TOKEN`/`CONTAINER_NAME` and `SNOWFLAKE_*` secrets as the main
+pipeline workflow.
 
 ### Containerized (SPCS)
 
