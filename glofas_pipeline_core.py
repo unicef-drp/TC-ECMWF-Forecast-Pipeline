@@ -27,7 +27,7 @@ from glofas_downloader import (
     blob_file_exists,
     EXTENT_RP_LEVELS,
 )
-from glofas_extent_masking import run_glofas_extent_masking
+from glofas_extent_masking import run_glofas_extent_masking, EXTENT_STAGE_PREFIX, IS_STANDIN
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +325,36 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
     return result
 
 
+def _already_computed_extent_tiers(config: BaseGlofasConfig, snowflake_conn, date_str: str) -> Optional[List[Dict]]:
+    """
+    Checks whether every EXTENT_RP_LEVELS tier's parquet file already exists on the remote
+    store (Blob or Snowflake stage, matching config.data_pipeline_db) for this date. Returns
+    lightweight {rp, is_standin, stage_path} dicts ready for metadata registration if every
+    tier is present, or None if any tier is missing (real masking still needs to run) or the
+    check itself can't be done (fails open toward running real masking, never toward silently
+    skipping it).
+    """
+    try:
+        found = []
+        for rp in EXTENT_RP_LEVELS:
+            rp_int = int(float(rp))
+            stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/river_extent_rp{rp_int}_bymember_{date_str}.parquet"
+            if config.data_pipeline_db == 'BLOB':
+                exists = blob_file_exists(config.blob_account_url, config.blob_sas_token,
+                                           config.blob_container, stage_path)
+            else:
+                if not snowflake_conn or not config.snowflake_stage_name:
+                    return None
+                exists = stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn)
+            if not exists:
+                return None
+            found.append({"rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path})
+        return found
+    except Exception as e:
+        logger.warning(f"Could not check for already-computed extent tiers, running real masking instead: {e}")
+        return None
+
+
 def run_glofas_extent_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
                                 discharge_result: Optional[Dict] = None) -> List[Dict]:
     """
@@ -335,6 +365,25 @@ def run_glofas_extent_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
     if not config.glofas_extent_enabled:
         logger.info("GLOFAS_EXTENT_ENABLED=false -- skipping extent-masking step")
         return []
+
+    # Same-day idempotency: extent masking is real per-member/per-tier raster work (51
+    # members x 6 RP tiers), meant to run once per real GloFAS publication, not once per
+    # poll. download_glofas_forecast() now materializes a real local zip_path even on a
+    # day-level cache hit (see its own comment for why), so "zip_path is None" can no longer
+    # be relied on as the "already done today" signal the way it used to be, without this
+    # check, every cache-hit poll (3 of the pipeline's 4 daily runs) would recompute and
+    # re-upload all 6 tiers from scratch for no reason. Also self-heals a prior run whose
+    # real masking succeeded (files really on Blob/stage) but whose metadata registration
+    # failed for an unrelated reason (e.g. a transient Snowflake outage): reusing the
+    # existing stage_path still lets the caller register it, without recomputing anything.
+    forecast_date = (discharge_result or {}).get('forecast_date')
+    if forecast_date is not None:
+        already = _already_computed_extent_tiers(config, snowflake_conn, forecast_date.strftime("%Y%m%d"))
+        if already is not None:
+            logger.info(f"All {len(EXTENT_RP_LEVELS)} extent tiers already computed for "
+                        f"{forecast_date.strftime('%Y-%m-%d')} -- reusing existing output instead "
+                        f"of recomputing")
+            return already
 
     if discharge_result is None or not discharge_result.get('zip_path'):
         logger.warning("No local Zarr path from the discharge step (e.g. a stage-only day-cache "
