@@ -1003,6 +1003,24 @@ def download_glofas_forecast(
             return upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, path)
         return upload_to_snowflake_stage(local_path, snowflake_stage_name, path, snowflake_conn)
 
+    def _remote_download(path: str, local_path: Path) -> bool:
+        """Materializes an already-staged remote Zarr to `local_path`. Needed so a
+        day-level cache hit still leaves run_glofas_extent_pipeline() a real local
+        zip_path to open (see the `if remote_ready:` branch below's own comment)."""
+        if data_pipeline_db == 'BLOB':
+            return download_from_blob(blob_account_url, blob_sas_token, blob_container, path, local_path)
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            cur = snowflake_conn.cursor()
+            try:
+                cur.execute(f"GET @{snowflake_stage_name}/{path} file://{local_path.parent}")
+            finally:
+                cur.close()
+            return local_path.exists()
+        except Exception as e:
+            logger.info(f"  Stage GET for {path} failed: {e}")
+            return False
+
     if candidate_path.exists():
         if remote_ready:
             candidate_stage_path = f'glofas/{candidate_str}/river_{candidate_str}.zarr.zip'
@@ -1022,7 +1040,19 @@ def download_glofas_forecast(
     if remote_ready:
         candidate_stage_path = f'glofas/{date_str}/river_{date_str}.zarr.zip'
         if _remote_exists(candidate_stage_path):
-            logger.info(f'  {candidate_stage_path} already staged, skipping (day-level cache hit)')
+            # Materialize a local copy even on a cache hit: extent masking
+            # (run_glofas_extent_pipeline) needs a real local zip_path to open, and
+            # previously got None here, silently skipping extent masking entirely on
+            # any run that finds the raw discharge already staged (e.g. a manual
+            # re-dispatch, or a retry after the original run's own extent step
+            # failed downstream of a successful discharge upload/stage-write).
+            local_download_path = output_path / date_str / f'river_{date_str}.zarr.zip'
+            if _remote_download(candidate_stage_path, local_download_path):
+                logger.info(f'  {candidate_stage_path} already staged, downloaded locally for extent masking (day-level cache hit)')
+                return {'success': True, 'zip_path': local_download_path, 'stage_path': candidate_stage_path,
+                         'forecast_date': forecast_date, 'param': 'dis24', 'cached': True}
+            logger.warning(f'  {candidate_stage_path} already staged, but could not download it locally; '
+                            f'extent masking will be skipped this run')
             return {'success': True, 'zip_path': None, 'stage_path': candidate_stage_path,
                      'forecast_date': forecast_date, 'param': 'dis24', 'cached': True}
 
