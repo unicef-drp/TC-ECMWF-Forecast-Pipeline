@@ -241,6 +241,11 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                     os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
                     conn = get_snowflake_connection()
                     rows = load_precip_metadata_to_snowflake(precip_metadata, conn)
+                    if rows == 0:
+                        raise RuntimeError(
+                            f"MET_FORECASTS load wrote 0 of {len(precip_metadata)} pointer row(s) "
+                            f"(the loader swallowed a Snowflake error, see log above)"
+                        )
                     stats.rows_loaded += rows
                     logger.info(f"Loaded {rows} metadata row(s) into MET_FORECASTS (BLOB mode)")
                 except Exception as e:
