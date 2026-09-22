@@ -292,6 +292,10 @@ def main():
             write_conn = _open_snowflake_conn(config)
             write_conn_is_ad_hoc = True
 
+        # Collected (not raised immediately) so the extent step below still runs and writes its
+        # Blob output even when the Snowflake pointer load failed; raised after the finally.
+        # Mirrors github_actions/glofas_pipeline.py's identical fix.
+        metadata_load_errors = []
         try:
             if upload_to_stage and write_conn:
                 if result.get('stage_path'):
@@ -301,6 +305,11 @@ def main():
                         'stage_path': result['stage_path'],
                     }]
                     rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    if rows == 0:
+                        metadata_load_errors.append(
+                            "RIVER_FORECASTS load wrote 0 metadata row(s) (the loader swallowed a "
+                            "Snowflake error, see log above); data is in Blob but not registered"
+                        )
                     logger.info(f"Loaded {rows} metadata row(s) into RIVER_FORECASTS")
 
                     cursor = write_conn.cursor()
@@ -333,10 +342,18 @@ def main():
                 } for r in extent_results if r.get('stage_path')]
                 if metadata_rows:
                     rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
+                    if rows == 0:
+                        metadata_load_errors.append(
+                            f"RIVER_FORECASTS extent load wrote 0 of {len(metadata_rows)} metadata row(s) "
+                            f"(the loader swallowed a Snowflake error, see log above)"
+                        )
                     logger.info(f"Loaded {rows} extent metadata row(s) into RIVER_FORECASTS")
         finally:
             if write_conn_is_ad_hoc:
                 write_conn.close()
+
+        if metadata_load_errors:
+            raise RuntimeError("; ".join(metadata_load_errors))
 
         logger.info("GloFAS pipeline completed successfully!")
         sys.exit(0)
