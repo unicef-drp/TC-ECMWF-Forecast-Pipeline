@@ -32,7 +32,13 @@ from ecmwf_wind_data_extractor import (
     merge_contour_dicts,
     polygon_to_wkt,
 )
-from ecmwf_tc_wind_combination import find_tc_data_files, load_tc_track_data, _save_wind_rasters_for_lead_time
+from ecmwf_tc_wind_combination import (
+    find_tc_data_files,
+    load_tc_track_data,
+    _save_wind_rasters_for_lead_time,
+    _resolve_run_forecast_time,
+    _synthesize_rows_by_lead,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -111,6 +117,37 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]
         return regions
     finally:
         ds.close()
+
+
+_GUST_FILENAME_LEAD_TIME_RE = re.compile(r"_f(\d{3})h_")
+
+
+def _gust_lead_times_for_run(run_forecast_time: pd.Timestamp, gust_files: List[str]) -> List[int]:
+    """
+    Return sorted, unique lead times of real gust GRIB files on disk for this
+    storm's own run (matched by date + run hour, same convention as
+    ecmwf_wind_data_downloader.py's `gust_ens_{YYYY-MM-DD}_r{HH}_f{lead}h_{pf|cf}.grib2`
+    filenames).
+
+    Same pattern as ecmwf_tc_wind_combination.py's `_wind_lead_times_for_run()`:
+    deriving lead times to process from the track CSV's own rows, which only
+    exist at ECMWF's TC track BUFR product's native 6-hourly resolution,
+    would silently drop any gust file at a non-6h-multiple lead time.
+    Per-track-row data is used only for output labeling here too
+    (ensemble_member/valid_time/forecast_time), never for which lead times get
+    processed.
+    """
+    date_str = run_forecast_time.strftime('%Y-%m-%d')
+    run_hour = f"{run_forecast_time.hour:02d}"
+    expected_run_tag = f"_r{run_hour}_"
+    lead_times = set()
+    for f in gust_files:
+        name = Path(f).name
+        if f"gust_ens_{date_str}" in name and expected_run_tag in name:
+            match = _GUST_FILENAME_LEAD_TIME_RE.search(name)
+            if match:
+                lead_times.add(int(match.group(1)))
+    return sorted(lead_times)
 
 
 def _match_gust_file(lead_time: int, file_type: str, gust_files: List[str]) -> Optional[str]:
@@ -252,16 +289,6 @@ def process_gust_combination(
         logger.warning(f"No gust PF files found in {gust_data_dir}")
         return {'processed_storms': 0, 'total_envelope_files': 0}
 
-    available_lead_times = []
-    for f in pf_files:
-        m = re.search(r'_f(\d+)h_', f.name)
-        if m:
-            lt = int(m.group(1))
-            if not (_SKIP_STEP_ZERO and lt == 0):
-                available_lead_times.append(lt)
-    available_lead_times = sorted(set(available_lead_times))
-    logger.info(f"Available gust lead times: {available_lead_times}")
-
     # Collect all gust file paths (both pf and cf)
     gust_files = [str(f) for f in gust_data_dir.glob('gust_ens_*.grib2')]
 
@@ -290,13 +317,24 @@ def process_gust_combination(
             bbox = get_bounding_box(track_polygon, buffer=4.0)
 
             has_forecast_time = 'forecast_time' in track_df.columns
-            all_rows = track_df.to_dict('records')
+            run_forecast_time = _resolve_run_forecast_time(track_df, has_forecast_time)
 
-            # Restrict to lead times present in both track data and on disk
-            track_lead_times = {r['lead_time'] for r in all_rows}
-            lead_times_to_process = sorted(
-                lt for lt in available_lead_times if lt in track_lead_times
-            )
+            if run_forecast_time is not None:
+                # Lead times to process are driven by the real gust files on disk
+                # for this storm's own run, not by the track CSV's rows (which are
+                # native ECMWF-BUFR 6-hourly only), see _gust_lead_times_for_run's
+                # own docstring for the full rationale.
+                lead_times_to_process = _gust_lead_times_for_run(run_forecast_time, gust_files)
+                if _SKIP_STEP_ZERO:
+                    lead_times_to_process = [lt for lt in lead_times_to_process if lt != 0]
+            else:
+                # Could not resolve a run time at all (should not happen for real
+                # track data); fall back to the track's own lead times so this
+                # doesn't silently process zero timesteps.
+                lead_times_to_process = sorted(track_df['lead_time'].unique())
+
+            unique_members = sorted(track_df['ensemble_member'].unique())
+            rows_by_lead = _synthesize_rows_by_lead(lead_times_to_process, unique_members, run_forecast_time)
 
             if verbose:
                 logger.info(f"  Processing lead times: {lead_times_to_process}")
@@ -304,7 +342,7 @@ def process_gust_combination(
             storm_records: List[Dict] = []
 
             for lead_time in lead_times_to_process:
-                rows_at_lead = [r for r in all_rows if r.get('lead_time') == lead_time]
+                rows_at_lead = rows_by_lead[lead_time]
                 if not rows_at_lead:
                     continue
 

@@ -91,6 +91,81 @@ def _match_wind_file(
     return None
 
 
+def _resolve_run_forecast_time(filtered_tc_data: pd.DataFrame, has_forecast_time: bool) -> Optional[pd.Timestamp]:
+    """
+    Resolve the single run/forecast-issuance time for a storm's track data.
+
+    Prefers the track data's own 'forecast_time' column (constant across all
+    rows for a given run). Falls back to deriving it from any row's
+    valid_time - lead_time, for older track CSVs that lack an explicit
+    forecast_time column. Returns None only if the track data is empty.
+    """
+    if filtered_tc_data.empty:
+        return None
+    if has_forecast_time:
+        val = filtered_tc_data['forecast_time'].iloc[0]
+        if pd.notna(val):
+            return pd.to_datetime(val)
+    row = filtered_tc_data.iloc[0]
+    try:
+        return pd.to_datetime(row['valid_time']) - pd.Timedelta(hours=int(row['lead_time']))
+    except Exception:
+        return None
+
+
+_WIND_FILENAME_LEAD_TIME_RE = re.compile(r"_f(\d{3})h_")
+
+
+def _wind_lead_times_for_run(run_forecast_time: pd.Timestamp, wind_files: List[Path]) -> List[int]:
+    """
+    Return sorted, unique lead times actually downloaded for this storm's run.
+
+    ECMWF's TC track BUFR product is natively 6-hourly only, but wind GRIB
+    data can be downloaded at a finer cadence. Nothing in wind extraction or
+    contouring needs a track point at the exact same lead time as each wind
+    file, so lead times to process are derived from the wind files actually
+    on disk for this run rather than from track CSV rows.
+    """
+    date_str = run_forecast_time.strftime('%Y-%m-%d')
+    run_hour = f"{run_forecast_time.hour:02d}"
+    expected_run_tag = f"_r{run_hour}_"
+    lead_times = set()
+    for wind_file in wind_files:
+        filename = wind_file.name
+        if f"wind_ens_{date_str}" in filename and expected_run_tag in filename:
+            match = _WIND_FILENAME_LEAD_TIME_RE.search(filename)
+            if match:
+                lead_times.add(int(match.group(1)))
+    return sorted(lead_times)
+
+
+def _synthesize_rows_by_lead(
+    unique_lead_times: List[int],
+    unique_members: List[int],
+    run_forecast_time: Optional[pd.Timestamp],
+) -> Dict[int, List[Dict]]:
+    """
+    Build the {lead_time: [row, ...]} structure the lead-time processing loops
+    expect, one synthetic row per (lead_time, member) pair -- computing
+    valid_time arithmetically (run_forecast_time + lead_time) instead of
+    reading it from a track CSV row, since wind lead times are no longer
+    guaranteed to have a matching track row (see _wind_lead_times_for_run).
+    Only 'ensemble_member', 'forecast_time', and 'valid_time' are read from
+    these rows downstream.
+    """
+    return {
+        lt: [
+            {
+                'ensemble_member': member,
+                'forecast_time': run_forecast_time,
+                'valid_time': (run_forecast_time + pd.Timedelta(hours=lt)) if run_forecast_time is not None else None,
+            }
+            for member in unique_members
+        ]
+        for lt in unique_lead_times
+    }
+
+
 def find_tc_data_files(tc_data_dir: Path) -> List[Dict[str, str]]:
     """
     Find all transformed TC data files and extract storm information.
@@ -642,13 +717,13 @@ def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> 
 
         if verbose:
             logger.info(f"TC data analysis: max forecast hour needed = {max_hour}h")
-            logger.info(f"Recommended wind forecast hours: 0 to {recommended_hour}h (every 6h)")
+            logger.info(f"Recommended wind forecast hours: 0 to {recommended_hour}h")
             if uncapped_hour > 144:
                 logger.warning(
                     f"Track data needs wind coverage out to {uncapped_hour}h, but ECMWF's "
                     f"0.25deg operational ENS wind fields are only published to 144h -- wind "
                     f"envelope coverage for this storm will have NO data for lead times "
-                    f"{150}h through {uncapped_hour}h (in 6h steps). This is a hard upstream "
+                    f"{150}h through {uncapped_hour}h. This is a hard upstream "
                     f"data-availability limit, not a bug; the storm's own track/position "
                     f"forecast is unaffected, only wind-hazard coverage beyond 144h."
                 )
@@ -761,15 +836,16 @@ def process_wind_combination(
             # design instead of re-opening the same file once per member.
             if use_process_pool and len(filtered_tc_data) > 1:
                 has_forecast_time = 'forecast_time' in filtered_tc_data.columns
-                all_rows = filtered_tc_data.to_dict('records')
-                unique_lead_times = sorted({r['lead_time'] for r in all_rows})
-                rows_by_lead = {
-                    lt: [r for r in all_rows if r['lead_time'] == lt]
-                    for lt in unique_lead_times
-                }
+                run_forecast_time = _resolve_run_forecast_time(filtered_tc_data, has_forecast_time)
+                if run_forecast_time is not None:
+                    unique_lead_times = _wind_lead_times_for_run(run_forecast_time, wind_files)
+                else:
+                    unique_lead_times = sorted(filtered_tc_data['lead_time'].unique())
+                rows_by_lead = _synthesize_rows_by_lead(unique_lead_times, unique_members, run_forecast_time)
 
                 logger.info(f"  Processing {len(unique_lead_times)} timestep(s) in parallel "
-                            f"with {max_workers} workers ({len(all_rows)} member-timesteps total)")
+                            f"with {max_workers} workers "
+                            f"({len(unique_lead_times) * len(unique_members)} member-timesteps total)")
 
                 with ProcessPoolExecutor(
                     max_workers=max_workers,
@@ -801,15 +877,19 @@ def process_wind_combination(
                 # and extracting all members avoids N_members redundant GRIB decompression
                 # cycles per timestep (typically a ~25x speedup over the member-first loop).
                 has_forecast_time = 'forecast_time' in filtered_tc_data.columns
-                all_rows = filtered_tc_data.to_dict('records')
-                unique_lead_times = sorted({r['lead_time'] for r in all_rows})
+                run_forecast_time = _resolve_run_forecast_time(filtered_tc_data, has_forecast_time)
+                if run_forecast_time is not None:
+                    unique_lead_times = _wind_lead_times_for_run(run_forecast_time, wind_files)
+                else:
+                    unique_lead_times = sorted(filtered_tc_data['lead_time'].unique())
+                rows_by_lead = _synthesize_rows_by_lead(unique_lead_times, unique_members, run_forecast_time)
 
                 if verbose:
                     logger.info(f"  Processing {len(unique_lead_times)} timestep(s) × "
                                 f"{len(unique_members)} member(s) (one GRIB open per timestep)")
 
                 for lead_time in unique_lead_times:
-                    rows_at_lead = [r for r in all_rows if r['lead_time'] == lead_time]
+                    rows_at_lead = rows_by_lead[lead_time]
                     sample = rows_at_lead[0]
                     valid_time = sample['valid_time']
                     forecast_time = sample.get('forecast_time') if has_forecast_time else None

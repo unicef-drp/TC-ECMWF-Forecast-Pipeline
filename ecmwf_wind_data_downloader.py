@@ -10,7 +10,7 @@ The downloader processes:
 - 10m wind components (u10 and v10): sustained wind, used for TC_ENVELOPES_*
 - 10fg (maximum 10m wind gust): indexed as '10fg' for steps ≤ 90h, '10fg3' for steps > 90h;
   used for TC_GUST_ENVELOPES_*
-- Multiple forecast lead times (every 6 hours up to 144 hours for wind, 6-144 hours for gust)
+- Multiple forecast lead times (every 3 hours up to 144 hours, for both wind and gust)
 - Different forecast run times (00Z, 06Z, 12Z, 18Z)
 
 References:
@@ -29,12 +29,14 @@ from ecmwf.opendata import Client
 # Configuration
 DEFAULT_OUTPUT_DIR = "wind_data"
 
-# ENS perturbed (pf) forecast steps: 0–144h for all run times
+# ENS perturbed (pf) forecast steps: 0-144h for all run times, at ECMWF's
+# published resolution for this range (3-hourly 0-144h on all four run
+# times, for both enfo/pf and oper/fc).
 FORECAST_STEPS = {
-    0:  list(range(0, 145, 6)),
-    6:  list(range(0, 145, 6)),
-    12: list(range(0, 145, 6)),
-    18: list(range(0, 145, 6)),
+    0:  list(range(0, 145, 3)),
+    6:  list(range(0, 145, 3)),
+    12: list(range(0, 145, 3)),
+    18: list(range(0, 145, 3)),
 }
 
 # HRES control (stream=oper, type=fc) max step per run time.
@@ -52,8 +54,8 @@ def get_forecast_steps(run_time: int) -> List[int]:
     Get available forecast steps for a given run time.
 
     Simplified configuration for all run times:
-    - All run times: 0 to 144 hours by 6-hour steps
-    - This provides 25 forecast steps: 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144
+    - All run times: 0 to 144 hours by 3-hour steps
+    - This provides 49 forecast steps: 0, 3, 6, ..., 144
 
     Args:
         run_time (int): Model run time (0, 6, 12, or 18)
