@@ -274,7 +274,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 
 ### "Wind file not found"
 - Ensure wind data download completed successfully for the correct run time
-- Wind data downloads forecast hours 0–144h in 6-hour increments
+- Wind data downloads forecast hours 0–144h in 3-hour increments
 
 ### "SNOWFLAKE_STAGE_NAME is required"
 - Set `SNOWFLAKE_STAGE_NAME` to your Snowflake internal stage name (e.g. `AOTS_ANALYSIS`)

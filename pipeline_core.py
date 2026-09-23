@@ -491,10 +491,10 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
         max_forecast_hour = analyze_required_forecast_hours(
             config.transformed_data_dir, verbose=True
         )
-        required_forecast_hours = list(range(0, max_forecast_hour + 1, 6))
+        required_forecast_hours = list(range(0, max_forecast_hour + 1, 3))
         logger.info(f"TC forecast: {tc_date} {tc_run_time:02d}Z")
         logger.info(
-            f"Wind steps: 0–{max_forecast_hour}h every 6h "
+            f"Wind steps: 0–{max_forecast_hour}h every 3h "
             f"({len(required_forecast_hours)} files)"
         )
 
@@ -542,8 +542,8 @@ def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
             logger.warning("Cannot determine TC run time or date -- skipping gust download")
             return []
         max_forecast_hour = analyze_required_forecast_hours(config.transformed_data_dir, verbose=False)
-        required_forecast_hours = list(range(6, max_forecast_hour + 1, 6))
-        logger.info(f"Gust steps: 6–{max_forecast_hour}h every 6h ({len(required_forecast_hours)} files)")
+        required_forecast_hours = list(range(3, max_forecast_hour + 1, 3))
+        logger.info(f"Gust steps: 3–{max_forecast_hour}h every 3h ({len(required_forecast_hours)} files)")
         result = download_ensemble_gust(
             date=tc_date, run_time=tc_run_time,
             forecast_hours=required_forecast_hours,

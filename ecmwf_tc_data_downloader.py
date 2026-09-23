@@ -31,13 +31,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = "tc_data"
 
-# Maximum TC forecast step by run time (hours)
-_MAX_STEP = {0: 240, 6: 144, 12: 240, 18: 144}
+# Candidate TC forecast steps by run time (hours), tried in order against the primary
+# source before falling back to DISS. 
+_STEP_CANDIDATES = {0: [360, 240], 6: [144], 12: [360, 240], 18: [144]}
 
 
-def _step_for_run_time(run_time: int) -> int:
-    """Return the maximum TC track forecast step for a given run time."""
-    return _MAX_STEP.get(run_time, 240)
+def _steps_for_run_time(run_time: int) -> List[int]:
+    """Return the ordered list of TC track forecast steps to try for a given run time."""
+    return _STEP_CANDIDATES.get(run_time, [240])
 
 
 def _output_filename(forecast_date: datetime, run_time: int) -> str:
@@ -167,7 +168,6 @@ def download_tc_data(
     files: List[Path] = []
 
     for forecast_date, rt in targets:
-        step = _step_for_run_time(rt)
         filename = _output_filename(forecast_date, rt)
         filepath = os.path.join(output_dir, filename)
 
@@ -177,29 +177,31 @@ def download_tc_data(
             files.append(Path(filepath))
             continue
 
-        logger.info(f"Downloading TC tracks: {forecast_date.strftime('%Y-%m-%d')} {rt:02d}Z (step={step}h)")
         success = False
-        try:
-            client.retrieve(
-                date=forecast_date,
-                time=rt,
-                stream="enfo",
-                type="tf",
-                step=step,
-                target=filepath,
-            )
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                size_kb = os.path.getsize(filepath) / 1024
-                logger.info(f"Downloaded: {filename} ({size_kb:.0f} KB)")
-                success = True
-            else:
-                logger.warning(f"data.ecmwf.int returned empty file for {filename}")
+        for step in _steps_for_run_time(rt):
+            logger.info(f"Downloading TC tracks: {forecast_date.strftime('%Y-%m-%d')} {rt:02d}Z (step={step}h)")
+            try:
+                client.retrieve(
+                    date=forecast_date,
+                    time=rt,
+                    stream="enfo",
+                    type="tf",
+                    step=step,
+                    target=filepath,
+                )
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    size_kb = os.path.getsize(filepath) / 1024
+                    logger.info(f"Downloaded: {filename} ({size_kb:.0f} KB, step={step}h)")
+                    success = True
+                    break
+                else:
+                    logger.warning(f"data.ecmwf.int returned empty file for {filename} at step={step}h")
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+            except Exception as e:
+                logger.warning(f"data.ecmwf.int failed for {filename} at step={step}h: {e}")
                 if os.path.exists(filepath):
                     os.remove(filepath)
-        except Exception as e:
-            logger.warning(f"data.ecmwf.int failed for {filename}: {e}")
-            if os.path.exists(filepath):
-                os.remove(filepath)
 
         if not success:
             logger.info(f"Falling back to DISS (essential.ecmwf.int) for {filename}")
