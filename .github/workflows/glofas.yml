@@ -1,7 +1,7 @@
 name: GloFAS Riverine Discharge Pipeline
 
 on:
-  # Two triggers, splitting the CDS interaction to avoid paying for idle compute
+  # Three triggers, splitting the CDS interaction to avoid paying for idle compute
   # while waiting on the CDS queue:
   #  - submit  (15:00 UTC): fires the 2 CDS requests and exits in seconds
   #  - process (15:40 UTC, CDS_PROCESS_DELAY_MINUTES=40 in glofas_downloader.py):
@@ -10,9 +10,14 @@ on:
   #    real-data-informed starting point with headroom, not a guess. If CDS still
   #    isn't ready by 15:40 this step just waits out the remainder itself (the
   #    same patient wait-and-retry the original single-step flow always used)
+  #  - process (19:00 UTC): same-day safety-net retry, for when today's forecast
+  #    genuinely hadn't been published by CDS yet at 15:40. Same-day-only file
+  #    existence check (_glofas_already_downloaded()) makes this a cheap no-op
+  #    if the 15:40 run already succeeded; only does real work if it didn't.
   schedule:
     - cron: '0 15 * * *'   # submit
     - cron: '40 15 * * *'  # process
+    - cron: '0 19 * * *'   # process (same-day retry)
 
   workflow_dispatch:
     inputs:
@@ -83,8 +88,8 @@ jobs:
           GLOFAS_DATA_DIR: 'glofas_data'
           # workflow_dispatch: honors the mode input (defaults to 'process').
           # schedule: 'submit' only for the 15:00 UTC trigger, 'process' for
-          # everything else (the 15:40 UTC trigger, and any run type where
-          # github.event.schedule isn't set).
+          # everything else (the 15:40 UTC and 19:00 UTC triggers, and any run
+          # type where github.event.schedule isn't set).
           GLOFAS_MODE: ${{ github.event.inputs.mode || (github.event.schedule == '0 15 * * *' && 'submit') || 'process' }}
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
 
