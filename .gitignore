@@ -47,3 +47,10 @@ TEST_wind_extracted/
 SPCS_initial_files.RenameMe/
 testing/
 snowflake_spcs/
+
+# Storm surge (setup_surge_dem.py cache, demo notebook outputs)
+surge_dem/
+surge_dem_tmp/
+surge_dem_cache/
+demo_surge/
+tests/surge_model_comparison/data/

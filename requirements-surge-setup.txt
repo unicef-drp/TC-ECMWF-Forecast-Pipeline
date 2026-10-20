@@ -1,0 +1,4 @@
+# One-time setup of the storm surge coastal elevation cache (setup_surge_dem.py).
+# NOT needed by the recurring pipeline: step 5c only uses packages already in requirements.txt.
+-r requirements.txt
+giga-spatial>=0.9.8   # NASA SRTM download (NasaSRTMHandler), Earthdata login required

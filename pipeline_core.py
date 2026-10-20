@@ -24,6 +24,7 @@ from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_st
 from ecmwf_wind_data_downloader import download_ensemble_wind, download_ensemble_gust
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
 from ecmwf_gust_envelope_extractor import process_gust_combination
+from ecmwf_surge_envelope_extractor import process_surge_combination, resolve_surge_dem
 from ecmwf_met_downloader import download_ensemble_param
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,17 @@ class BasePipelineConfig:
         # step5b_extract_gust_envelopes, both of which still also require
         # process_wind_data since gust extraction reuses the same TC track data).
         self.process_gust = os.getenv('PROCESS_GUST', 'true').lower() == 'true'
+
+        # Storm surge (step 5c, ecmwf_surge_envelope_extractor.py): CLIMADA
+        # bathtub surge computed from the same ECMWF 10 m wind files as step 5,
+        # so it also requires process_wind_data. Default OFF until validated in
+        # production. Needs the coastal elevation cache built once by
+        # setup_surge_dem.py.
+        self.process_surge = os.getenv('PROCESS_SURGE', 'false').lower() == 'true'
+        # Where that cache is read from: snowflake, blob, or local. Defaults to
+        # DATA_PIPELINE_DB, same convention as GLOFAS_JRC_SOURCE.
+        self.surge_dem_source = os.getenv('SURGE_DEM_SOURCE', self.data_pipeline_db).lower()
+        self.surge_dem_local_dir = Path(os.getenv('SURGE_DEM_LOCAL_DIR', 'surge_dem'))
 
         # Wind/gust speed-field raster persistence (ecmwf_wind_raster_writer.py):
         # real, additive, tested output, but NOT currently consumed by anything.
@@ -608,7 +620,7 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
             logger.info(f"Processed wind data for {result['processed_storms']} storm(s)")
             envelope_files = [
                 f for f in config.wind_extracted_dir.glob("*_envelopes_*.csv")
-                if 'gust' not in f.name
+                if 'gust' not in f.name and 'surge' not in f.name
             ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
             # Gated on publish_raster, not just globbed unconditionally: a stale
@@ -674,6 +686,55 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return [], []
+
+
+def step5c_extract_surge_envelopes(config: BasePipelineConfig, stats: PipelineStats,
+                                    snowflake_conn=None) -> List[Path]:
+    """Step 5c: Extract storm surge envelope polygons from the 10 m wind GRIB files.
+
+    Same inputs as step 5 (transformed tracks + wind_ens_* GRIB files), plus the
+    coastal elevation cache (setup_surge_dem.py), resolved from
+    SURGE_DEM_SOURCE. snowflake_conn is only needed when that source is
+    'snowflake' and the cache is not already on local disk.
+
+    Returns:
+        surge_files: the *_surge_envelopes_{individual,combined}.csv files.
+    """
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled -- skipping surge envelope extraction")
+        return []
+    if not config.process_surge:
+        logger.info("PROCESS_SURGE=false -- skipping surge envelope extraction")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 5c: Extracting storm surge envelopes (bathtub) from 10 m wind...")
+    logger.info("=" * 70)
+    try:
+        dem_path = resolve_surge_dem(
+            config.surge_dem_source, config.surge_dem_local_dir,
+            snowflake_conn=snowflake_conn,
+            snowflake_stage_name=config.snowflake_stage_name,
+            blob_account_url=config.blob_account_url,
+            blob_sas_token=config.blob_sas_token,
+            blob_container=config.blob_container,
+        )
+        process_surge_combination(
+            tc_data_dir=config.transformed_data_dir,
+            wind_data_dir=config.wind_data_dir,
+            output_dir=config.wind_extracted_dir,
+            dem_path=dem_path,
+        )
+        surge_files = sorted(config.wind_extracted_dir.glob('*_surge_envelopes_*.csv'))
+        if surge_files:
+            logger.info(f"Surge envelope files: {[f.name for f in surge_files]}")
+        else:
+            logger.info("No surge envelope files generated (no low-lying coast reached by any member)")
+        return surge_files
+    except Exception as e:
+        error_msg = f"Surge envelope extraction failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,11 @@ PROCESS_WIND_DATA=true
 # PROCESS_WIND_DATA
 PROCESS_GUST=true
 
+# Storm surge envelopes, step 5c (default: false); see root sample_env.txt
+PROCESS_SURGE=false
+SURGE_DEM_SOURCE=snowflake
+SURGE_DEM_LOCAL_DIR=surge_dem
+
 # Filter to named storms only (true/false, default: true)
 # Set false to include unnamed disturbances (e.g. 70W, 95E)
 NAMED_STORMS_ONLY=true

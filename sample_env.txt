@@ -47,6 +47,22 @@ SNOWFLAKE_STAGE_NAME=your_stage_name
 # PROCESS_WIND_DATA
 PROCESS_GUST=true
 
+# Enable storm surge envelopes, step 5c (true/false, default: false). Requires
+# PROCESS_WIND_DATA (reuses the 10 m wind files) and the coastal elevation cache
+# built once by setup_surge_dem.py
+PROCESS_SURGE=false
+
+# Where the surge elevation cache is read from: snowflake, blob, or local.
+# Defaults to DATA_PIPELINE_DB
+SURGE_DEM_SOURCE=snowflake
+
+# Local dir containing surge_coastal_dem.tif, used only when SURGE_DEM_SOURCE=local
+SURGE_DEM_LOCAL_DIR=surge_dem
+
+# Earthdata login, only for the one-time setup_surge_dem.py SRTM download (GigaSpatial)
+EARTHDATA_USERNAME=your_earthdata_username
+EARTHDATA_PASSWORD=your_earthdata_password
+
 # Filter to named storms only (true/false, default: true)
 NAMED_STORMS_ONLY=true
 

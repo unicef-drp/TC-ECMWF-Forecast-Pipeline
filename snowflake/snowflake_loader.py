@@ -253,7 +253,8 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
         conn: Snowflake connection
         table_type: Target table type ('TC_TRACKS', 'TC_ENVELOPES_INDIVIDUAL',
                     'TC_ENVELOPES_COMBINED', 'TC_GUST_ENVELOPES_INDIVIDUAL',
-                    'TC_GUST_ENVELOPES_COMBINED')
+                    'TC_GUST_ENVELOPES_COMBINED', 'TC_SURGE_ENVELOPES_INDIVIDUAL',
+                    'TC_SURGE_ENVELOPES_COMBINED')
         use_staging: If True, use staging table + MERGE (handles duplicates)
                      If False, direct INSERT (faster but no deduplication)
 
@@ -392,6 +393,58 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                         ENSEMBLE_MEMBER INTEGER,
                         LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
                         GUST_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_SURGE_ENVELOPES_INDIVIDUAL':
+                # Storm surge tables (step 5c): same shape and same bootstrap DDL
+                # as the gust tables above, SURGE_THRESHOLD in cm (50 = 0.5 m).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_SURGE_ENVELOPES_INDIVIDUAL (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        VALID_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Valid time for this forecast point',
+                        LEAD_TIME INTEGER NOT NULL COMMENT 'Forecast lead time in hours',
+                        SURGE_THRESHOLD INTEGER NOT NULL COMMENT 'Surge height threshold in cm (50 = 0.5 m)',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing the area where storm surge exceeds the threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, LEAD_TIME, SURGE_THRESHOLD)
+                    )
+                    COMMENT = 'Individual storm surge envelopes for specific forecast times'
+                """)
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        VALID_TIME TIMESTAMP_NTZ,
+                        LEAD_TIME INTEGER,
+                        SURGE_THRESHOLD INTEGER,
+                        ENVELOPE_REGION VARCHAR
+                    )
+                """)
+            elif table_type == 'TC_SURGE_ENVELOPES_COMBINED':
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS TC_SURGE_ENVELOPES_COMBINED (
+                        FORECAST_TIME TIMESTAMP_NTZ NOT NULL COMMENT 'Time when the forecast was issued',
+                        TRACK_ID VARCHAR(100) NOT NULL COMMENT 'Unique identifier for the storm',
+                        ENSEMBLE_MEMBER INTEGER NOT NULL COMMENT 'Ensemble member number',
+                        LEAD_TIME_RANGE INTEGER NOT NULL COMMENT 'Starting lead time for the range in hours (e.g., 0, 6, 12)',
+                        SURGE_THRESHOLD INTEGER NOT NULL COMMENT 'Surge height threshold in cm (50 = 0.5 m)',
+                        ENVELOPE_REGION GEOGRAPHY COMMENT 'Geographic polygon representing cumulative area where storm surge exceeds threshold',
+                        LOADED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was loaded into Snowflake',
+                        PRIMARY KEY (TRACK_ID, ENSEMBLE_MEMBER, FORECAST_TIME, SURGE_THRESHOLD)
+                    )
+                    COMMENT = 'Combined storm surge envelopes across time ranges for impact analysis'
+                """)
+                cursor.execute(f"""
+                    CREATE OR REPLACE TEMPORARY TABLE {staging_table} (
+                        FORECAST_TIME TIMESTAMP_NTZ,
+                        TRACK_ID VARCHAR,
+                        ENSEMBLE_MEMBER INTEGER,
+                        LEAD_TIME VARCHAR,  -- Keep as VARCHAR to handle range format
+                        SURGE_THRESHOLD INTEGER,
                         ENVELOPE_REGION VARCHAR
                     )
                 """)
@@ -625,6 +678,93 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                     ) VALUES (
                         s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
                         s.GUST_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
+                    )
+                """
+
+            elif table_type == 'TC_SURGE_ENVELOPES_INDIVIDUAL':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+
+                merge_sql = f"""
+                    MERGE INTO TC_SURGE_ENVELOPES_INDIVIDUAL t
+                    USING (
+                        SELECT
+                            FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                            SURGE_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.LEAD_TIME = s.LEAD_TIME
+                        AND t.SURGE_THRESHOLD = s.SURGE_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        VALID_TIME = s.VALID_TIME,
+                        LOADED_AT = CURRENT_TIMESTAMP()
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME,
+                        SURGE_THRESHOLD, ENVELOPE_REGION, LOADED_AT
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.VALID_TIME, s.LEAD_TIME,
+                        s.SURGE_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
+                    )
+                """
+                # LOADED_AT is set explicitly here (not via a table DEFAULT,
+                # unlike the wind tables). Snowflake's ALTER TABLE ADD
+                # COLUMN doesn't support a computed DEFAULT the way CREATE
+                # TABLE does ("Invalid column default expression"), and this
+                # column was added to the already-live gust tables via
+                # ALTER TABLE, not CREATE TABLE, so no working DEFAULT
+                # exists on the real table.
+
+            elif table_type == 'TC_SURGE_ENVELOPES_COMBINED':
+                logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
+                logger.info(f"  LEAD_TIME will be parsed from VARCHAR to INTEGER during MERGE")
+
+                merge_sql = f"""
+                    MERGE INTO TC_SURGE_ENVELOPES_COMBINED t
+                    USING (
+                        SELECT
+                            FORECAST_TIME,
+                            TRACK_ID,
+                            ENSEMBLE_MEMBER,
+                            CASE
+                                WHEN LEAD_TIME LIKE '%-%' THEN
+                                    CAST(SPLIT_PART(LEAD_TIME, '-', 1) AS INTEGER)
+                                ELSE CAST(LEAD_TIME AS INTEGER)
+                            END AS LEAD_TIME_RANGE,
+                            SURGE_THRESHOLD,
+                            CASE
+                                WHEN ENVELOPE_REGION IS NOT NULL
+                                     AND ENVELOPE_REGION != ''
+                                     AND ENVELOPE_REGION != 'None'
+                                     AND ENVELOPE_REGION != 'null'
+                                THEN TRY_TO_GEOGRAPHY(ENVELOPE_REGION)
+                                ELSE NULL
+                            END AS ENVELOPE_REGION
+                        FROM {staging_table}
+                    ) s
+                    ON t.TRACK_ID = s.TRACK_ID
+                        AND t.ENSEMBLE_MEMBER = s.ENSEMBLE_MEMBER
+                        AND t.FORECAST_TIME = s.FORECAST_TIME
+                        AND t.SURGE_THRESHOLD = s.SURGE_THRESHOLD
+                    WHEN MATCHED AND s.ENVELOPE_REGION IS NOT NULL THEN UPDATE SET
+                        ENVELOPE_REGION = s.ENVELOPE_REGION,
+                        LEAD_TIME_RANGE = s.LEAD_TIME_RANGE
+                    WHEN NOT MATCHED THEN INSERT (
+                        FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
+                        SURGE_THRESHOLD, ENVELOPE_REGION, LOADED_AT
+                    ) VALUES (
+                        s.FORECAST_TIME, s.TRACK_ID, s.ENSEMBLE_MEMBER, s.LEAD_TIME_RANGE,
+                        s.SURGE_THRESHOLD, s.ENVELOPE_REGION, CURRENT_TIMESTAMP()
                     )
                 """
 

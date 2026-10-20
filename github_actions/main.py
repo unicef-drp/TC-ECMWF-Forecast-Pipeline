@@ -28,6 +28,7 @@ from pipeline_core import (
     step4b_download_gust,
     step5_process_wind,
     step5b_extract_gust_envelopes,
+    step5c_extract_surge_envelopes,
     step6_download_precip,
     cleanup_files,
 )
@@ -299,6 +300,10 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                     table_type = 'TC_GUST_ENVELOPES_INDIVIDUAL'
                 elif 'gust_envelopes_combined' in csv_file.name:
                     table_type = 'TC_GUST_ENVELOPES_COMBINED'
+                elif 'surge_envelopes_individual' in csv_file.name:
+                    table_type = 'TC_SURGE_ENVELOPES_INDIVIDUAL'
+                elif 'surge_envelopes_combined' in csv_file.name:
+                    table_type = 'TC_SURGE_ENVELOPES_COMBINED'
                 elif 'individual' in csv_file.name:
                     table_type = 'TC_ENVELOPES_INDIVIDUAL'
                 elif 'combined' in csv_file.name:
@@ -375,6 +380,8 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                 combined_count = cursor.fetchone()[0]
                 gust_individual_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_INDIVIDUAL")
                 gust_combined_count = _safe_table_count(cursor, "TC_GUST_ENVELOPES_COMBINED")
+                surge_individual_count = _safe_table_count(cursor, "TC_SURGE_ENVELOPES_INDIVIDUAL")
+                surge_combined_count = _safe_table_count(cursor, "TC_SURGE_ENVELOPES_COMBINED")
                 met_count = _safe_table_count(cursor, "MET_FORECASTS")
             finally:
                 cursor.close()
@@ -385,6 +392,8 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             logger.info(f"  TC_ENVELOPES_COMBINED:         {combined_count:,}")
             logger.info(f"  TC_GUST_ENVELOPES_INDIVIDUAL:  {_fmt_count(gust_individual_count)}")
             logger.info(f"  TC_GUST_ENVELOPES_COMBINED:    {_fmt_count(gust_combined_count)}")
+            logger.info(f"  TC_SURGE_ENVELOPES_INDIVIDUAL: {_fmt_count(surge_individual_count)}")
+            logger.info(f"  TC_SURGE_ENVELOPES_COMBINED:   {_fmt_count(surge_combined_count)}")
             logger.info(f"  MET_FORECASTS:                 {_fmt_count(met_count)}")
 
             stats.files_loaded = len(transformed_files) + len(envelope_files) + raster_uploaded
@@ -426,6 +435,7 @@ def main():
     logger.info(f"Snowflake: {config.sf_database}.{config.sf_schema}")
     logger.info(f"Wind processing: {config.process_wind_data}")
     logger.info(f"Gust processing: {config.process_gust}")
+    logger.info(f"Surge processing: {config.process_surge}")
     logger.info(f"Met (precip/runoff) processing: {config.process_met}")
     if config.download_date:
         logger.info(f"Download date: {config.download_date} {config.run_time or 'any'}Z")
@@ -485,6 +495,23 @@ def main():
         envelope_files, raster_files = step5_process_wind(config, stats)
         gust_files, gust_raster_files = step5b_extract_gust_envelopes(config, stats)
 
+        # Surge needs a Snowflake connection only to fetch its elevation cache
+        # from the stage (SURGE_DEM_SOURCE=snowflake)
+        _surge_conn = None
+        if config.process_surge and config.surge_dem_source == 'snowflake':
+            os.environ['SNOWFLAKE_ACCOUNT'] = config.sf_account
+            os.environ['SNOWFLAKE_USER'] = config.sf_user
+            os.environ['SNOWFLAKE_PASSWORD'] = config.sf_password
+            os.environ['SNOWFLAKE_WAREHOUSE'] = config.sf_warehouse
+            os.environ['SNOWFLAKE_DATABASE'] = config.sf_database
+            os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
+            _surge_conn = get_snowflake_connection()
+        try:
+            surge_files = step5c_extract_surge_envelopes(config, stats, snowflake_conn=_surge_conn)
+        finally:
+            if _surge_conn:
+                _surge_conn.close()
+
         # Open a connection for the precip stage PUT (SNOWFLAKE mode only)
         _precip_conn = None
         if config.data_pipeline_db == 'SNOWFLAKE':
@@ -503,7 +530,7 @@ def main():
             if _precip_conn:
                 _precip_conn.close()
 
-        step7_load(config, stats, transformed_files, envelope_files + gust_files, precip_metadata,
+        step7_load(config, stats, transformed_files, envelope_files + gust_files + surge_files, precip_metadata,
                    raster_files=raster_files + gust_raster_files)
 
         cleanup_files(config, stats.upload_failed_filenames)

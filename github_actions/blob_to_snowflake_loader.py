@@ -73,6 +73,8 @@ GLOFAS_PREFIX = 'glofas'
 _ENVELOPE_TABLE_RULES = [
     ('gust_envelopes_individual', 'TC_GUST_ENVELOPES_INDIVIDUAL'),
     ('gust_envelopes_combined', 'TC_GUST_ENVELOPES_COMBINED'),
+    ('surge_envelopes_individual', 'TC_SURGE_ENVELOPES_INDIVIDUAL'),
+    ('surge_envelopes_combined', 'TC_SURGE_ENVELOPES_COMBINED'),
     ('individual', 'TC_ENVELOPES_INDIVIDUAL'),
     ('combined', 'TC_ENVELOPES_COMBINED'),
 ]
