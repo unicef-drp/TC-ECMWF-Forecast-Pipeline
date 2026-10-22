@@ -27,7 +27,8 @@ from glofas_downloader import (
     blob_file_exists,
     EXTENT_RP_LEVELS,
 )
-from glofas_extent_masking import run_glofas_extent_masking, EXTENT_STAGE_PREFIX, IS_STANDIN
+import glofas_extent_masking
+from glofas_extent_masking import run_glofas_extent_masking, EXTENT_STAGE_PREFIX, IS_STANDIN, bymask_filename
 
 logger = logging.getLogger(__name__)
 
@@ -327,28 +328,36 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
 
 def _already_computed_extent_tiers(config: BaseGlofasConfig, snowflake_conn, date_str: str) -> Optional[List[Dict]]:
     """
-    Checks whether every EXTENT_RP_LEVELS tier's parquet file already exists on the remote
-    store (Blob or Snowflake stage, matching config.data_pipeline_db) for this date. Returns
-    lightweight {rp, is_standin, stage_path} dicts ready for metadata registration if every
-    tier is present, or None if any tier is missing (real masking still needs to run) or the
-    check itself can't be done (fails open toward running real masking, never toward silently
-    skipping it).
+    Checks whether every EXTENT_RP_LEVELS tier's parquet files already exist on the remote
+    store (Blob or Snowflake stage, matching config.data_pipeline_db) for this date: the
+    per-member file, and also the compact bitmask file while its generation is enabled.
+    Returns lightweight {rp, is_standin, stage_path, bymask_stage_path} dicts ready for
+    metadata registration if every tier is complete, or None if any file is missing (real
+    masking still needs to run, which rewrites both files for every tier) or the check itself
+    can't be done (fails open toward running real masking, never toward silently skipping it).
     """
     try:
+        def exists_remote(stage_path):
+            if config.data_pipeline_db == 'BLOB':
+                return blob_file_exists(config.blob_account_url, config.blob_sas_token,
+                                         config.blob_container, stage_path)
+            return stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn)
+
+        if config.data_pipeline_db != 'BLOB' and (not snowflake_conn or not config.snowflake_stage_name):
+            return None
         found = []
         for rp in EXTENT_RP_LEVELS:
             rp_int = int(float(rp))
             stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/river_extent_rp{rp_int}_bymember_{date_str}.parquet"
-            if config.data_pipeline_db == 'BLOB':
-                exists = blob_file_exists(config.blob_account_url, config.blob_sas_token,
-                                           config.blob_container, stage_path)
-            else:
-                if not snowflake_conn or not config.snowflake_stage_name:
-                    return None
-                exists = stage_file_exists(config.snowflake_stage_name, stage_path, snowflake_conn)
-            if not exists:
+            if not exists_remote(stage_path):
                 return None
-            found.append({"rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path})
+            bymask_stage_path = None
+            if glofas_extent_masking.EXTENT_BYMASK_ENABLED:
+                bymask_stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{bymask_filename(rp_int, date_str)}"
+                if not exists_remote(bymask_stage_path):
+                    return None
+            found.append({"rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path,
+                          "bymask_stage_path": bymask_stage_path})
         return found
     except Exception as e:
         logger.warning(f"Could not check for already-computed extent tiers, running real masking instead: {e}")

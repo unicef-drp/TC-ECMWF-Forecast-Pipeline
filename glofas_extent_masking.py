@@ -78,6 +78,15 @@ JRC_STAGE_PREFIX = f"glofas/jrc_extent_cache/{JRC_VERSION}"
 # same forecast, so they live in the same date folder on stage.
 EXTENT_STAGE_PREFIX = "glofas"
 
+# Compact companion to the per-member file: one row per distinct flooded pixel with
+# one uint64 member bitmask per lead step (bit = member id - 1), written alongside the
+# per-member file in the same cell loop. Needs member ids 1..64.
+EXTENT_BYMASK_ENABLED = True
+BYMASK_ROW_GROUP_SIZE = 262144
+BYMASK_MAX_MEMBERS = 64
+# Granularity of the Morton (z-order) cell index that orders the bymask rows.
+BYMASK_CELL_DEG = 0.05
+
 # JRC depth band filenames per tier, and the permanent-water band
 JRC_DEPTH_FILENAME = {"10.0": "jrc_rp10.tif", "20.0": "jrc_rp20.tif",
                        "50.0": "jrc_rp50.tif", "100.0": "jrc_rp100.tif"}
@@ -438,12 +447,134 @@ def combine_tier(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
             "is_standin": IS_STANDIN[rp], "path": out_path}
 
 
+def bymask_step_columns(leadtime_hours: List[int]) -> List[str]:
+    """Column names of the per-step member bitmasks, e.g. [m024, m048, ..., m168]."""
+    return [f"m{int(h):03d}" for h in leadtime_hours]
+
+
+def bymask_filename(rp_int: int, date_str: str) -> str:
+    return f"river_extent_rp{rp_int}_bymask_{date_str}.parquet"
+
+
+def _interleave_bits(v: np.ndarray) -> np.ndarray:
+    """Spreads the low 16 bits of each value so a zero bit sits between every pair of bits."""
+    v = v.astype(np.uint64) & np.uint64(0xFFFF)
+    v = (v | (v << np.uint64(8))) & np.uint64(0x00FF00FF)
+    v = (v | (v << np.uint64(4))) & np.uint64(0x0F0F0F0F)
+    v = (v | (v << np.uint64(2))) & np.uint64(0x33333333)
+    v = (v | (v << np.uint64(1))) & np.uint64(0x55555555)
+    return v
+
+
+def morton_cell_order(cell_lat: np.ndarray, cell_lon: np.ndarray) -> np.ndarray:
+    """
+    Indices that visit cells in Morton (z-order) order of their BYMASK_CELL_DEG grid index,
+    so consecutive cells are spatially close in both latitude and longitude. Ties (same
+    grid index) keep their original relative order.
+    """
+    ix = np.floor((np.asarray(cell_lat, dtype=np.float64) + 90.0) / BYMASK_CELL_DEG).astype(np.int64)
+    iy = np.floor((np.asarray(cell_lon, dtype=np.float64) + 180.0) / BYMASK_CELL_DEG).astype(np.int64)
+    key = (_interleave_bits(ix) << np.uint64(1)) | _interleave_bits(iy)
+    return np.argsort(key, kind="stable")
+
+
+def cell_member_masks(exceed_cell: np.ndarray, member_numbers: np.ndarray) -> np.ndarray:
+    """
+    exceed_cell: (n_members, n_steps) boolean for one cell. Returns (n_steps,) uint64 with
+    bit (member id - 1) set for every member exceeding on that step. Per-step, not cumulative.
+    """
+    shifts = (np.asarray(member_numbers, dtype=np.int64) - 1).astype(np.uint64)
+    bits = exceed_cell.astype(np.uint64) << shifts[:, None]
+    return np.bitwise_or.reduce(bits, axis=0)
+
+
+class _BymaskWriter:
+    """
+    Streams the one-row-per-pixel bitmask file. Rows are buffered per cell (pixel
+    coordinates plus that cell's step masks, expanded only at write time) and written in
+    exact `row_group_size` row groups, so a row group covers a run of consecutive cells.
+    Writes to a temporary sibling path and renames on finish(), so a partial file never
+    appears under the final name.
+    """
+
+    def __init__(self, path: Path, step_cols: List[str], row_group_size: int = BYMASK_ROW_GROUP_SIZE):
+        self.path = Path(path)
+        self.tmp_path = self.path.with_name(self.path.name + ".tmp")
+        self.step_cols = step_cols
+        self.row_group_size = row_group_size
+        self.schema = pa.schema(
+            [("pixel_lat", pa.float64()), ("pixel_lon", pa.float64())]
+            + [(c, pa.uint64()) for c in step_cols] + [("below_min_basin", pa.bool_())])
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.writer = pq.ParquetWriter(str(self.tmp_path), self.schema, compression="zstd")
+        self.pending = []   # per-cell (lat, lon, masks, basin)
+        self.n_pending = 0
+        self.carry = None   # table of rows left over from the last flush
+        self.n_rows = 0
+
+    def add_cell(self, px_lat: np.ndarray, px_lon: np.ndarray, masks: np.ndarray, basin: bool):
+        self.pending.append((px_lat, px_lon, masks, basin))
+        self.n_pending += px_lat.size
+        if self.n_pending + (self.carry.num_rows if self.carry is not None else 0) >= self.row_group_size:
+            self._write_full_groups()
+
+    def _pending_table(self):
+        if not self.pending:
+            return None
+        n_px = np.array([c[0].size for c in self.pending], dtype=np.int64)
+        cols = {
+            "pixel_lat": np.concatenate([c[0] for c in self.pending]),
+            "pixel_lon": np.concatenate([c[1] for c in self.pending]),
+        }
+        mask_mat = np.repeat(np.stack([c[2] for c in self.pending]), n_px, axis=0)
+        for j, name in enumerate(self.step_cols):
+            cols[name] = mask_mat[:, j]
+        cols["below_min_basin"] = np.repeat(np.array([c[3] for c in self.pending], dtype=bool), n_px)
+        self.pending, self.n_pending = [], 0
+        return pa.table(cols, schema=self.schema)
+
+    def _write_full_groups(self):
+        parts = [t for t in (self.carry, self._pending_table()) if t is not None]
+        table = parts[0] if len(parts) == 1 else pa.concat_tables(parts)
+        n_full = (table.num_rows // self.row_group_size) * self.row_group_size
+        if n_full:
+            self.writer.write_table(table.slice(0, n_full), row_group_size=self.row_group_size)
+            self.n_rows += n_full
+        self.carry = table.slice(n_full) if n_full < table.num_rows else None
+
+    def finish(self) -> int:
+        parts = [t for t in (self.carry, self._pending_table()) if t is not None]
+        if parts:
+            table = parts[0] if len(parts) == 1 else pa.concat_tables(parts)
+            self.writer.write_table(table, row_group_size=self.row_group_size)
+            self.n_rows += table.num_rows
+        self.carry = None
+        self.writer.close()
+        self.writer = None
+        os.replace(self.tmp_path, self.path)
+        return self.n_rows
+
+    def abort(self):
+        try:
+            if self.writer is not None:
+                self.writer.close()
+        except Exception:
+            pass
+        self.writer = None
+        self.pending, self.carry, self.n_pending = [], None, 0
+        try:
+            self.tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
                                      exceed_by_member: Dict[str, np.ndarray], keep_mask: np.ndarray,
                                      jrc_paths: Dict[str, Path], leadtime_hours: List[int],
                                      member_numbers: np.ndarray, out_path: Path,
                                      below_min_basin: Optional[np.ndarray] = None,
-                                     flush_every_rows: int = 2_000_000) -> Dict:
+                                     flush_every_rows: int = 2_000_000,
+                                     bymask_path: Optional[Path] = None) -> Dict:
     """
     Writes one Parquet file for a single RP tier: one row per (pixel, member,
     step) that IS flooded for that member after JRC pixel-matching: sparse,
@@ -472,12 +603,31 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
     Streams to disk via a pyarrow ParquetWriter, flushing every
     `flush_every_rows` accumulated rows, rather than building one giant
     in-memory table across every cell before writing once.
+
+    If `bymask_path` is given, the same cell loop (one JRC read per cell) also writes the
+    compact companion file: one row per distinct flooded pixel with columns pixel_lat,
+    pixel_lon, one uint64 member bitmask per lead step (m024..m168, bit = member id - 1,
+    per step, not cumulative) and below_min_basin. Only pixels with at least one nonzero
+    step mask are written. Cells are visited in Morton order of their 0.05deg grid index,
+    so each row group spans a compact lat/lon box. The two outputs are fault-isolated: a
+    bitmask failure only drops the bitmask file (returned `bymask_path` is None), and the
+    per-member file is never affected. If the per-member output itself aborts, the
+    incomplete bitmask file is discarded. Member ids above BYMASK_MAX_MEMBERS cannot be
+    represented, which skips only the bitmask file.
     """
     source_tier = EXTENT_SOURCE_TIER[rp]
     depth_path = jrc_paths[source_tier]
     water_path = jrc_paths["water"]
     n_steps = len(leadtime_hours)
     exceed = exceed_by_member[rp]  # (n_members, n_steps, n_cells) boolean
+    if bymask_path is not None:
+        member_arr = np.asarray(member_numbers)
+        if member_arr.size == 0 or int(member_arr.max()) > BYMASK_MAX_MEMBERS or int(member_arr.min()) < 1:
+            logger.error(f"  RP{rp}: member ids outside 1..{BYMASK_MAX_MEMBERS} "
+                         f"(max {int(member_arr.max()) if member_arr.size else 'n/a'}), "
+                         f"cannot build the uint64 bitmask file -- skipping it for this tier "
+                         f"(the per-member file is unaffected)")
+            bymask_path = None
     if below_min_basin is None:
         below_min_basin = np.zeros(len(cell_lat), dtype=bool)
 
@@ -492,6 +642,16 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
     buffered_rows = 0
     total_rows = 0
     writer = None
+    mask_writer = None
+    n_mask_rows = 0
+
+    def drop_mask_writer(reason):
+        nonlocal mask_writer
+        logger.error(f"  RP{rp}: bitmask file failed, skipping it for this tier "
+                     f"(the per-member file is unaffected): {reason}")
+        if mask_writer is not None:
+            mask_writer.abort()
+        mask_writer = None
 
     def flush():
         nonlocal lat_chunks, lon_chunks, member_chunks, step_chunks, basin_chunks, buffered_rows, total_rows
@@ -526,6 +686,14 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
 
             transform = depth_src.transform
             active_idx = np.where(keep_mask)[0]
+            if bymask_path is not None:
+                try:
+                    mask_writer = _BymaskWriter(bymask_path, bymask_step_columns(leadtime_hours))
+                    active_idx = active_idx[morton_cell_order(cell_lat[active_idx], cell_lon[active_idx])]
+                except Exception as e:
+                    logger.error(f"  RP{rp}: could not start the bitmask file, skipping it for this "
+                                 f"tier (the per-member file is unaffected): {e}")
+                    mask_writer = None
             n_cells_failed = 0
 
             for i in active_idx:
@@ -557,6 +725,14 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
                     px_lon_1d = np.asarray(px_lon_1d, dtype=np.float64)
                     n_px = px_lat_1d.size
 
+                    if mask_writer is not None:
+                        try:
+                            step_masks = cell_member_masks(exceed[:, :, i], member_numbers)
+                            if step_masks.any():
+                                mask_writer.add_cell(px_lat_1d, px_lon_1d, step_masks, bool(below_min_basin[i]))
+                        except Exception as e:
+                            drop_mask_writer(e)
+
                     for step_idx in range(n_steps):
                         members_exceeding = np.where(exceed[:, step_idx, i])[0]
                         if members_exceeding.size == 0:
@@ -584,12 +760,55 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
                 logger.warning(f"  RP{rp}: {n_cells_failed} of {len(active_idx)} cells failed and were skipped")
 
         flush()  # final partial batch
+    except BaseException:
+        # An aborted per-member output leaves the bitmask file incomplete, so it is discarded.
+        if mask_writer is not None:
+            mask_writer.abort()
+        raise
     finally:
         if writer is not None:
             writer.close()
 
+    if mask_writer is not None:
+        try:
+            n_mask_rows = mask_writer.finish()
+        except Exception as e:
+            drop_mask_writer(e)
+
     return {"rp": rp, "n_cells": int(len(active_idx)), "n_rows": total_rows,
-            "is_standin": IS_STANDIN[rp], "path": out_path}
+            "is_standin": IS_STANDIN[rp], "path": out_path,
+            "bymask_path": bymask_path if mask_writer is not None else None,
+            "n_bymask_rows": n_mask_rows if mask_writer is not None else 0}
+
+
+def _upload_extent_file(local_path: Path, rp: str, date_str: str, snowflake_conn,
+                         snowflake_stage_name: Optional[str], data_pipeline_db: str,
+                         blob_account_url: Optional[str], blob_sas_token: Optional[str],
+                         blob_container: Optional[str]) -> Optional[str]:
+    """
+    Uploads one extent output file under glofas/{date}/ on the configured remote store and
+    returns its stage path, or None if there is no usable store or the upload failed
+    (never raises).
+    """
+    try:
+        stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{local_path.name}"
+        if data_pipeline_db == 'BLOB':
+            if not (blob_account_url and blob_sas_token and blob_container):
+                logger.warning(f"  RP{rp}: no Blob credentials -- keeping {local_path.name} local only")
+                return None
+            ok = upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, stage_path)
+        elif not snowflake_conn or not snowflake_stage_name:
+            logger.warning(f"  RP{rp}: no Snowflake connection -- keeping {local_path.name} local only")
+            return None
+        else:
+            ok = upload_to_snowflake_stage(local_path, snowflake_stage_name, stage_path, snowflake_conn)
+        if not ok:
+            logger.error(f"  RP{rp}: upload of {local_path.name} failed -- skipping its metadata row")
+            return None
+        return stage_path
+    except Exception as e:
+        logger.error(f"  RP{rp}: upload of {local_path.name} failed -- skipping its metadata row: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -626,8 +845,9 @@ def run_glofas_extent_masking(
     already succeeded upstream.
 
     Returns a list of metadata dicts (one per successfully-written tier):
-    {rp, is_standin, stage_path, n_cells, n_rows}, the caller maps `rp`
-    into a PARAM value ('extent_rp{N}_bymember') and loads these alongside
+    {rp, is_standin, stage_path, n_cells, n_rows, bymask_stage_path, n_bymask_rows},
+    the caller maps `rp` into PARAM values ('extent_rp{N}_bymember' for stage_path,
+    'extent_bymask_rp{N}' for bymask_stage_path when set) and loads these alongside
     raw discharge rows via load_riverine_metadata_to_snowflake() (one shared
     RIVER_FORECASTS table, not a separate RIVER_EXTENT_FORECASTS).
     """
@@ -720,18 +940,31 @@ def run_glofas_extent_masking(
         # per-member output are per-cycle products of the same forecast date.
         rp_int = int(float(rp))
         out_path = output_path / date_str / f"river_extent_rp{rp_int}_bymember_{date_str}.parquet"
+        bymask_path = (output_path / date_str / bymask_filename(rp_int, date_str)
+                       if EXTENT_BYMASK_ENABLED else None)
         try:
             info = combine_tier_per_member_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
                                                     jrc_paths, leadtime_hours, member_numbers, out_path,
-                                                    below_min_basin=below_min_basin)
+                                                    below_min_basin=below_min_basin, bymask_path=bymask_path)
         except Exception as e:
             logger.error(f"  RP{rp}: combination failed, skipping this tier: {e}")
             continue
         n_flagged_cells = int((keep_mask & below_min_basin).sum())
         logger.info(f"  RP{rp}: {info['n_cells']} cells ({n_flagged_cells} below_min_basin), "
                     f"{info['n_rows']:,} flooded pixel/member/step rows -> {out_path.name}")
+        if info.get("bymask_path") is not None:
+            logger.info(f"  RP{rp}: {info['n_bymask_rows']:,} flooded pixel rows -> {info['bymask_path'].name}")
+
+        # The bitmask file is uploaded first and on its own: its outcome never gates the
+        # per-member upload/registration below, and vice versa.
+        bymask_stage_path = None
+        if info.get("bymask_path") is not None and upload_to_stage:
+            bymask_stage_path = _upload_extent_file(
+                info["bymask_path"], rp, date_str, snowflake_conn, snowflake_stage_name,
+                data_pipeline_db, blob_account_url, blob_sas_token, blob_container)
 
         stage_path = None
+        upload_ok = True
         if upload_to_stage:
             if data_pipeline_db == 'BLOB':
                 if not (blob_account_url and blob_sas_token and blob_container):
@@ -741,7 +974,7 @@ def run_glofas_extent_masking(
                     ok = upload_to_blob(out_path, blob_account_url, blob_sas_token, blob_container, stage_path)
                     if not ok:
                         logger.error(f"  RP{rp}: Blob upload failed -- skipping metadata row for this tier")
-                        continue
+                        upload_ok = False
             elif not snowflake_conn or not snowflake_stage_name:
                 logger.warning(f"  RP{rp}: upload_to_stage requested but no Snowflake connection -- keeping local only")
             else:
@@ -749,11 +982,23 @@ def run_glofas_extent_masking(
                 ok = upload_to_snowflake_stage(out_path, snowflake_stage_name, stage_path, snowflake_conn)
                 if not ok:
                     logger.error(f"  RP{rp}: stage upload failed -- skipping metadata row for this tier")
-                    continue
+                    upload_ok = False
+
+        if not upload_ok:
+            # Per-member upload failed: no per-member row for this tier, but a bitmask file that
+            # did upload is still reported (stage_path None is skipped by per-member registration).
+            if bymask_stage_path:
+                results.append({
+                    "rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": None,
+                    "n_cells": info["n_cells"], "n_rows": info["n_rows"],
+                    "bymask_stage_path": bymask_stage_path, "n_bymask_rows": info["n_bymask_rows"],
+                })
+            continue
 
         results.append({
             "rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path,
             "n_cells": info["n_cells"], "n_rows": info["n_rows"],
+            "bymask_stage_path": bymask_stage_path, "n_bymask_rows": info["n_bymask_rows"],
         })
 
     return results
