@@ -229,6 +229,14 @@ def main():
                     'is_standin': r['is_standin'],
                     'stage_path': r['stage_path'],
                 } for r in extent_results if r.get('stage_path')]
+                # Compact bitmask companion file: its own PARAM (not 'extent_rp%') so
+                # per-member extent_rp lookups never match it.
+                metadata_rows += [{
+                    'forecast_time': result['forecast_date'],
+                    'param': f"extent_bymask_rp{int(float(r['rp']))}",
+                    'is_standin': r['is_standin'],
+                    'stage_path': r['bymask_stage_path'],
+                } for r in extent_results if r.get('bymask_stage_path')]
                 if metadata_rows:
                     rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
                     if rows == 0:

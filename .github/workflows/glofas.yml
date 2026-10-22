@@ -10,14 +10,15 @@ on:
   #    real-data-informed starting point with headroom, not a guess. If CDS still
   #    isn't ready by 15:40 this step just waits out the remainder itself (the
   #    same patient wait-and-retry the original single-step flow always used)
-  #  - process (19:00 UTC): same-day safety-net retry, for when today's forecast
-  #    genuinely hadn't been published by CDS yet at 15:40. Same-day-only file
-  #    existence check (_glofas_already_downloaded()) makes this a cheap no-op
-  #    if the 15:40 run already succeeded; only does real work if it didn't.
+  #  - process (19:00 UTC): a retry later the same day, for when today's forecast
+  #    genuinely had not been published by CDS yet at 15:40. The file existence
+  #    check in _glofas_already_downloaded(), scoped to the same day only, makes
+  #    this a cheap no op if the 15:40 run already succeeded; it only does real
+  #    work if that run did not.
   schedule:
     - cron: '0 15 * * *'   # submit
     - cron: '40 15 * * *'  # process
-    - cron: '0 19 * * *'   # process (same-day retry)
+    - cron: '0 19 * * *'   # process, retry later the same day
 
   workflow_dispatch:
     inputs:

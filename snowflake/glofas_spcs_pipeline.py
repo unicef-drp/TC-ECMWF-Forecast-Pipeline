@@ -332,6 +332,10 @@ def main():
                 )
 
             # Extent-masking step (GloFAS x JRC v2.1)
+            # This path registers only the per-member extent files. The compact bitmask files
+            # (river_extent_rp{N}_bymask_*, in each result's 'bymask_stage_path') are not
+            # registered here: if this path is used again, add RIVER_FORECASTS rows with
+            # PARAM 'extent_bymask_rp{N}' for them, as github_actions/glofas_pipeline.py does.
             extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
             if extent_results and upload_to_stage and write_conn:
                 metadata_rows = [{

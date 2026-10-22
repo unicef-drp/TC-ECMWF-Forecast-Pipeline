@@ -214,11 +214,23 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
     metadata_rows = []
     discharge_re = re.compile(rf'^river_{date_str}\.zarr\.zip$')
     extent_re = re.compile(rf'^river_extent_rp(\d+(?:\.\d+)?)_bymember_{date_str}\.parquet$')
+    bymask_re = re.compile(rf'^river_extent_rp(\d+(?:\.\d+)?)_bymask_{date_str}\.parquet$')
 
     for blob_path in blob_paths:
         name = Path(blob_path).name
         if discharge_re.match(name):
             metadata_rows.append({'forecast_time': date_str, 'param': 'dis24', 'stage_path': blob_path})
+            continue
+        mb = bymask_re.match(name)
+        if mb:
+            rp = mb.group(1)
+            rp_key = rp if rp in _IS_STANDIN else f'{rp}.0'
+            metadata_rows.append({
+                'forecast_time': date_str,
+                'param': f'extent_bymask_rp{int(float(rp))}',
+                'is_standin': _IS_STANDIN.get(rp_key),
+                'stage_path': blob_path,
+            })
             continue
         m = extent_re.match(name)
         if m:
