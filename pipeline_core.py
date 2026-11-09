@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared pipeline core: configuration, statistics, and processing steps 1–6.
+Shared pipeline core: configuration, statistics, and processing steps 1 to 6.
 
 Both entry points import from here:
   - github_actions/main.py: sequential execution, password auth
@@ -60,12 +60,12 @@ class BasePipelineConfig:
         # BLOB, SNOWFLAKE, and LOCAL are genuinely independent: BLOB mode needs zero
         # Snowflake credentials to pass validate() (see validate() below). In BLOB mode,
         # step7_load() (github_actions/main.py) uploads the track/envelope CSVs and the
-        # gridded Zarr files to Blob instead of Snowflake, and does NOT write
-        # TC_TRACKS/TC_ENVELOPES_COMBINED at all (loading Blob-resident CSVs into those
-        # tables directly; a separate, already-built manual loader,
-        # github_actions/blob_to_snowflake_loader.py, reads these same Blob prefixes
-        # back and MERGEs them in, but is not run automatically by any real scheduled
-        # workflow today). The MET_FORECASTS pointer-table row
+        # gridded Zarr files to Blob instead of loading them directly into Snowflake.
+        # The GitHub Actions BLOB branch then syncs tracks/envelopes into
+        # TC_TRACKS/TC_ENVELOPES_* via github_actions/blob_to_snowflake_loader.py only
+        # when Snowflake credentials are also configured; SPCS BLOB mode never does.
+        # That module can also be run manually (or through the manual-dispatch
+        # sync-tracks-to-snowflake.yml workflow) to MERGE the same Blob prefixes. The MET_FORECASTS pointer-table row
         # IS written in BLOB mode, but only best-effort: if real Snowflake credentials
         # happen to also be configured (a legitimate mixed-mode deployment) it writes for
         # real, otherwise it's skipped with a logged warning rather than failing the run.
@@ -93,14 +93,13 @@ class BasePipelineConfig:
         self.max_ensemble_members = 51  # Fixed: 50 perturbed + 1 control
 
         # Gust processing: independent of process_wind_data (a run can process
-        # wind without gust, e.g. the existing production workflow while gust
-        # is still being verified on the side; see step4b_download_gust/
-        # step5b_extract_gust_envelopes, both of which still also require
-        # process_wind_data since gust extraction reuses the same TC track data).
+        # wind without gust); step4b_download_gust and step5b_extract_gust_envelopes
+        # still require process_wind_data since gust extraction reuses the same
+        # TC track data).
         self.process_gust = os.getenv('PROCESS_GUST', 'true').lower() == 'true'
 
         # Wind/gust speed-field raster persistence (ecmwf_wind_raster_writer.py):
-        # real, additive, tested output, but NOT currently consumed by anything.
+        # optional output, not read by downstream consumers.
         # DATAPIPELINE's own impact-computation code rasterizes the
         # already-precise threshold-contour polygons directly on its own side
         # instead, since that reproduces production results exactly and
@@ -136,8 +135,10 @@ class BasePipelineConfig:
         BLOB, SNOWFLAKE, and LOCAL are genuinely independent: only the one actually
         selected by DATA_PIPELINE_DB has its own credentials required, matching the
         standalone GloFAS pipeline's own validate() (glofas_pipeline_core.py). BLOB
-        mode's step7_load() (github_actions/main.py) never opens a Snowflake
-        connection, so it needs zero Snowflake credentials, same as LOCAL.
+        mode needs zero Snowflake credentials to pass validation, same as LOCAL;
+        the GitHub Actions BLOB branch of step7_load() opens a Snowflake
+        connection (for the tracks/envelopes sync and the MET_FORECASTS pointer
+        row) only when Snowflake credentials are also configured.
 
         Returns True if valid, False otherwise (errors are logged).
         Subclasses with different auth requirements should override this.
@@ -154,7 +155,7 @@ class BasePipelineConfig:
             return self._validate_run_time()
 
         if self.data_pipeline_db == 'LOCAL':
-            logger.info("DATA_PIPELINE_DB=LOCAL -- Snowflake credentials not required")
+            logger.info("DATA_PIPELINE_DB=LOCAL, Snowflake credentials not required")
             return self._validate_run_time()
 
         missing = []
@@ -304,7 +305,7 @@ def extract_tc_data_info_from_bufr(bufr_files: List[Path]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline steps 1–5
+# Pipeline steps 1 to 5
 # ---------------------------------------------------------------------------
 
 def step1_download(config: BasePipelineConfig, stats: PipelineStats) -> List[Path]:
@@ -475,7 +476,7 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
         max_workers: Concurrent download workers passed to download_ensemble_wind (default 4).
     """
     if not config.process_wind_data:
-        logger.info("Wind data processing disabled -- skipping wind download")
+        logger.info("Wind data processing disabled, skipping wind download")
         return []
 
     logger.info("=" * 70)
@@ -485,7 +486,7 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
         tc_run_time = tc_data_info.get('run_time')
         tc_date = tc_data_info.get('date')
         if tc_run_time is None or tc_date is None:
-            logger.warning("Cannot determine TC run time or date -- skipping wind download")
+            logger.warning("Cannot determine TC run time or date, skipping wind download")
             return []
 
         max_forecast_hour = analyze_required_forecast_hours(
@@ -494,7 +495,7 @@ def step4_download_wind(config: BasePipelineConfig, stats: PipelineStats,
         required_forecast_hours = list(range(0, max_forecast_hour + 1, 3))
         logger.info(f"TC forecast: {tc_date} {tc_run_time:02d}Z")
         logger.info(
-            f"Wind steps: 0–{max_forecast_hour}h every 3h "
+            f"Wind steps: 0 to {max_forecast_hour}h every 3h "
             f"({len(required_forecast_hours)} files)"
         )
 
@@ -527,10 +528,10 @@ def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
                           tc_data_info: Dict, max_workers: int = 4) -> List[Path]:
     """Step 4b: Download ensemble 10fg (max wind gust) GRIB files alongside u10/v10."""
     if not config.process_wind_data:
-        logger.info("Wind data processing disabled -- skipping gust download")
+        logger.info("Wind data processing disabled, skipping gust download")
         return []
     if not config.process_gust:
-        logger.info("PROCESS_GUST=false -- skipping gust download")
+        logger.info("PROCESS_GUST=false, skipping gust download")
         return []
     logger.info("=" * 70)
     logger.info("STEP 4b: Downloading gust forecast data (10fg)...")
@@ -539,11 +540,11 @@ def step4b_download_gust(config: BasePipelineConfig, stats: PipelineStats,
         tc_run_time = tc_data_info.get('run_time')
         tc_date = tc_data_info.get('date')
         if tc_run_time is None or tc_date is None:
-            logger.warning("Cannot determine TC run time or date -- skipping gust download")
+            logger.warning("Cannot determine TC run time or date, skipping gust download")
             return []
         max_forecast_hour = analyze_required_forecast_hours(config.transformed_data_dir, verbose=False)
         required_forecast_hours = list(range(3, max_forecast_hour + 1, 3))
-        logger.info(f"Gust steps: 3–{max_forecast_hour}h every 3h ({len(required_forecast_hours)} files)")
+        logger.info(f"Gust steps: 3 to {max_forecast_hour}h every 3h ({len(required_forecast_hours)} files)")
         result = download_ensemble_gust(
             date=tc_date, run_time=tc_run_time,
             forecast_hours=required_forecast_hours,
@@ -584,7 +585,7 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
     """
     wind_files = list(config.wind_data_dir.glob("*.grib2"))
     if not config.process_wind_data or not wind_files:
-        logger.info("Wind processing disabled or no wind files -- skipping")
+        logger.info("Wind processing disabled or no wind files, skipping")
         return [], []
 
     pool_label = f"ProcessPool({max_workers})" if use_process_pool else "Sequential"
@@ -612,8 +613,8 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
             ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
             # Gated on publish_raster, not just globbed unconditionally: a stale
-            # *.tif left over from an earlier cycle (e.g. a run that wrote
-            # rasters then crashed before cleanup_files() could remove them)
+            # *.tif left behind by an interrupted run (rasters written, cleanup_files()
+            # not reached)
             # must never get discovered and uploaded on a later cycle where the
             # flag is off. Turning the flag off is expected to fully disable
             # this feature, not just the write half of it.
@@ -642,10 +643,10 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
         CSVs, same shape as step5_process_wind()'s own wind raster_files.
     """
     if not config.process_wind_data:
-        logger.info("Wind data processing disabled -- skipping gust envelope extraction")
+        logger.info("Wind data processing disabled, skipping gust envelope extraction")
         return [], []
     if not config.process_gust:
-        logger.info("PROCESS_GUST=false -- skipping gust envelope extraction")
+        logger.info("PROCESS_GUST=false, skipping gust envelope extraction")
         return [], []
     logger.info("=" * 70)
     logger.info("STEP 5b: Extracting gust envelopes from 10fg GRIB files...")
@@ -688,7 +689,7 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
     Step 6: Download tp and ro, build Zarr ZipStores, upload to stage.
 
     Runs after wind processing. Downloads all 51 members × 25 steps globally
-    (60°S–60°N), builds one ZipStore per param, and either PUTs them to the
+    (60°S to 60°N), builds one ZipStore per param, and either PUTs them to the
     Snowflake internal stage or keeps them locally.
 
     tp: total precipitation (global; primary pluvial forcing)
@@ -700,26 +701,26 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
     params_to_run = ['tp', 'ro'] if config.process_met else []
 
     if not params_to_run:
-        logger.info('Precipitation processing disabled -- skipping')
+        logger.info('Precipitation processing disabled, skipping')
         return []
 
     tc_run_time = tc_data_info.get('run_time')
     tc_date     = tc_data_info.get('date')
     tc_forecast_time = tc_data_info.get('forecast_time')
     if tc_run_time is None or tc_date is None:
-        logger.warning('Cannot determine TC run time/date -- skipping MET parameter download')
+        logger.warning('Cannot determine TC run time/date, skipping MET parameter download')
         return []
 
     upload_to_stage = config.data_pipeline_db in ('SNOWFLAKE', 'BLOB')
     if upload_to_stage and config.data_pipeline_db == 'SNOWFLAKE' and not config.snowflake_stage_name:
-        error_msg = 'SNOWFLAKE_STAGE_NAME required for precipitation stage upload -- skipping'
+        error_msg = 'SNOWFLAKE_STAGE_NAME required for precipitation stage upload, skipping'
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return []
     if upload_to_stage and config.data_pipeline_db == 'BLOB' and not (
         config.blob_account_url and config.blob_sas_token and config.blob_container
     ):
-        error_msg = 'ACCOUNT_URL/SAS_TOKEN/CONTAINER_NAME required for precipitation Blob upload -- skipping'
+        error_msg = 'ACCOUNT_URL/SAS_TOKEN/CONTAINER_NAME required for precipitation Blob upload, skipping'
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return []
@@ -761,7 +762,7 @@ def step6_download_precip(config: BasePipelineConfig, stats: PipelineStats,
             'stage_path':    result['stage_path'] or str(result['zip_path']),
         })
 
-    logger.info(f'Precipitation step done -- {len(metadata_rows)} metadata rows')
+    logger.info(f'Precipitation step done, {len(metadata_rows)} metadata rows')
     return metadata_rows
 
 

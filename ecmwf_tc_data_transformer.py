@@ -28,21 +28,18 @@ References:
 import math
 import os
 import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Union
-from datetime import datetime
+from typing import Dict, Optional, Union
 import re
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon, Point
+from shapely.geometry import Polygon, MultiPolygon
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # Configuration
 DEFAULT_OUTPUT_DIR = "tc_data"
-DEFAULT_CSV_SUFFIX = "_transformed.csv"
 
 
 def validate_raw_data(df: pd.DataFrame) -> bool:
@@ -246,7 +243,7 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
         # quadrant's combined wind radius to span more than 360 deg of
         # longitude (over 20,000km), physically impossible for any real
         # storm. Reaching this branch indicates a real data anomaly
-        # upstream (e.g. a unit-conversion bug feeding an absurd radius
+        # upstream (e.g. a unit-conversion error feeding an absurd radius
         # value) rather than a legitimate antimeridian crossing, the
         # single-sided branch below only ever handles one edge, so
         # silently taking it here would truncate the unhandled side's
@@ -254,7 +251,7 @@ def wind_quadrant_polygon(lat: float, lon: float, r_ne: float, r_se: float, r_sw
         # matching this function's own existing "invalid input -> None"
         # convention above.
         print(
-            f"  WARNING: wind_quadrant_polygon: lat={lat}, lon={lon} -- "
+            f"  WARNING: wind_quadrant_polygon: lat={lat}, lon={lon}, "
             f"computed quadrant bounds overflow BOTH antimeridian edges "
             f"(lon_min={lon_min:.2f}, lon_max={lon_max:.2f}), implying an "
             f"implausible >360 deg-wide wind radius. Returning None rather "
@@ -606,8 +603,8 @@ def transform_tc_data(raw_csv_path: str,
         # reported wind speed at this forecast point never reaches that
         # threshold. WIND_SPEED_KNOTS is the storm's peak sustained wind
         # anywhere at this instant, so a nonzero quadrant radius for a
-        # HIGHER threshold is physically impossible: confirmed as a real,
-        # live data-quality bug against production data (e.g. a row
+        # HIGHER threshold is physically impossible: seen in real
+        # production data (e.g. a row
         # reporting wind_speed_knots=29.9 alongside a 34kt-wind radius up
         # to 272km). The raw BUFR wind-radii fields are extracted
         # independently of the storm's own peak-wind field, so nothing
@@ -751,69 +748,6 @@ def transform_tc_data(raw_csv_path: str,
             'csv_file': None,
             'records': 0
         }
-
-
-def transform_all_in_directory(input_dir: str,
-                               output_dir: str = "tc_data_transformed",
-                               verbose: bool = True) -> Dict[str, int]:
-    """
-    Transform all CSV files in a directory.
-
-    Args:
-        input_dir (str): Directory containing raw CSVs (required)
-        output_dir (str): Directory to save transformed CSVs (default: "tc_data_transformed")
-        verbose (bool): Whether to print detailed progress information (default: True)
-
-    Returns:
-        dict: Summary with 'transformed' and 'failed' counts
-    """
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-
-    # Find all CSV files
-    csv_files = [f for f in input_path.glob("*.csv") if f.name != "SUMMARY.csv"]
-
-    if not csv_files:
-        if verbose:
-            print(f"No CSV files found in {input_dir}")
-        return {'transformed': 0, 'failed': 0}
-
-    if verbose:
-        print(f"Found {len(csv_files)} CSV files to transform")
-
-    transformed_files = []
-    total_transformed = 0
-    total_failed = 0
-
-    for csv_file in csv_files:
-        try:
-            # Generate output base (no extension): transform_tc_data appends _transformed.csv
-            output_base = output_path / csv_file.stem
-
-            # Transform
-            result = transform_tc_data(str(csv_file), str(output_base), verbose=False)
-            if result['success']:
-                transformed_files.append(Path(f"{output_base}_transformed.csv"))
-                total_transformed += 1
-            else:
-                total_failed += 1
-
-        except Exception as e:
-            if verbose:
-                print(f"Error transforming {csv_file.name}: {e}")
-            total_failed += 1
-
-    # Summary
-    if verbose:
-        print("=" * 50)
-        print(f"Transformation Complete")
-        print("=" * 50)
-        print(f"Successfully transformed: {total_transformed} files")
-        print(f"Failed transformations: {total_failed} files")
-        print(f"Output directory: {output_dir}")
-
-    return {'transformed': total_transformed, 'failed': total_failed}
 
 
 def transform_tc_data_from_file(filename: str,

@@ -8,7 +8,7 @@ cheap because `load_wind_data_all_members()`/`load_gust_data_all_members()`
 materialize the full ensemble wind-speed field into RAM before it gets
 reduced to threshold-contour polygons and discarded. This module persists
 that same, already-loaded array instead of throwing it away. Additive
-only, the existing polygon output/pipeline is completely unchanged by this.
+only.
 
 Not currently consumed downstream. DATAPIPELINE's own impact-computation
 rewrite instead rasterizes the already-precise threshold-contour polygons on
@@ -50,7 +50,7 @@ def _affine_from_pixel_centers(lat_values: np.ndarray, lon_values: np.ndarray):
         load_wind_data_all_members()), so this is expected to be True in
         practice, but checked explicitly rather than assumed, since silently
         writing a vertically-flipped raster would be a real, hard-to-notice
-        correctness bug for every downstream consumer.
+        incorrect output for every downstream consumer.
 
     Guards against a single-gridpoint-wide dimension (`len(...) == 1`), which
     would otherwise raise `IndexError` on the `values[1]` access below. This

@@ -3,23 +3,23 @@
 Blob -> Snowflake table loader.
 
 The per-cycle pipeline (main.py / glofas_pipeline.py, DATA_PIPELINE_DB=BLOB) writes tracks/
-envelope CSVs and the raw discharge/extent Zarr/Parquet files to Blob, but deliberately opens
-no Snowflake connection at all in that mode for the pipeline's own data writes. That's what
-makes BLOB mode genuinely independent of Snowflake for the write side. TC_TRACKS/
+envelope CSVs and the raw discharge/extent Zarr/Parquet files to Blob, and opens a Snowflake
+connection in that mode only when Snowflake credentials are configured (best-effort syncs and
+pointer-row writes), so the Blob writes themselves never depend on Snowflake. TC_TRACKS/
 TC_ENVELOPES_COMBINED/RIVER_FORECASTS themselves are still real Snowflake tables, though, and
 this script is what loads Blob-resident data into them: list what's in Blob, download each file
 to a temp local path, and call the SAME load_csv_to_snowflake()/
 load_riverine_metadata_to_snowflake() functions the per-cycle pipeline already uses in
-SNOWFLAKE mode, unchanged.
+SNOWFLAKE mode.
 
 load_tracks_envelopes_from_blob() (tracks/envelopes only, not RIVER_FORECASTS) is called two
-ways, an immediate signal plus a periodic catch-up:
+ways, an immediate signal plus a manual catch-up:
   - Directly, in-process, from main.py's own step7_load() BLOB branch, immediately after that
     same run's Blob upload succeeds, with the exact blob_paths of the files just uploaded,
     the tightest possible coupling, so a new cycle's Snowflake copy exists the moment the cycle
     itself lands in Blob.
-  - Via this module's CLI (below), on its own schedule (`.github/workflows/
-    sync-tracks-to-snowflake.yml`), with no blob_paths filter, scoped instead to files modified
+  - Via this module's CLI (below), run manually or through the manual-dispatch workflow
+    (`.github/workflows/sync-tracks-to-snowflake.yml`), with no blob_paths filter, scoped instead to files modified
     within a recent time window (see --since-hours below), the safety net for a cycle whose
     in-process sync above was skipped (no Snowflake creds available to that run) or failed
     mid-way through an otherwise-successful pipeline run.
@@ -30,7 +30,8 @@ Two real Snowflake table families, each with a different metadata shape:
     envelopes/ at the container root, table_type inferred from filename exactly like
     main.py's own step7_load() SNOWFLAKE branch already does.
   - RIVER_FORECASTS: not a per-file table, a pointer table. The actual discharge/extent
-    Zarr/Parquet files already live in Blob under glofas/<date>/; this reconstructs the same
+    Zarr/Parquet files already live in Blob under glofas/<date>/ (only
+    river_extent_rp{N}_bymask_<date>.parquet extent files are registered); this reconstructs the same
     metadata rows (forecast_time, param, stage_path, is_standin) that glofas_pipeline.py's own
     SNOWFLAKE-mode run would have built from the pipeline's own return values, purely from the
     date and the real filenames already present in Blob.
@@ -43,8 +44,8 @@ always safe to do against real production Blob data.
 Usage:
     python github_actions/blob_to_snowflake_loader.py --tracks-envelopes           # dry run
     python github_actions/blob_to_snowflake_loader.py --tracks-envelopes --execute # real load
-    # Periodic safety net (sync-tracks-to-snowflake.yml): bounded to recent files only,
-    # so a frequent scheduled run doesn't re-list/re-download/re-MERGE the whole container.
+    # Manual safety net (sync-tracks-to-snowflake.yml): bounded to recent files only,
+    # so a repeated run doesn't re-list/re-download/re-MERGE the whole container.
     python github_actions/blob_to_snowflake_loader.py --tracks-envelopes --since-hours 3 --execute
     python github_actions/blob_to_snowflake_loader.py --river-forecasts --date 2026-09-02
     python github_actions/blob_to_snowflake_loader.py --river-forecasts --date 2026-09-02 --execute
@@ -77,8 +78,7 @@ _ENVELOPE_TABLE_RULES = [
     ('combined', 'TC_ENVELOPES_COMBINED'),
 ]
 
-# Mirrors glofas_extent_masking.py's own EXTENT_RP_LEVELS/IS_STANDIN.
-_EXTENT_RP_LEVELS = ["2.0", "5.0", "10.0", "20.0", "50.0", "100.0"]
+# Mirrors glofas_extent_masking.py's own IS_STANDIN.
 _IS_STANDIN = {"2.0": True, "5.0": True, "10.0": False, "20.0": False, "50.0": False, "100.0": False}
 
 
@@ -123,7 +123,7 @@ def load_tracks_envelopes_from_blob(account_url: str, sas_token: str, container:
                                      since_hours: Optional[float] = None) -> dict:
     """
     Loads tracks/ and envelopes/ CSVs from Blob into the real Snowflake tables, via the
-    existing, unchanged load_csv_to_snowflake().
+    existing load_csv_to_snowflake().
 
     Args:
         blob_paths: explicit list of blob paths to load, e.g. from one specific forecast
@@ -136,12 +136,12 @@ def load_tracks_envelopes_from_blob(account_url: str, sas_token: str, container:
         execute: real Snowflake writes only happen when this is True. False (default) only
             lists what would be loaded and returns without downloading or connecting.
         since_hours: only consulted when blob_paths is None. Restricts the listing to blobs
-            whose last_modified is within the last since_hours hours, so a frequent periodic
+            whose last_modified is within the last since_hours hours, so a repeated
             caller (see sync-tracks-to-snowflake.yml) re-checks only recently-landed cycles
             instead of every file ever uploaded under tracks/envelopes. The container has
             no lifecycle deletion, so an unbounded listing only grows over a season and would
             otherwise re-MERGE the entire history on every run. None (default) means no time
-            filter, appropriate for a one-off manual catch-up but not for a scheduled job.
+            filter, appropriate for a one-off manual catch-up but not for a recurring run.
 
     Returns:
         {'planned': [...], 'loaded': [...], 'skipped': [...], 'errors': [...]}
@@ -197,7 +197,7 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
     """
     Reconstructs RIVER_FORECASTS metadata rows for one forecast date purely from the real
     filenames already present in Blob under glofas/<date_str>/, then loads them via the
-    existing, unchanged load_riverine_metadata_to_snowflake().
+    existing load_riverine_metadata_to_snowflake().
 
     Args:
         date_str: 'YYYYMMDD', matching glofas_downloader.py's own date_str convention.
@@ -213,7 +213,6 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
 
     metadata_rows = []
     discharge_re = re.compile(rf'^river_{date_str}\.zarr\.zip$')
-    extent_re = re.compile(rf'^river_extent_rp(\d+(?:\.\d+)?)_bymember_{date_str}\.parquet$')
     bymask_re = re.compile(rf'^river_extent_rp(\d+(?:\.\d+)?)_bymask_{date_str}\.parquet$')
 
     for blob_path in blob_paths:
@@ -221,9 +220,9 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
         if discharge_re.match(name):
             metadata_rows.append({'forecast_time': date_str, 'param': 'dis24', 'stage_path': blob_path})
             continue
-        mb = bymask_re.match(name)
-        if mb:
-            rp = mb.group(1)
+        m = bymask_re.match(name)
+        if m:
+            rp = m.group(1)
             rp_key = rp if rp in _IS_STANDIN else f'{rp}.0'
             metadata_rows.append({
                 'forecast_time': date_str,
@@ -232,16 +231,6 @@ def load_river_forecasts_from_blob(account_url: str, sas_token: str, container: 
                 'stage_path': blob_path,
             })
             continue
-        m = extent_re.match(name)
-        if m:
-            rp = m.group(1)
-            rp_key = rp if rp in _IS_STANDIN else f'{rp}.0'
-            metadata_rows.append({
-                'forecast_time': date_str,
-                'param': f'extent_rp{int(float(rp))}_bymember',
-                'is_standin': _IS_STANDIN.get(rp_key),
-                'stage_path': blob_path,
-            })
 
     result = {'planned': metadata_rows, 'loaded_rows': 0, 'error': None}
 
@@ -276,7 +265,7 @@ def main():
     parser.add_argument('--date', help='YYYY-MM-DD, required for --river-forecasts')
     parser.add_argument('--since-hours', type=float, default=None,
                          help='With --tracks-envelopes, only consider blobs modified within the last '
-                              'N hours (bounds cost for a frequent periodic run). Omit for a one-off '
+                              'N hours (bounds cost for a repeated run). Omit for a one-off '
                               'catch-up over everything currently in Blob.')
     parser.add_argument('--execute', action='store_true',
                          help='Actually write to Snowflake. Without this, only lists what would happen.')

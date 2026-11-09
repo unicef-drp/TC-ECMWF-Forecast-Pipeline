@@ -2,7 +2,7 @@
 """
 GitHub Actions entry point: sequential pipeline execution with password auth.
 
-Orchestrates steps 1–7 from pipeline_core, then loads the results to Snowflake
+Orchestrates steps 1 to 7 from pipeline_core, then loads the results to Snowflake
 using the github_actions/snowflake_loader (password-based connection).
 """
 
@@ -86,9 +86,10 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
         # Immediately below, the same files just uploaded are also synced into
         # TC_TRACKS/TC_ENVELOPES_COMBINED/TC_ENVELOPES_INDIVIDUAL/TC_GUST_ENVELOPES_*
         # via load_tracks_envelopes_from_blob() (blob_to_snowflake_loader.py), which
-        # MERGEs them using the same load_csv_to_snowflake() the legacy SNOWFLAKE
-        # branch below already uses. A separate periodic workflow
-        # (sync-tracks-to-snowflake.yml) is the safety net for a cycle whose sync
+        # MERGEs them using the same load_csv_to_snowflake() the SNOWFLAKE
+        # branch below uses. The
+        # SYNC_TRACKS_ENVELOPES_TASK Snowflake task (or a manual dispatch of
+        # sync-tracks-to-snowflake.yml) is the safety net for a cycle whose sync
         # step here is skipped (no Snowflake creds) or fails mid-run.
         logger.info("DATA_PIPELINE_DB=BLOB. Uploading CSVs to Blob, then syncing TC_TRACKS/TC_ENVELOPES_* below")
         from ecmwf_met_downloader import upload_to_blob
@@ -134,7 +135,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             error_msg = f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) uploaded to Blob successfully"
             logger.warning(error_msg)  # warning, not error: additive output, must not fail an otherwise-successful run
         elif raster_files:
-            logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Blob (wind_raster//gust_raster/)")
+            logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Blob (wind_raster/ and gust_raster/)")
         stats.files_loaded = uploaded + raster_uploaded
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -149,18 +150,18 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
         # windgust job queries to discover new storms (existence/candidate-country
         # check only, not the detailed geometry, which already reads correctly from
         # Blob) and the dashboard reads TC_TRACKS/TC_ENVELOPES_COMBINED directly from
-        # Snowflake for map rendering, and both depended, until this, entirely on the
-        # separate legacy SNOWFLAKE-mode workflow keeping these tables fresh in
-        # parallel. Loads via load_tracks_envelopes_from_blob() (blob_to_snowflake_
-        # loader.py), which calls the SAME, unchanged load_csv_to_snowflake() the
-        # legacy SNOWFLAKE-mode branch below already uses, scoped to exactly the
+        # Snowflake for map rendering. This step keeps those tables fresh so neither
+        # depends on the SNOWFLAKE-mode workflow. Loads via load_tracks_envelopes_from_blob()
+        # (blob_to_snowflake_loader.py), which calls the same load_csv_to_snowflake() the
+        # SNOWFLAKE-mode branch below uses, scoped to exactly the
         # files uploaded above (not a broader Blob listing) so this step's cost
         # tracks this run's own output size, not the full container.
         # Best-effort and never fatal to this otherwise-successful Blob upload, same
         # reasoning as the MET_FORECASTS pointer-row write below: a credential-less
-        # BLOB-only deployment logs a warning and skips it. The periodic
-        # sync-tracks-to-snowflake.yml workflow (see that workflow's own header
-        # comment) is the safety net that catches a skipped or failed sync here.
+        # BLOB-only deployment logs a warning and skips it. The
+        # SYNC_TRACKS_ENVELOPES_TASK Snowflake task (or a manual dispatch of
+        # sync-tracks-to-snowflake.yml, see that workflow's own header comment)
+        # is the safety net that catches a skipped or failed sync here.
         if uploaded_blob_paths:
             have_snowflake_creds = all([
                 config.sf_account, config.sf_user, config.sf_password,
@@ -208,18 +209,17 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                 logger.warning(
                     "No Snowflake credentials configured. TC_TRACKS/TC_ENVELOPES_* not "
                     "synced from this run's Blob upload; the tracks/envelopes CSVs are safely "
-                    "in Blob, relying on the periodic sync-tracks-to-snowflake.yml safety net "
-                    "(or the separate legacy SNOWFLAKE-mode workflow) to catch up later"
+                    "in Blob, relying on the SYNC_TRACKS_ENVELOPES_TASK Snowflake task "
+                    "(or a manual sync-tracks-to-snowflake.yml dispatch) to catch up later"
                 )
 
         # MET_FORECASTS pointer rows: unlike tracks/envelopes (synced directly into
-        # their real data tables just above), MET_FORECASTS is a pointer table --
+        # their real data tables just above), MET_FORECASTS is a pointer table,
         # a real Snowflake table that anything downstream queries to find where a
         # forecast cycle's precip/runoff Zarr actually lives. step6_download_precip
         # already uploads the Zarr itself to Blob and builds precip_metadata with the
-        # real Blob stage_path regardless of mode; this was previously never written
-        # here, so the file existed in Blob with nothing in Snowflake ever pointing at
-        # it. Best-effort and never fatal to this otherwise-successful Blob upload: a
+        # real Blob stage_path regardless of mode; the row written here is the pointer
+        # that lets Snowflake reference the Blob file. Best-effort and never fatal to this otherwise-successful Blob upload: a
         # mixed-mode deployment (real Snowflake creds configured alongside Blob, the
         # case in this repo's actual .env) writes it for real; a genuinely
         # credential-less BLOB-only deployment logs a warning and skips it, matching
@@ -311,11 +311,10 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             if precip_metadata:
                 total_rows += load_precip_metadata_to_snowflake(precip_metadata, conn)
 
-            # Wind/gust rasters. SNOWFLAKE mode had no generic binary-file-to-stage
-            # upload path in this function until now. Reuses upload_to_snowflake_stage() (already used
+            # Wind/gust rasters. Reuses upload_to_snowflake_stage() (also used
             # for precip's own Zarr uploads elsewhere in this pipeline, ecmwf_met_
             # downloader.py), a real PUT to config.snowflake_stage_name, same
-            # wind_raster//gust_raster/ prefix convention as the BLOB branch above
+            # wind_raster/ and gust_raster/ prefix convention as the BLOB branch above
             # (derived from the filename's own `{dataset_label}_raster_` token). No
             # Snowflake pointer-table row: same reasoning as BLOB mode, these files
             # are cleanly file-per-(storm, forecast_time, lead_time) and
@@ -336,7 +335,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
                                     f"uploaded to Snowflake stage successfully")
                 else:
                     logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Snowflake stage "
-                                f"(wind_raster//gust_raster/)")
+                                f"(wind_raster/ and gust_raster/)")
             elif raster_files:
                 logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust raster(s) not "
                                 "uploaded to Snowflake stage")
@@ -364,8 +363,7 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             try:
                 # TC_TRACKS/TC_ENVELOPES_* are the core wind/gust discovery
                 # and dashboard rendering input, so a failure reading their
-                # own counts stays a hard error (matches this block's
-                # original behavior). Only the newer gust/precip tables get
+                # own counts stays a hard error. Only the newer gust/precip tables get
                 # the fault-tolerant treatment.
                 cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
                 tracks_count = cursor.fetchone()[0]

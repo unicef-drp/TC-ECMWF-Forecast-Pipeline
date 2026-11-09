@@ -29,15 +29,12 @@ import logging
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     get_bounding_box,
-    get_longitude_windows,
     merge_contour_dicts,
-    load_wind_data,
     load_wind_data_all_members,
     create_wind_threshold_contours,
     polygon_to_wkt,
@@ -146,10 +143,10 @@ def _synthesize_rows_by_lead(
 ) -> Dict[int, List[Dict]]:
     """
     Build the {lead_time: [row, ...]} structure the lead-time processing loops
-    expect, one synthetic row per (lead_time, member) pair -- computing
+    expect, one synthetic row per (lead_time, member) pair, computing
     valid_time arithmetically (run_forecast_time + lead_time) instead of
-    reading it from a track CSV row, since wind lead times are no longer
-    guaranteed to have a matching track row (see _wind_lead_times_for_run).
+    reading it from a track CSV row, since wind lead times need not
+    have a matching track row (see _wind_lead_times_for_run).
     Only 'ensemble_member', 'forecast_time', and 'valid_time' are read from
     these rows downstream.
     """
@@ -233,73 +230,6 @@ def load_tc_track_data(track_csv: str) -> pd.DataFrame:
     return df
 
 
-def find_wind_file_for_time(valid_time: datetime, lead_time: int, wind_files: List[Path], ensemble_member: int, forecast_time: Optional[datetime] = None) -> Optional[Path]:
-    """
-    Find the wind GRIB file that corresponds to a specific valid time and lead time.
-
-    Args:
-        valid_time: Valid time from TC track data
-        lead_time: Lead time in hours from TC track data
-        wind_files: List of available wind GRIB files
-        ensemble_member: Ensemble member number (51 for control, others for perturbed)
-        forecast_time: Forecast issuance time (used to match run hour).
-                       If None, derived from valid_time - lead_time.
-
-    Returns:
-        Path to matching wind file or None
-    """
-    if forecast_time is None:
-        forecast_time = valid_time - pd.Timedelta(hours=lead_time)
-    return _match_wind_file(forecast_time, lead_time, ensemble_member, wind_files)
-
-
-def extract_wind_polygons_for_time_step(
-    wind_file: Path,
-    bbox: Dict[str, float],
-    ensemble_member: int,
-    indexpath: Optional[str] = None
-) -> Dict[int, Optional[str]]:
-    """
-    Extract wind polygons for a specific time step and ensemble member.
-
-    Args:
-        wind_file: Path to wind GRIB file
-        bbox: Bounding box for wind extraction
-        ensemble_member: Ensemble member number
-        indexpath: Optional directory path for GRIB index files (.idx).
-                   If provided, index files will be stored here instead
-                   of alongside the GRIB file. Useful for parallel processing
-                   to avoid concurrent index file conflicts.
-
-    Returns:
-        Dictionary mapping wind thresholds to WKT polygons
-    """
-    try:
-        # Load wind data for this member and region with optional index path
-        # one window in the common case, two when bbox straddles the
-        # antimeridian (see get_longitude_windows)
-        wind_regions = load_wind_data(str(wind_file), ensemble_member, bbox, verbose=False, indexpath=indexpath)
-
-        # Create contours per window, then merge (a single-window input
-        # merges to that one dict unchanged, see merge_contour_dicts)
-        sub_contours = [
-            create_wind_threshold_contours(region, WIND_THRESHOLDS, verbose=False)
-            for region in wind_regions
-        ]
-        contours = merge_contour_dicts(sub_contours)
-
-        # Convert to WKT format
-        wkt_polygons = {}
-        for threshold, polygon in contours.items():
-            wkt_polygons[threshold] = polygon_to_wkt(polygon)
-
-        return wkt_polygons
-
-    except Exception as e:
-        logger.warning(f"Error extracting wind polygons for member {ensemble_member}: {e}")
-        return {}
-
-
 def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Optional[str]]]:
     """
     Extract wind threshold polygons for every ensemble member from one or
@@ -307,7 +237,7 @@ def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Opti
 
     Args:
         wind_data_windows: List[xr.DataArray] from load_wind_data_all_members:
-            length 1 (bbox clipped exactly as before) for the overwhelming
+            length 1 (bbox clipped to the single window) for the overwhelming
             majority of storms, length 2 only when the storm's bbox straddles
             the antimeridian. Each has dims (number, lat, lon) for PF or
             (lat, lon) for CF.
@@ -316,7 +246,7 @@ def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Opti
         {grib_member_number: {threshold_kt: wkt_string_or_None}}: per-member
         contours are extracted independently within each window, then
         unioned across windows per member/threshold (a length-1 input list
-        is a verified no-op, producing exactly today's output).
+        returns the same output as a single-window run).
     """
     # per_window[i] = {grib_member_number: {threshold_kt: Polygon_or_None}}
     per_window: List[Dict[int, Dict[int, Optional[object]]]] = []
@@ -336,7 +266,7 @@ def _extract_polygons_all_members(wind_data_windows) -> Dict[int, Dict[int, Opti
 
     if len(per_window) == 1:
         # No antimeridian split: return polygons->wkt directly, identical
-        # to the original single-window behavior.
+        # to the single-window result.
         return {
             member: {kt: polygon_to_wkt(p) for kt, p in contours.items()}
             for member, contours in per_window[0].items()
@@ -547,10 +477,8 @@ def _process_lead_time_worker(args: Tuple) -> Tuple[List[Dict], str]:
 
     Loads the PF file (covers all 50 perturbed members) and the CF file
     (control member) once each for this lead time, matching the sequential
-    path's one-GRIB-open-per-timestep design. The earlier per-track-point
-    worker submitted one task per (member, lead_time) pair and re-opened the
-    same PF/CF file once per member, doing roughly 25x more GRIB decompression
-    work than necessary, since one PF file already contains all 50 members.
+    path's one-GRIB-open-per-timestep design: one PF file already contains
+    all 50 members.
 
     Also persists the wind-speed raster for this lead time directly from
     this worker process to the shared output_dir. Safe: each lead time's
@@ -575,7 +503,6 @@ def _process_lead_time_worker(args: Tuple) -> Tuple[List[Dict], str]:
 
     try:
         sample = rows_at_lead[0]
-        valid_time = sample['valid_time']
         forecast_time = sample.get('forecast_time') if has_forecast_time else None
         ft_suffix = None
         if forecast_time is not None:
@@ -597,13 +524,9 @@ def _process_lead_time_worker(args: Tuple) -> Tuple[List[Dict], str]:
             except Exception as e:
                 return [], f"Error loading PF wind at lead {lead_time}h: {e}\n{traceback.format_exc()}"
             # Own try/except, deliberately separate from the polygon-extraction one
-            # above. Sharing one try/except meant a raster-save failure here (even though
-            # _save_wind_rasters_for_lead_time() is itself verified exception-safe
-            # today) would have discarded pf_results and returned early with a
-            # misleading "Error loading PF wind" message, losing the real,
-            # already-successfully-extracted polygon output for this lead time.
-            # Raster output must never be able to take the real polygon output
-            # down with it.
+            # above, so a raster-save failure cannot discard pf_results or surface as
+            # a misleading "Error loading PF wind" message. Raster output must
+            # never be able to take the real polygon output down with it.
             if publish_raster:
                 try:
                     _save_wind_rasters_for_lead_time(pf_wind, output_dir, storm_name, ft_suffix, lead_time, 'pf')
@@ -721,10 +644,10 @@ def analyze_required_forecast_hours(tc_data_dir: Path, verbose: bool = True) -> 
             if uncapped_hour > 144:
                 logger.warning(
                     f"Track data needs wind coverage out to {uncapped_hour}h, but ECMWF's "
-                    f"0.25deg operational ENS wind fields are only published to 144h -- wind "
+                    f"0.25deg operational ENS wind fields are only published to 144h, wind "
                     f"envelope coverage for this storm will have NO data for lead times "
                     f"{150}h through {uncapped_hour}h. This is a hard upstream "
-                    f"data-availability limit, not a bug; the storm's own track/position "
+                    f"data-availability limit; the storm's own track/position "
                     f"forecast is unaffected, only wind-hazard coverage beyond 144h."
                 )
 
@@ -762,10 +685,10 @@ def process_wind_combination(
         wind_data_dir: Directory containing wind GRIB files
         output_dir: Directory to save envelope CSV files
         buffer_radius_km: Buffer radius around TC tracks in km
-        max_ensemble_members: Maximum number of ensemble members to process (for testing)
+        max_ensemble_members: Maximum number of ensemble members to process
         verbose: Whether to print detailed progress
         use_process_pool: If True, use ProcessPoolExecutor for concurrent track point processing.
-                         Default: False (sequential processing for backward compatibility)
+                         Default: False (sequential processing)
         max_workers: Number of concurrent workers (only used if use_process_pool=True)
 
     Returns:
@@ -1026,7 +949,7 @@ def process_wind_combination(
                         logger.warning(
                             f"  Member count mismatch for {storm_name}: "
                             f"expected {max_ensemble_members}, got {actual_members} "
-                            f"({missing} member(s) missing -- check GRIB files)"
+                            f"({missing} member(s) missing, check GRIB files)"
                         )
 
                     total_envelope_records += len(combined_records)

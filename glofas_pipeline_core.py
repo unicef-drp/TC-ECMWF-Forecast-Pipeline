@@ -27,7 +27,6 @@ from glofas_downloader import (
     blob_file_exists,
     EXTENT_RP_LEVELS,
 )
-import glofas_extent_masking
 from glofas_extent_masking import run_glofas_extent_masking, EXTENT_STAGE_PREFIX, IS_STANDIN, bymask_filename
 
 logger = logging.getLogger(__name__)
@@ -61,7 +60,9 @@ class BaseGlofasConfig:
 
         self.glofas_data_dir = os.getenv('GLOFAS_DATA_DIR', 'glofas_data')
 
-        # RP thresholds and the JRC cache both default to following DATA_PIPELINE_DB,
+        # RP thresholds (optionally pre-populated by setup_glofas_thresholds.py, otherwise
+        # fetched from ECMWF on first use and cached) and the JRC cache both default to
+        # following DATA_PIPELINE_DB,
         # same as the per-cycle discharge/extent output: BLOB means only Blob,
         # SNOWFLAKE means only Snowflake, LOCAL means only local, with no implicit
         # cross-mode dependency. Each can still be overridden independently (e.g. Blob
@@ -142,7 +143,7 @@ class BaseGlofasConfig:
             return False
 
         # Gated on glofas_extent_enabled, matching needs_snowflake_creds()'s own
-        # gating of this same field two lines below: an unused/blank/invalid
+        # gating of this same field above in this class: an unused/blank/invalid
         # GLOFAS_JRC_SOURCE left over from before extent masking was enabled
         # (or before setup_jrc_extents.py has ever been run, exactly the state
         # sample_env.txt documents GLOFAS_EXTENT_ENABLED=false for) must not
@@ -170,7 +171,7 @@ class BaseGlofasConfig:
         if not self.needs_snowflake_creds():
             logger.info("No Snowflake-sourced path is configured (DATA_PIPELINE_DB, "
                         "GLOFAS_THRESHOLD_SOURCE, and GLOFAS_JRC_SOURCE are all 'local'/'blob', "
-                        "or extent masking is disabled) -- Snowflake credentials not required")
+                        "or extent masking is disabled): Snowflake credentials not required")
             return True
 
         missing = [var for var, val in (
@@ -189,11 +190,9 @@ class BaseGlofasConfig:
         # 'snowflake', or (extent_enabled and glofas_jrc_source=='snowflake') is
         # true, so snowflake_stage_name is required for all of them, not just the
         # data_pipeline_db=='SNOWFLAKE' case. Deliberately NOT gated on
-        # data_pipeline_db != 'BLOB' (an earlier version of this check was, which
-        # was itself a bug: data_pipeline_db=='BLOB' with threshold_source or
-        # jrc_source still 'snowflake', a legitimate mixed-mode config, would
-        # have silently skipped this requirement and failed later, mid-run,
-        # instead of at startup). A GLOFAS_MODE=submit-only config with
+        # data_pipeline_db != 'BLOB': data_pipeline_db=='BLOB' with threshold_source or
+        # jrc_source still 'snowflake' is a legitimate mixed-mode config and must
+        # fail at startup, not mid-run. A GLOFAS_MODE=submit-only config with
         # everything local/blob correctly does NOT require a stage name, since
         # _needs_stage_operations() would be False for it, this whole block
         # never fires.
@@ -210,7 +209,7 @@ def _glofas_already_downloaded(config: BaseGlofasConfig, forecast_date: datetime
                                 snowflake_conn=None) -> Optional[datetime]:
     """
     Returns forecast_date if forecast_date's own raw discharge Zarr already
-    exists locally or on the Snowflake stage; None otherwise.
+    exists locally, on the Snowflake stage, or in Blob; None otherwise.
 
     Guards GLOFAS_MODE=submit against firing a redundant, wasted pair of CDS
     requests when its own scheduled trigger runs late (GitHub Actions gives no
@@ -266,7 +265,7 @@ def run_glofas_submit_pipeline(config: BaseGlofasConfig, snowflake_conn=None) ->
 
     Returns None if GloFAS wasn't available within the publication-lag window
     (already logged by submit_glofas_requests() itself), the entry point should
-    treat that exactly like a failed run of the original blocking path.
+    treat that exactly like a failed run of the blocking path.
     """
     forecast_date_str = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
     forecast_date = datetime.strptime(forecast_date_str, '%Y-%m-%d')
@@ -274,7 +273,7 @@ def run_glofas_submit_pipeline(config: BaseGlofasConfig, snowflake_conn=None) ->
 
     already = _glofas_already_downloaded(config, forecast_date, snowflake_conn)
     if already is not None:
-        logger.info(f"  {already.strftime('%Y-%m-%d')} already fully downloaded/staged -- "
+        logger.info(f"  {already.strftime('%Y-%m-%d')} already fully downloaded/staged: "
                     f"skipping submission (this trigger likely ran after the process trigger's "
                     f"own fallback had already completed the day)")
         return {"actual_date": already, "requests": {}}
@@ -292,8 +291,8 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
     pre_submitted: optional {'actual_date', 'requests'} from a prior submit step
     (GLOFAS_MODE=process resuming via each entry point's own
     load_cds_request_ids()), forwarded to download_glofas_forecast() to resume
-    waiting on those requests instead of submitting fresh. None (default): behaves
-    exactly as before, submits fresh and blocks through the full wait.
+    waiting on those requests instead of submitting fresh. None (default): submits
+    fresh and blocks through the full wait.
     """
     forecast_date = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
     logger.info(f"Forecast date: {forecast_date}")
@@ -328,13 +327,12 @@ def run_glofas_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
 
 def _already_computed_extent_tiers(config: BaseGlofasConfig, snowflake_conn, date_str: str) -> Optional[List[Dict]]:
     """
-    Checks whether every EXTENT_RP_LEVELS tier's parquet files already exist on the remote
-    store (Blob or Snowflake stage, matching config.data_pipeline_db) for this date: the
-    per-member file, and also the compact bitmask file while its generation is enabled.
-    Returns lightweight {rp, is_standin, stage_path, bymask_stage_path} dicts ready for
-    metadata registration if every tier is complete, or None if any file is missing (real
-    masking still needs to run, which rewrites both files for every tier) or the check itself
-    can't be done (fails open toward running real masking, never toward silently skipping it).
+    Checks whether every EXTENT_RP_LEVELS tier's compact bitmask parquet file already exists
+    on the remote store (Blob or Snowflake stage, matching config.data_pipeline_db) for this
+    date. Returns lightweight {rp, is_standin, bymask_stage_path} dicts ready for metadata
+    registration if every tier is complete, or None if any file is missing (real masking still
+    needs to run) or the check itself can't be done (fails open toward running real masking,
+    never toward silently skipping it).
     """
     try:
         def exists_remote(stage_path):
@@ -348,16 +346,10 @@ def _already_computed_extent_tiers(config: BaseGlofasConfig, snowflake_conn, dat
         found = []
         for rp in EXTENT_RP_LEVELS:
             rp_int = int(float(rp))
-            stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/river_extent_rp{rp_int}_bymember_{date_str}.parquet"
-            if not exists_remote(stage_path):
+            bymask_stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{bymask_filename(rp_int, date_str)}"
+            if not exists_remote(bymask_stage_path):
                 return None
-            bymask_stage_path = None
-            if glofas_extent_masking.EXTENT_BYMASK_ENABLED:
-                bymask_stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{bymask_filename(rp_int, date_str)}"
-                if not exists_remote(bymask_stage_path):
-                    return None
-            found.append({"rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path,
-                          "bymask_stage_path": bymask_stage_path})
+            found.append({"rp": rp, "is_standin": IS_STANDIN[rp], "bymask_stage_path": bymask_stage_path})
         return found
     except Exception as e:
         logger.warning(f"Could not check for already-computed extent tiers, running real masking instead: {e}")
@@ -370,33 +362,41 @@ def run_glofas_extent_pipeline(config: BaseGlofasConfig, snowflake_conn=None,
     Shared orchestration for the GloFAS x JRC extent-masking step, called
     right after run_glofas_pipeline() succeeds, in the same daily run, using
     the sparse cell set that step just built (discharge_result['zip_path']).
+
+    Returns the per-tier dicts for tiers produced, as an ExtentResults list that
+    carries `.failed_tiers`. A tier whose compact write, member-limit check
+    (member ids 1..64) or upload fails is skipped and listed in `.failed_tiers`
+    (ERROR logged, no pointer registered, retried on the next run). The
+    already-computed reuse path returns a plain list of {rp, is_standin,
+    bymask_stage_path} without `.failed_tiers`. `bymask_stage_path` is None for a
+    local-only file (no store credentials or upload_to_stage=False), which is not a
+    failure. Returns [] when disabled, when there is no local zip_path, or when the
+    whole step fails.
     """
     if not config.glofas_extent_enabled:
-        logger.info("GLOFAS_EXTENT_ENABLED=false -- skipping extent-masking step")
+        logger.info("GLOFAS_EXTENT_ENABLED=false, skipping extent-masking step")
         return []
 
-    # Same-day idempotency: extent masking is real per-member/per-tier raster work (51
-    # members x 6 RP tiers), meant to run once per real GloFAS publication, not once per
-    # poll. download_glofas_forecast() now materializes a real local zip_path even on a
-    # day-level cache hit (see its own comment for why), so "zip_path is None" can no longer
-    # be relied on as the "already done today" signal the way it used to be, without this
-    # check, every cache-hit poll (3 of the pipeline's 4 daily runs) would recompute and
-    # re-upload all 6 tiers from scratch for no reason. Also self-heals a prior run whose
-    # real masking succeeded (files really on Blob/stage) but whose metadata registration
-    # failed for an unrelated reason (e.g. a transient Snowflake outage): reusing the
-    # existing stage_path still lets the caller register it, without recomputing anything.
+    # Same-day idempotency: extent masking (51 members x 6 RP tiers) runs once per real
+    # GloFAS publication, not once per poll. download_glofas_forecast() returns a real local
+    # zip_path even on a day-level cache hit, so zip_path alone cannot signal "already done
+    # today"; this check does. Reuse applies only when the compact file exists for every
+    # tier, otherwise all tiers are recomputed and re-uploaded. It also covers a run whose
+    # masking succeeded (files on Blob/stage) but whose metadata registration failed (e.g.
+    # a transient Snowflake error): the existing bymask_stage_path is registered without
+    # recomputing.
     forecast_date = (discharge_result or {}).get('forecast_date')
     if forecast_date is not None:
         already = _already_computed_extent_tiers(config, snowflake_conn, forecast_date.strftime("%Y%m%d"))
         if already is not None:
             logger.info(f"All {len(EXTENT_RP_LEVELS)} extent tiers already computed for "
-                        f"{forecast_date.strftime('%Y-%m-%d')} -- reusing existing output instead "
+                        f"{forecast_date.strftime('%Y-%m-%d')}: reusing existing output instead "
                         f"of recomputing")
             return already
 
     if discharge_result is None or not discharge_result.get('zip_path'):
         logger.warning("No local Zarr path from the discharge step (e.g. a stage-only day-cache "
-                        "hit) -- extent masking needs the local sparse cell data, skipping this run")
+                        "hit): extent masking needs the local sparse cell data, skipping this run")
         return []
 
     logger.info(f"JRC source: {config.glofas_jrc_source}")

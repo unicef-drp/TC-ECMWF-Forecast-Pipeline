@@ -1,13 +1,13 @@
 # GitHub Actions Pipeline Environment Variables
-# Copy this file to .env for local testing
+# Copy this file to .env for local runs
 # Note: In GitHub Actions, these are set as GitHub Secrets and workflow environment variables
 
 # ==============================================================================
 # Storage backend: SNOWFLAKE (default), BLOB, or LOCAL
 # ==============================================================================
 # SNOWFLAKE pushes tracks/envelope/met output to Snowflake tables and stage.
-# BLOB uploads the same output to Azure Blob Storage instead, touching no Snowflake
-# table or stage at all. LOCAL keeps files locally and skips the load step entirely.
+# BLOB uploads the same output to Azure Blob Storage instead and needs no Snowflake
+# credentials; if they are present, tracks/envelopes are synced and pointer rows are written. LOCAL keeps files locally and skips the load step entirely.
 # GLOFAS_THRESHOLD_SOURCE/GLOFAS_JRC_SOURCE (see the GloFAS section below) default to
 # this same value.
 DATA_PIPELINE_DB=SNOWFLAKE
@@ -92,7 +92,7 @@ GLOFAS_DATA_DIR=glofas_data
 # input / schedule-selected mode in .github/workflows/glofas.yml.
 GLOFAS_MODE=process
 
-# Where the RP2 threshold file is read from: snowflake, blob, or local (requires
+# Where the RP threshold files are read from: snowflake, blob, or local (requires
 # setup_glofas_thresholds.py --local-only to have been run first). Defaults to
 # DATA_PIPELINE_DB above; set explicitly to use a different source for this static
 # reference file than for the per-cycle output.
