@@ -8,20 +8,19 @@ name: Sync Tracks/Envelopes to Snowflake
 # otherwise-successful pipeline run, so a real forecast cycle's tracks/envelopes are never
 # permanently stuck in Blob with no Snowflake copy.
 #
-# The recurring `on: schedule` cron that used to run this every 30 minutes has been REMOVED:
-# a serverless, stream-triggered Snowflake task (SYNC_TRACKS_ENVELOPES_TASK, calling
+# This workflow runs only on manual dispatch. Periodic syncing is done by a serverless,
+# stream-triggered Snowflake task (SYNC_TRACKS_ENVELOPES_TASK, calling
 # SYNC_TRACKS_ENVELOPES_FROM_BLOB(), see Ahead-of-the-Storm-ORCHESTRATION/09_orchestration/
-# 06_sync_tracks_envelopes_from_blob.sql) now covers this same periodic-safety-net role.
-# It reads new tracks/envelopes files directly from the Blob stage via SQL and MERGEs them
-# on Snowflake-managed serverless compute, checked every 10 minutes at negligible cost when
-# there is nothing new (no 60-second warehouse-resume minimum on every check, unlike this
-# workflow's own plain Snowflake client connection). This workflow is kept as a `workflow_dispatch`-only
-# manual tool: useful for an ad-hoc backfill (e.g. `--since-hours` covering a longer outage
-# window than the Snowflake task's own retry queue would reach) or local debugging against a
-# real Blob container, without needing a live GHA cron to exist for that purpose.
+# 06_sync_tracks_envelopes_from_blob.sql). The task reads new tracks/envelopes files
+# directly from the Blob stage via SQL and MERGEs them on Snowflake-managed serverless
+# compute, checked every 10 minutes at negligible cost when there is nothing new (no
+# 60-second warehouse-resume minimum on every check, unlike this workflow's own plain
+# Snowflake client connection). This workflow is a manual tool: useful for an ad-hoc
+# backfill (e.g. `--since-hours` covering a longer gap than the Snowflake
+# task's own retry queue would reach) or local debugging against a real Blob container.
 #
-# blob_to_snowflake_loader.py's --since-hours/CLI support (added alongside this workflow) is
-# kept as-is, still the mechanism this manual dispatch (and any local debugging) uses.
+# blob_to_snowflake_loader.py's --since-hours/CLI support is the mechanism this manual
+# dispatch (and any local debugging) uses.
 
 on:
   workflow_dispatch:

@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
-from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 # Suppress warnings
@@ -59,12 +59,12 @@ def _unwrap_track_longitudes(track_data: pd.DataFrame) -> pd.DataFrame:
     coordinate space, independently per ensemble member when that column is
     present.
 
-    Fixes the antimeridian-crossing bug: a single member's own track can
+    Handles antimeridian crossings: a single member's own track can
     legitimately jump from just under +180 to just over -180 between
     consecutive lead times as the storm crosses the dateline. Naive min/max
     bounding-box math over the raw values misreads that as a near-global
-    span (e.g. NANGKA 2026-08-12 12Z member 34: 179.1 deg -> -179.5 deg
-    read as a ~359 deg-wide box instead of the true ~1 deg step). Sorting
+    span (e.g. 179.1 deg -> -179.5 deg reads as a ~359 deg-wide box
+    instead of the true ~1 deg step). Sorting
     each member's own points by time and applying np.unwrap(period=360)
     turns that into a continuous, physically correct sequence (179.1 ->
     180.5) with no discontinuity for the union/bounding-box math to trip
@@ -72,8 +72,7 @@ def _unwrap_track_longitudes(track_data: pd.DataFrame) -> pd.DataFrame:
 
     A track with no dateline crossing is returned with 'longitude'
     numerically unchanged: np.unwrap is a no-op whenever no consecutive gap
-    exceeds the wrap period, so this is a verified zero-behavior-change
-    path for the overwhelming majority of real storms.
+    exceeds the wrap period.
 
     This function only feeds the internal buffered-polygon/bounding-box
     computation used to size the GRIB extraction window (see
@@ -116,17 +115,16 @@ def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
     crosses the seam, so per-member np.unwrap never fires for either, but
     the true physical positions are only ~5 deg apart (both hugging the
     dateline from opposite sides), while the raw combined min/max reads as
-    ~353 deg wide. That corrupted-looking bbox is real: it was reproduced
-    directly from this exact scenario during a real council review.
+    ~353 deg wide, a corrupted-looking bbox.
 
     Uses the standard "largest circular gap" method: sort every point's
     longitude, find the widest gap between consecutive values, including
     the wraparound gap (from the highest value back to the lowest value
     + 360). If the wraparound gap is itself the widest, the points are
     genuinely not antimeridian-adjacent as a group, this is the ordinary
-    case (including the already-correct single-member NANGKA-style crossing
-    handled above, which per-member unwrap already leaves as one dense,
-    gap-free cluster) and this function is a verified no-op. If some other
+    case (including a single-member dateline crossing handled above, which
+    per-member unwrap already leaves as one dense, gap-free cluster) and
+    this function is a no-op. If some other
     gap is wider, the true cluster wraps through +/-180 at that gap
     instead, so every value up to and including it gets shifted by +360 to
     make the whole group numerically contiguous.
@@ -134,13 +132,10 @@ def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
     Sanity bound: only applies the shift if doing so actually produces a
     plausibly-sized (<90 deg, matching this project's own established "no
     real single-storm envelope is wider than this" convention used
-    elsewhere) reconciled cluster. A real council review found that,
-    without this bound, the largest-gap method would also fire on
-    genuinely scattered, non-antimeridian data whenever a group's total
-    spread happens to approach 360 deg, confirmed not reachable by any
-    real TC ensemble (tested clean against real, genuinely wide-spread
-    storms), but with no guard to distinguish that from a real upstream
-    data anomaly (e.g. a parsing bug placing one member on the wrong side
+    elsewhere) reconciled cluster. Without this bound the method would also
+    fire on scattered non-antimeridian data whose spread approaches 360
+    deg. No real TC ensemble reaches that, but without a guard the method
+    could not distinguish it from an upstream data anomaly (e.g. a parsing error placing one member on the wrong side
     of the planet).
     """
     lons = df['longitude'].to_numpy(dtype=float)
@@ -170,7 +165,7 @@ def _reconcile_cross_member_longitudes(df: pd.DataFrame) -> pd.DataFrame:
             f"_reconcile_cross_member_longitudes: widest internal "
             f"gap ({internal_gaps[widest_internal_idx]:.2f} deg) exceeds the "
             f"wraparound gap ({wrap_gap:.2f} deg), but shifting would still "
-            f"leave a {reconciled_span:.2f} deg-wide cluster -- too wide to "
+            f"leave a {reconciled_span:.2f} deg-wide cluster, too wide to "
             f"plausibly be a real antimeridian-hugging storm ensemble. "
             f"Leaving longitudes unchanged rather than risk mis-reprojecting "
             f"genuinely scattered/anomalous data."
@@ -250,9 +245,8 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
     Returns [bbox] unchanged, a single window, identical to the input,
     whenever lon_min/lon_max already fall within [-180, 180]. This is the
     overwhelming majority case (any storm that doesn't cross the
-    antimeridian) and is a verified no-op: callers looping over this
-    function's output process exactly one window with exactly the original
-    bounds, so existing non-crossing behavior is unchanged.
+    antimeridian) and is a no-op: callers looping over this function's
+    output process exactly one window with exactly the original bounds.
 
     When the bbox does extend past one edge, returns two windows that
     together cover the same real span: the part already inside
@@ -265,15 +259,10 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
     lon_max > 180 and lon_min < -180 together guarantee lon_max - lon_min
     > 360, and since longitude is periodic with period 360, any request
     spanning more than a full circle covers every native value at least
-    once: the correct window really is the whole globe. An earlier
-    version of this function got this backwards (returned two ~4deg-wide
-    slivers, silently dropping ~96% of the real requested area with no
-    error): caught by a real council review that reproduced it directly
-    against the real code. Reaching this branch at all should be rare in
-    practice once the caller's own bbox has been through
-    _reconcile_cross_member_longitudes() first (which keeps a real
-    storm's reconciled span well under 360: confirmed via a real,
-    realistic-scale reproduction), so hitting it is itself a signal of an
+    once: the correct window really is the whole globe. Reaching this branch
+    at all should be rare in practice once the caller's own bbox has been
+    through _reconcile_cross_member_longitudes() first (which keeps a real
+    storm's reconciled span well under 360), so hitting it is itself a signal of an
     anomalously wide upstream input, not a normal antimeridian case.
     """
     lon_min = bbox['lon_min']
@@ -289,7 +278,7 @@ def get_longitude_windows(bbox: Dict[str, float]) -> List[Dict[str, float]]:
         logger.warning(
             f"get_longitude_windows: bbox spans >360 deg "
             f"(lon_min={lon_min:.2f}, lon_max={lon_max:.2f}, "
-            f"width={lon_max - lon_min:.2f}) -- returning the full native "
+            f"width={lon_max - lon_min:.2f}), returning the full native "
             f"longitude range as a single window. This indicates an "
             f"anomalously wide upstream input, not a normal antimeridian case."
         )
@@ -315,8 +304,8 @@ def merge_contour_dicts(
 
     A single-element input list is returned as that one dict, unchanged:
     the common non-antimeridian-crossing case (one window) is therefore a
-    verified no-op: the exact same dict create_wind_threshold_contours
-    already produced today, with no extra union/copy step.
+    no-op: the exact same dict create_wind_threshold_contours produced,
+    with no extra union/copy step.
     """
     if len(dicts) == 1:
         return dicts[0]
@@ -341,113 +330,6 @@ def merge_contour_dicts(
     return merged
 
 
-def load_wind_data(grib_file: str, member_number: int, bbox: Dict[str, float],
-                   verbose: bool = True, indexpath: Optional[str] = None) -> List[xr.DataArray]:
-    """
-    Load ensemble wind data for specific member and region.
-
-    Args:
-        grib_file (str): Path to wind GRIB file
-        member_number (int): Ensemble member number
-        bbox (dict): Bounding box coordinates. May have lon_min/lon_max
-            outside [-180, 180] (see get_bounding_box): this function
-            slices the real GRIB longitude range once per real window
-            returned by get_longitude_windows(bbox), rather than assuming
-            a single contiguous slice.
-        verbose (bool): Whether to print progress information
-        indexpath (str, optional): Directory path for GRIB index files (.idx).
-                                   If provided, index files will be stored here instead
-                                   of alongside the GRIB file. Useful for parallel processing
-                                   to avoid concurrent index file conflicts.
-
-    Returns:
-        List[xr.DataArray]: One DataArray per real longitude window: length
-            1 for the overwhelming majority (non-antimeridian-crossing) case,
-            identical to what this function used to return directly; length
-            2 only when bbox straddles the antimeridian. Callers must run
-            contour extraction once per element and merge results (see
-            merge_contour_dicts) rather than concatenating these arrays:
-            a raw concat would reintroduce a coordinate discontinuity at the
-            180/-180 seam that contour tracing can't interpret correctly.
-    """
-    # Open dataset with optional custom index path
-    if indexpath:
-        # Create process-specific index directory to avoid concurrent access conflicts
-        # Each process gets its own index cache, preventing race conditions
-        # while still benefiting from index file caching performance
-        import threading
-
-        # Get unique identifier for this process/thread
-        pid = os.getpid()
-        thread_id = threading.get_ident()
-
-        # Create process-specific subdirectory
-        process_index_dir = os.path.join(indexpath, f"process_{pid}_thread_{thread_id}")
-        os.makedirs(process_index_dir, exist_ok=True)
-
-        # Build the index file path
-        import pathlib
-        grib_filename = pathlib.Path(grib_file).name
-        index_file_path = os.path.join(process_index_dir, grib_filename + '.idx')
-
-        # Open with process-specific index path
-        ds = xr.open_dataset(
-            grib_file,
-            engine='cfgrib',
-            backend_kwargs={
-                'indexpath': index_file_path,
-                'errors': 'ignore'
-            }
-        )
-    else:
-        ds = xr.open_dataset(grib_file, engine='cfgrib')
-
-    # Select specific ensemble member, mapping control member 51 to GRIB number 0
-    try:
-        # Extract u and v components (inside try so ds.close() fires on KeyError etc.)
-        u10 = ds['u10']
-        v10 = ds['v10']
-        wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
-        if 'number' in wind_speed.dims:
-            desired_number = 0 if member_number == 51 else member_number
-            if verbose:
-                print(f"    Selecting wind ensemble member {member_number} (GRIB number {desired_number})")
-            try:
-                wind_speed = wind_speed.sel(number=desired_number)
-            except Exception as e:
-                logger.warning(f"Member {member_number} (GRIB {desired_number}) not found in wind data: {e}")
-                return [xr.DataArray()]  # outer finally: ds.close() still fires
-        else:
-            if verbose:
-                print(f"    NOTE: No ensemble dimension in wind data (likely control forecast)")
-
-        # Subset to bounding box: one real native-range window in the
-        # overwhelming majority of cases, two only when bbox straddles the
-        # antimeridian (see get_longitude_windows)
-        windows = get_longitude_windows(bbox)
-        wind_regions = []
-        for window in windows:
-            region = wind_speed.sel(
-                latitude=slice(bbox['lat_max'], bbox['lat_min']),
-                longitude=slice(window['lon_min'], window['lon_max'])
-            )
-            region.load()  # materialise into RAM before closing the file handle
-            wind_regions.append(region)
-
-        if verbose:
-            for region in wind_regions:
-                print(f"    Wind data shape: {region.shape}")
-                try:
-                    max_ms = float(region.max())
-                    print(f"    Max wind: {max_ms:.1f} m/s ({max_ms / 0.5144:.1f} kt)")
-                except Exception:
-                    pass
-
-        return wind_regions
-    finally:
-        ds.close()
-
-
 def load_wind_data_all_members(
     grib_file: str,
     bbox: Dict[str, float],
@@ -462,7 +344,7 @@ def load_wind_data_all_members(
 
     Returns:
         List[xr.DataArray]: One DataArray per real longitude window: length
-            1 (bbox clipped exactly as before) for the overwhelming majority
+            1 (bbox clipped to the single window) for the overwhelming majority
             of storms; length 2 only when bbox straddles the antimeridian
             (see get_bounding_box / get_longitude_windows). Callers must
             extract contours once per element and merge results (see
@@ -548,8 +430,7 @@ def create_wind_threshold_contours(wind_data: xr.DataArray,
 
         polygons = []
         try:
-            # cs.allsegs is the stable per-level segments API (confirmed matplotlib 3.11).
-            # cs.collections was removed in matplotlib 3.9 and must not be used.
+            # cs.allsegs is the stable per-level segments API (matplotlib 3.11).
             # If allsegs is ever removed, fall back to contourpy (bundled with matplotlib).
             try:
                 level_segs = cs.allsegs[i] if i < len(cs.allsegs) else []
@@ -618,8 +499,8 @@ def _nudge_antimeridian_vertices(geom):
     def _nudge(x, y, z=None):
         x = np.asarray(x, dtype=float).copy()
         # Clamp, not exact-match: upstream window/buffer arithmetic can
-        # overshoot the boundary by float noise (e.g. -180.00000000000003,
-        # seen in real NANGKA data) which is itself already out of the
+        # overshoot the boundary by float noise (e.g. -180.00000000000003)
+        # which is itself already out of the
         # valid [-180, 180] range and would also fail Snowflake's parser
         # an exact == -180.0 check misses that. Anything at or past the
         # boundary gets pulled back in.

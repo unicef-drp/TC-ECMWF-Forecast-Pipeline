@@ -4,27 +4,27 @@ GloFAS Riverine Discharge Downloader
 
 Downloads the GloFAS v4.0 operational ensemble discharge forecast (51 members)
 from the Copernicus Emergency Management Service Early Warning Data Store (EWDS),
-converts to Zarr ZipStore, and uploads to a Snowflake internal stage.
+converts to Zarr ZipStore, and uploads to the configured remote store (Blob or Snowflake stage).
 
 Data source: `cdsapi` against `cems-glofas-forecast` on
   https://ewds.climate.copernicus.eu/api  (NOT ecmwf-opendata; GloFAS is a separate
   CEMS product, not part of ECMWF's Open Data dissemination).
 
 Storage format:
-  Zarr ZipStore (.zarr.zip): single file, chunked (1, 1, lat, lon), float32, zstd.
-  dims: (member=51, step=7, lat, lon)
+  Zarr ZipStore (.zarr.zip): single file, chunked (1, 1, chunk_cells), float32, zstd.
+  dims: (member=51, step=7, n_cells), with parallel cell_lat/cell_lon arrays (n_cells,)
   values: river discharge in the last 24h (m3/s), one value per day, not accumulated
           (unlike tp/ro; no period-difference math needed at read time).
-  spatial: 60°S–60°N (matches ecmwf_met_downloader.py's clip, for consistency across
+  spatial: 60°S to 60°N (matches ecmwf_met_downloader.py's clip, for consistency across
            all "always-on, TC-independent" hazard layers).
 
 Cadence, the key difference from tp/ro:
   GloFAS's operational medium-range product is driven only by the 00 UTC IFS ENS
   cycle and is published to CDS at most ONCE PER CALENDAR DAY (the `cems-glofas-
-  forecast` CDS schema has no run-hour selector, only year/month/day). The TC
-  pipeline runs 4x/day (00/06/12/18Z cycles), so 3 of the 4 daily runs will find a
-  same-day GloFAS file already cached and skip the download entirely. The Zarr/stage
-  cache key is therefore DATE-ONLY (no run_time component), unlike tp/ro's per-run key.
+  forecast` CDS schema has no run-hour selector, only year/month/day). GloFAS runs on its own triggers (15:00, 15:40
+  and 19:00 UTC); re-runs on the same calendar day (the 19:00 retry, manual
+  dispatches) find the same-day file already cached and skip the download.
+  The Zarr/stage cache key is therefore DATE-ONLY (no run_time component), unlike tp/ro's per-run key.
 
 Publication lag: a given calendar day's GloFAS forecast is not always available
   immediately; this module falls back to the previous day if the current day's
@@ -38,7 +38,6 @@ Dtype note: float32, not float16 (unlike tp/ro). Global river discharge has a fa
 
 import logging
 import os
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,7 +58,7 @@ LAT_MAX = 60.0
 AREA = [LAT_MAX, -180.0, LAT_MIN, 180.0]  # N, W, S, E
 
 # Daily-resolution lead times: 1-7 days. 168h (not 144h like tp/ro) to pad for
-# GloFAS's once-daily cadence against the pipeline's 4x-daily run schedule
+# GloFAS's once-daily cadence
 LEADTIME_HOURS = ["24", "48", "72", "96", "120", "144", "168"]
 
 DEFAULT_GLOFAS_DIR = 'glofas_data'
@@ -77,7 +76,7 @@ CDS_PROCESS_DELAY_MINUTES = 40
 FILTER_RP = "2.0"
 
 # Full set of RP tiers the extent-masking step (glofas_extent_masking.py)
-# computes exceedance probability for, combined with JRC's static extent maps.
+# computes member exceedance for, combined with JRC's static extent maps.
 # RP2/RP5 have no native JRC map (JRC only covers RP10 and up); they use
 # RP10's own extent as a labeled upper-bound stand-in there; the probability
 # threshold lookup itself still needs each tier's own rl_{RP}.nc.
@@ -116,8 +115,8 @@ THRESHOLD_BASE_URL = "https://confluence.ecmwf.int/download/attachments/24206738
 
 # IMPORTANT: that flag is about JRC's
 # flood-EXTENT map coverage, not GloFAS discharge/threshold confidence (both
-# of which are dense, unrestricted, global products, confirmed directly
-# every cell has a real RP threshold value down to ~28km^2 catchments). The
+# of which are dense, unrestricted, global products: every cell has a
+# real RP threshold value down to ~28km^2 catchments). The
 # 500km^2 cutoff is JRC's own minimum-catchment scope for its LISFLOOD-FP
 # flood-extent simulation, a matching-availability gap, not a forecast one.
 # https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
@@ -128,7 +127,7 @@ UPAREA_STAGE_PATH = f"{THRESHOLD_STAGE_PREFIX}/uparea_glofas_v4_0.nc"
 def _download_threshold_from_ecmwf(rp: str, dest_path: Path) -> None:
     """Direct HTTP download of one official RP threshold file. No CDS/Snowflake
     auth needed (plain confluence attachment). Self-healing fallback of last
-    resort when neither a local cache nor the Snowflake stage has the file yet."""
+    resort when neither a local cache, the Snowflake stage, nor Blob has the file yet."""
     import requests
     fname = f"flood_threshold_glofas_v4_rl_{rp}.nc"
     url = f"{THRESHOLD_BASE_URL}/{fname}"
@@ -650,8 +649,8 @@ def build_zarr_zipstore(paths: Dict[str, Path], actual_date: datetime, output_di
     """
     date_str = actual_date.strftime("%Y%m%d")
     # Nested under a {date}/ subfolder (not flat in output_dir) so local storage
-    # mirrors the Snowflake stage's own glofas/{date}/... layout exactly
-    # per-member extent Parquet (glofas_extent_masking.py) lands in this same
+    # mirrors the Snowflake stage's own glofas/{date}/... layout exactly.
+    # The compact extent Parquet files (glofas_extent_masking.py) land in this same
     # per-date folder, not a separate "extent/" subdirectory.
     zip_path = output_dir / date_str / f"river_{date_str}.zarr.zip"
 
@@ -834,7 +833,7 @@ def upload_to_snowflake_stage(zip_path: Path, stage_name: str, stage_path: str, 
 
 def stage_file_exists(stage_name: str, stage_path: str, conn) -> bool:
     """Check whether a same-day file is already staged, to skip a redundant download
-    entirely (across the 4x-daily pipeline cycles that share one GloFAS run per day)."""
+    entirely (across same-day re-runs that share one GloFAS file per day)."""
     try:
         cursor = conn.cursor()
         try:
@@ -972,13 +971,10 @@ def download_glofas_forecast(
         logger.info(f'  Spatial: {LAT_MIN} deg - {LAT_MAX} deg  |  Cadence: once/calendar day')
         logger.info('=' * 70)
 
-    # SAME-DAY dedup only (lag=0): catches the 3-of-4 daily cycles that share one
-    # GloFAS run per day, per stage_file_exists()'s own docstring. This must NOT
-    # loop over MAX_PUBLICATION_LAG_DAYS: a lag>0 match here
-    # only proves YESTERDAY's file exists (which is always true, since yesterday's
-    # own run left it there), and accepting that as "today is done" meant today's
-    # real CDS request never got attempted at all, silently, on a roughly
-    # every-other-day cadence. The actual multi-day publication-lag fallback is
+    # SAME-DAY dedup only (lag=0): catches same-day re-runs (the 19:00 retry, manual
+    # dispatches), per stage_file_exists()'s own docstring. It does not loop over
+    # MAX_PUBLICATION_LAG_DAYS: a lag>0 match would only prove YESTERDAY's file
+    # exists, which says nothing about whether today's CDS request has been made. The actual multi-day publication-lag fallback is
     # already implemented correctly, further down, in download_with_fallback()
     # (and in resume_glofas_download() for the pre_submitted path), both of
     # which genuinely attempt today first and only fall back to an earlier day
@@ -1029,7 +1025,7 @@ def download_glofas_forecast(
                 if not ok:
                     return {'success': False, 'zip_path': candidate_path, 'stage_path': None,
                              'forecast_date': candidate, 'param': 'dis24', 'cached': False}
-            logger.info(f'  {candidate_stage_path}, day-level cache hit (local file, verified staged)')
+            logger.info(f'  {candidate_stage_path}, day-level cache hit (local file, confirmed on the remote store)')
             return {'success': True, 'zip_path': candidate_path, 'stage_path': candidate_stage_path,
                      'forecast_date': candidate, 'param': 'dis24', 'cached': True}
 
@@ -1041,11 +1037,10 @@ def download_glofas_forecast(
         candidate_stage_path = f'glofas/{date_str}/river_{date_str}.zarr.zip'
         if _remote_exists(candidate_stage_path):
             # Materialize a local copy even on a cache hit: extent masking
-            # (run_glofas_extent_pipeline) needs a real local zip_path to open, and
-            # previously got None here, silently skipping extent masking entirely on
-            # any run that finds the raw discharge already staged (e.g. a manual
-            # re-dispatch, or a retry after the original run's own extent step
-            # failed downstream of a successful discharge upload/stage-write).
+            # (run_glofas_extent_pipeline) needs a real local zip_path to open, so runs
+            # that find the raw discharge already staged (e.g. a manual re-dispatch, or
+            # a retry after an extent step failed downstream of a successful discharge
+            # upload) still get extent masking.
             local_download_path = output_path / date_str / f'river_{date_str}.zarr.zip'
             if _remote_download(candidate_stage_path, local_download_path):
                 logger.info(f'  {candidate_stage_path} already staged, downloaded locally for extent masking (day-level cache hit)')
@@ -1061,8 +1056,8 @@ def download_glofas_forecast(
     #    wait-then-download the already-submitted requests, date fallback already
     #    resolved at submit time.
     #  - pre_submitted=None (default, and GLOFAS_MODE=submit's own fallback when it
-    #    finds nothing to resume from): today's original submit-and-block-through-
-    #    the-full-wait behavior, unchanged.
+    #    finds nothing to resume from): submit-and-block-through-
+    #    the-full-wait behavior.
     if pre_submitted is not None:
         actual_date = pre_submitted['actual_date']
         try:
@@ -1081,8 +1076,7 @@ def download_glofas_forecast(
         if paths is None:
             # Resuming failed (e.g. a transient network blip reattaching, or the
             # request expired/errored during the submit->process gap), fall back
-            # to a fresh submit-and-block, same resilience the original single-step
-            # flow always had for an equivalent transient failure.
+            # to a fresh submit-and-block.
             logger.warning(f"  Resuming pre-submitted CDS requests for "
                             f"{actual_date.strftime('%Y-%m-%d')} failed, falling back to a "
                             f"fresh submit-and-block")

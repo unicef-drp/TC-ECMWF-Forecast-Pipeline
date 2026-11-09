@@ -77,7 +77,7 @@ def get_snowflake_connection():
        - Set SNOWFLAKE_PRIVATE_KEY_PATH to path of private key file
        - Optionally set SNOWFLAKE_PRIVATE_KEY_PASSPHRASE if key is encrypted
 
-    3. Password (legacy):
+    3. Password:
        - Set SNOWFLAKE_PASSWORD
 
     Required variables:
@@ -581,9 +581,8 @@ def load_csv_to_snowflake(csv_file, conn, table_type='TC_TRACKS', use_staging=Tr
                 # unlike the wind tables). Snowflake's ALTER TABLE ADD
                 # COLUMN doesn't support a computed DEFAULT the way CREATE
                 # TABLE does ("Invalid column default expression"), and this
-                # column was added to the already-live gust tables via
-                # ALTER TABLE, not CREATE TABLE, so no working DEFAULT
-                # exists on the real table.
+                # column is added to the gust tables via ALTER TABLE, not
+                # CREATE TABLE, so the real table has no working DEFAULT.
 
             elif table_type == 'TC_GUST_ENVELOPES_COMBINED':
                 logger.info(f"  Keeping ENVELOPE_REGION as VARCHAR in staging table")
@@ -747,13 +746,13 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
 def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     """
     Load GloFAS riverine metadata rows into RIVER_FORECASTS table: both raw
-    discharge (PARAM='dis24') and JRC per-member flood-extent output
-    (PARAM='extent_rp{N}_bymember', with IS_STANDIN true for the RP2/RP5
+    discharge (PARAM='dis24') and JRC compact flood-extent output
+    (PARAM='extent_bymask_rp{N}', with IS_STANDIN true for the RP2/RP5
     stand-in tiers) share this one table.
 
     Args:
         metadata_rows: list of dicts with keys forecast_time, param, stage_path,
-            and optionally is_standin (only meaningful for extent_rp2/extent_rp5 rows)
+            and optionally is_standin (only meaningful for extent_bymask_rp2/extent_bymask_rp5 rows)
         conn: active Snowflake connection
 
     Returns number of rows merged.
@@ -772,8 +771,7 @@ def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
                 CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # IS_STANDIN was added after RIVER_FORECASTS already existed in
-        # production (raw discharge rows predate the extent-masking work)
+        # IS_STANDIN is added via ALTER on an existing RIVER_FORECASTS table.
         # ADD COLUMN IF NOT EXISTS is idempotent, safe to run on every call.
         cursor.execute("ALTER TABLE RIVER_FORECASTS ADD COLUMN IF NOT EXISTS IS_STANDIN BOOLEAN")
 

@@ -58,7 +58,7 @@ overlaid with the track for a single storm and forecast run.
 ```bash
 python web/visualize_ensemble_envelopes.py --storm MAILA
 python web/visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00
-python web/visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00 --out /tmp/out.png
+python web/visualize_ensemble_envelopes.py --storm MAILA --date "2026-04-06" --run 00 --out out.png
 ```
 
 `--storm` is required. Uses the same Snowflake environment variables as the main app.

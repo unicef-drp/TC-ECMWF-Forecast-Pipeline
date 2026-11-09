@@ -40,7 +40,7 @@ CONTAINER_NAME=your_container_name
 # Download tp + ro as Zarr to Snowflake stage (true/false, default: true)
 PROCESS_MET=true
 
-# Snowflake internal stage for met Zarr: REQUIRED when PROCESS_MET=true
+# Snowflake internal stage for met Zarr: REQUIRED when PROCESS_MET=true and DATA_PIPELINE_DB=SNOWFLAKE
 SNOWFLAKE_STAGE_NAME=your_stage_name
 
 # Enable gust envelope processing (true/false, default: true), independent of
@@ -62,13 +62,13 @@ GLOFAS_DATA_DIR=glofas_data
 # fresh submit-and-block if nothing was saved.
 GLOFAS_MODE=process
 
-# Where the RP2 threshold file is read from: snowflake, blob, or local (fully offline
+# Where the RP threshold files are read from: snowflake, blob, or local (fully offline
 # dev, requires setup_glofas_thresholds.py --local-only to have been run first).
 # Defaults to DATA_PIPELINE_DB above; set explicitly to use a different source for this
 # static reference file than for the per-cycle output.
 GLOFAS_THRESHOLD_SOURCE=snowflake
 
-# Local dir containing rl_2.0.nc, used only when GLOFAS_THRESHOLD_SOURCE=local
+# Local dir containing rl_{2.0,5.0,10.0,20.0,50.0,100.0}.nc, used only when GLOFAS_THRESHOLD_SOURCE=local
 GLOFAS_THRESHOLD_LOCAL_DIR=glofas_thresholds
 
 # CDS/EWDS API credentials for cems-glofas-forecast (separate from ecmwf-opendata,
@@ -100,7 +100,7 @@ GLOFAS_JRC_LOCAL_DIR=glofas_jrc_extents
 # ==============================================================================
 # Usage
 # ==============================================================================
-# 1. For local pipeline testing: Copy github_actions/sample_env.txt to .env
+# 1. For local pipeline runs: Copy github_actions/sample_env.txt to .env
 #    Set DATA_PIPELINE_DB=LOCAL to skip Snowflake load and keep files locally, or
 #    DATA_PIPELINE_DB=BLOB to upload to Azure Blob Storage instead.
 # 2. For web app development: Copy web/sample_env.txt to .env

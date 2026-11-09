@@ -9,9 +9,10 @@ onto the TC pipeline's 4x-daily run slots, and a full global fetch can take far
 longer than the TC pipeline's other steps, so bundling them would force one
 unrelated schedule/timeout onto the other).
 
-Requires the RP2 threshold file to already be cached
-(run once, manually, not part of any recurring schedule). Trigger via a Snowflake
-TASK calling EXECUTE JOB SERVICE, scheduled once daily comfortably past GloFAS's
+The RP threshold files (rl_2.0..rl_100.0) can be pre-populated manually
+(not part of any recurring schedule); otherwise each is fetched from ECMWF on
+first use and cached. Trigger via a Snowflake
+TASK calling EXECUTE JOB SERVICE, scheduled as a submit task and a process task, comfortably past GloFAS's
 ~11h publication latency (e.g. 12-13 UTC), see snowflake/README.md for the job
 service execution pattern used by the main pipeline.
 
@@ -112,7 +113,7 @@ class PipelineConfig(BaseGlofasConfig):
         if not self.needs_snowflake_creds():
             logger.info("No Snowflake-sourced path is configured (DATA_PIPELINE_DB, "
                         "GLOFAS_THRESHOLD_SOURCE, and GLOFAS_JRC_SOURCE are all 'local'/'blob', "
-                        "or extent masking is disabled) -- Snowflake credentials not required")
+                        "or extent masking is disabled), Snowflake credentials not required")
             return True
 
         if not self.sf_account:
@@ -235,7 +236,7 @@ def main():
                 if existing:
                     logger.info(f"CDS requests already submitted for "
                                 f"{existing['actual_date'].strftime('%Y-%m-%d')} "
-                                f"({existing['requests']}) -- skipping duplicate submission")
+                                f"({existing['requests']}), skipping duplicate submission")
                     sys.exit(0)
 
             submitted = run_glofas_submit_pipeline(config, snowflake_conn=conn)
@@ -255,13 +256,13 @@ def main():
                 rows = save_cds_request_ids(submitted['actual_date'], submitted['requests'], conn)
                 if rows < len(submitted['requests']):
                     logger.error(f"Only saved {rows} of {len(submitted['requests'])} CDS request "
-                                 f"ID(s) -- the process step will not be able to resume the "
+                                 f"ID(s), the process step will not be able to resume the "
                                  f"unsaved request(s) and will submit a fresh pair instead, "
                                  f"wasting the CDS requests just fired")
                     sys.exit(1)
                 logger.info(f"Saved {rows} CDS request ID(s) for the later process step to resume")
             else:
-                logger.warning("No Snowflake connection -- submitted request IDs cannot be "
+                logger.warning("No Snowflake connection, submitted request IDs cannot be "
                                 "resumed later; the process step will submit fresh instead")
 
             logger.info("GloFAS submit step completed successfully!")
@@ -269,7 +270,7 @@ def main():
 
         # GLOFAS_MODE=process (default): resume a prior submit step's request IDs
         # if one was saved for this date; falls back to a fresh submit-and-block
-        # (today's original behavior) if there's nothing to resume from.
+        # (submit-and-block) if there's nothing to resume from.
         pre_submitted = None
         if conn:
             forecast_date_str = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -283,9 +284,9 @@ def main():
         # RIVER_FORECASTS pointer rows: `conn` above is only opened when needs_snowflake_
         # creds() says the configured MODE requires it, so a fully-independent BLOB config
         # leaves it None even when real credentials are sitting right there in the
-        # environment -- write_conn reuses `conn` if already open, otherwise opens its own
+        # environment. write_conn reuses `conn` if already open, otherwise opens its own
         # ad-hoc connection whenever real credentials are present, matching
-        # github_actions/glofas_pipeline.py's identical fix.
+        # github_actions/glofas_pipeline.py.
         write_conn = conn
         write_conn_is_ad_hoc = False
         if upload_to_stage and write_conn is None and _have_real_snowflake_creds(config):
@@ -321,29 +322,28 @@ def main():
                 else:
                     logger.warning(
                         "No stage_path in result (local day-cache hit before this run's "
-                        "data was ever staged) -- skipping metadata load this run"
+                        "data was ever staged), skipping metadata load this run"
                     )
             elif upload_to_stage:
                 logger.warning(
-                    "No Snowflake credentials configured -- RIVER_FORECASTS pointer row(s) "
+                    "No Snowflake credentials configured, RIVER_FORECASTS pointer row(s) "
                     "not written; the discharge/extent data is safely in Blob, but nothing "
                     "in Snowflake records where it is until a RIVER_FORECASTS row is "
                     "written separately"
                 )
 
             # Extent-masking step (GloFAS x JRC v2.1)
-            # This path registers only the per-member extent files. The compact bitmask files
-            # (river_extent_rp{N}_bymask_*, in each result's 'bymask_stage_path') are not
-            # registered here: if this path is used again, add RIVER_FORECASTS rows with
-            # PARAM 'extent_bymask_rp{N}' for them, as github_actions/glofas_pipeline.py does.
+            # Registers the compact extent files (PARAM extent_bymask_rp{N}) as
+            # github_actions/glofas_pipeline.py does. Unlike that entry point, it does not
+            # report failed tiers.
             extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
             if extent_results and upload_to_stage and write_conn:
                 metadata_rows = [{
                     'forecast_time': result['forecast_date'],
-                    'param': f"extent_rp{int(float(r['rp']))}_bymember",
+                    'param': f"extent_bymask_rp{int(float(r['rp']))}",
                     'is_standin': r['is_standin'],
-                    'stage_path': r['stage_path'],
-                } for r in extent_results if r.get('stage_path')]
+                    'stage_path': r['bymask_stage_path'],
+                } for r in extent_results if r.get('bymask_stage_path')]
                 if metadata_rows:
                     rows = load_riverine_metadata_to_snowflake(metadata_rows, write_conn)
                     if rows == 0:

@@ -31,7 +31,7 @@ References:
 import os
 import warnings
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List
 
 import collections
 from eccodes import *
@@ -92,7 +92,6 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                 data = collections.defaultdict(dict)
 
                 # Extract basic message metadata
-                numObs = codes_get(bufr, "numberOfSubsets")
                 year = codes_get(bufr, "year")
                 month = codes_get(bufr, "month")
                 day = codes_get(bufr, "day")
@@ -119,7 +118,7 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                     try:
                         # Try to get timePeriod array for this period number
                         codes_get_array(bufr, "#%d#timePeriod" % numberOfPeriods)
-                    except CodesInternalError as err:
+                    except CodesInternalError:
                         break  # No more periods found
                 # Note: numberOfPeriods includes the analysis (period=0)
 
@@ -133,9 +132,6 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                 # https://confluence.ecmwf.int/display/ECC/WMO%3D33+code-flag+table#WMO=33codeflagtable-CF_008005
 
                 # Code 1: STORM CENTRE
-                # significance = ec.codes_get(bufr, '#1#meteorologicalAttributeSignificance')
-                # latitudeCentre = ec.codes_get(bufr, '#1#latitude')
-                # longitudeCentre = ec.codes_get(bufr, '#1#longitude')
 
                 # Code 3: LOCATION OF MAXIMUM WIND
                 significance = codes_get(bufr, '#3#meteorologicalAttributeSignificance')
@@ -214,7 +210,7 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                     # Verify we have storm center data (Code 1)
                     if significance is None:
                         if verbose:
-                            print(f"Step {i}: all storm-center significance values missing -- skipping")
+                            print(f"Step {i}: all storm-center significance values missing, skipping")
                         continue
                     if significance != 1:
                         print('ERROR: unexpected meteorologicalAttributeSignificance=', significance)
@@ -241,7 +237,7 @@ def extract_tc_data(filename: str, verbose: bool = True) -> pd.DataFrame:
                     # Verify we have maximum wind location data (Code 3)
                     if significanceWind is None:
                         if verbose:
-                            print(f"Step {i}: all wind-significance values missing -- skipping")
+                            print(f"Step {i}: all wind-significance values missing, skipping")
                         continue
                     if significanceWind != 3:
                         print('ERROR: unexpected meteorologicalAttributeSignificance=', significanceWind)
@@ -446,7 +442,7 @@ def filter_tc_data(
         & s.str.slice(0, 2).str.match(r'^\d{2}$')
         & s.str.slice(2, 3).str.match(r'^[A-Za-z]$')
     )
-    # Short IDs (1–2 chars) are also unnumbered
+    # Short IDs (1 to 2 chars) are also unnumbered
     is_short = s.str.len() <= 2
     mask = ~is_numbered & ~is_short
     filtered = df[mask]
@@ -494,61 +490,3 @@ def save_per_storm_csvs(
             print(f"  Saved {len(storm_df)} records for storm {storm_id} → {csv_name}")
 
     return csv_files
-
-
-def extract_tc_data_from_file(filename: str,
-                              output_dir: str = DEFAULT_OUTPUT_DIR,
-                              verbose: bool = True) -> Dict[str, Union[str, int]]:
-    """
-    Extract tropical cyclone data from a BUFR file and save results.
-
-    This is the main function for processing ECMWF tropical cyclone BUFR files.
-    It handles the complete extraction pipeline from BUFR file to structured data.
-
-    Args:
-        filename (str): Path to the BUFR file (must be Template 316082)
-        output_dir (str): Output directory for saved files (default: "tc_data")
-        verbose (bool): Whether to print detailed progress information (default: True)
-
-    Returns:
-        dict: Summary dictionary with keys:
-            - success (bool): Whether extraction was successful
-            - csv_file (str): Path to saved CSV file (None if failed)
-            - records (int): Total number of records extracted
-    """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-
-    if verbose:
-        print(f"Extracting tropical cyclone data from: {filename}")
-
-    # Extract data
-    df = extract_tc_data(filename, verbose=verbose)
-
-    if df.empty:
-        if verbose:
-            print("Error: Failed to extract data from BUFR file")
-        return {'success': False, 'csv_file': None, 'records': 0}
-
-    # Generate output filename
-    base_name = os.path.splitext(os.path.basename(filename))[0]
-    csv_file = os.path.join(output_dir, base_name + DEFAULT_CSV_SUFFIX)
-
-    # Save CSV data
-    df.to_csv(csv_file, index=False)
-    if verbose:
-        print(f"Data saved to: {csv_file}")
-
-    # Summary
-    if verbose:
-        print("=" * 50)
-        print(f"Summary:")
-        print(f"   Successfully extracted: {len(df)} records")
-        print(f"   CSV file: {csv_file}")
-        print("=" * 50)
-
-    return {
-        'success': True,
-        'csv_file': csv_file,
-        'records': len(df)
-    }

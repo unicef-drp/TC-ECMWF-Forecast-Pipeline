@@ -19,7 +19,7 @@ References:
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +43,7 @@ FORECAST_STEPS = {
 # All run times are currently capped at T+144h, matching FORECAST_STEPS above.
 CF_MAX_STEP = {0: 144, 6: 144, 12: 144, 18: 144}
 
-# ECMWF open data indexes 10m max gust as '10fg' for steps 0–90h and '10fg3'
+# ECMWF open data indexes 10m max gust as '10fg' for steps 0 to 90h and '10fg3'
 # for steps > 90h (same physical quantity, different accumulation interval label).
 def _gust_param(step: int) -> str:
     return "10fg3" if step > 90 else "10fg"
@@ -200,7 +200,7 @@ def _download_single_step_cf(client: Client, forecast_date: datetime, run_time: 
             print(f"  [DOWN] +{step:3d}h CF: Downloading...", end='', flush=True)
 
         # Download HRES control forecast (member 51).
-        # stream=enfo type=cf was removed in IFS Cycle 50r1 (May 2026); use stream=oper type=fc.
+        # Control member (51) comes from stream=oper type=fc.
         client.retrieve(
             date=forecast_date,
             time=run_time,
@@ -466,7 +466,7 @@ def download_ensemble_wind(
         output_dir (str): Output directory for downloaded files
         verbose (bool): Whether to print detailed progress information
         max_workers (int): Maximum number of concurrent downloads (default: 4).
-                          Set to 1 for sequential downloads (original behavior).
+                          Set to 1 for sequential downloads.
 
     Returns:
         dict: Summary with 'success', 'files_downloaded', 'files_failed'
@@ -532,7 +532,7 @@ def download_ensemble_wind(
                 else:
                     failed_downloads += 1
     else:
-        # Sequential download mode (original behavior)
+        # Sequential download mode
         for step in forecast_hours:
             # Download PF file
             result_pf = _download_single_step_pf(client, forecast_date, run_time, step, output_dir, verbose)
@@ -565,143 +565,3 @@ def download_ensemble_wind(
         'output_dir': output_dir,
         'downloaded_files': downloaded_files
     }
-
-
-def download_multiple_forecasts(
-        start_date: Union[str, datetime],
-        end_date: Optional[Union[str, datetime]] = None,
-        run_times: Optional[List[int]] = None,
-        forecast_hours: Optional[List[int]] = None,
-        output_dir: str = DEFAULT_OUTPUT_DIR,
-        verbose: bool = True,
-        max_workers: int = 4
-) -> Dict[str, int]:
-    """
-    Download multiple ensemble wind forecasts.
-
-    Args:
-        start_date (str or datetime): Start date in 'YYYY-MM-DD' format
-        end_date (str or datetime, optional): End date. If None, only download start_date
-        run_times (List[int], optional): Run times to download (default: [0, 12])
-        forecast_hours (List[int], optional): Specific forecast hours to download
-        output_dir (str): Output directory for downloaded files
-        verbose (bool): Whether to print detailed progress information
-        max_workers (int): Maximum number of concurrent downloads (default: 4).
-                          Set to 1 for sequential downloads (original behavior).
-
-    Returns:
-        dict: Summary with 'total_downloaded', 'total_failed'
-    """
-    # Parse dates
-    if isinstance(start_date, str):
-        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-    else:
-        start_dt = start_date
-
-    if end_date is None:
-        end_dt = start_dt
-    elif isinstance(end_date, str):
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-    else:
-        end_dt = end_date
-
-    # Default run times
-    if run_times is None:
-        run_times = [0, 12]  # Main runs with longest forecast horizon
-
-    # Generate list of dates
-    date_list = []
-    current_date = start_dt
-    while current_date <= end_dt:
-        date_list.append(current_date)
-        current_date += timedelta(days=1)
-
-    if verbose:
-        print(f"Downloading forecasts for {len(date_list)} date(s) and {len(run_times)} run time(s)")
-
-    total_downloaded = 0
-    total_failed = 0
-
-    for forecast_date in date_list:
-        for run_time in run_times:
-            result = download_ensemble_wind(
-                date=forecast_date,
-                run_time=run_time,
-                forecast_hours=forecast_hours,
-                output_dir=output_dir,
-                verbose=verbose,
-                max_workers=max_workers
-            )
-
-            total_downloaded += result['files_downloaded']
-            total_failed += result['files_failed']
-
-    if verbose:
-        print("\n" + "=" * 70)
-        print("OVERALL SUMMARY")
-        print("=" * 70)
-        print(f"Total files downloaded: {total_downloaded}")
-        print(f"Total files failed: {total_failed}")
-        print("=" * 70)
-
-    return {
-        'total_downloaded': total_downloaded,
-        'total_failed': total_failed
-    }
-
-
-def list_downloaded_files(output_dir: str = DEFAULT_OUTPUT_DIR) -> List[str]:
-    """
-    List all downloaded wind GRIB files in the output directory.
-
-    Args:
-        output_dir (str): Directory containing downloaded files
-
-    Returns:
-        List[str]: List of downloaded file paths
-    """
-    output_path = Path(output_dir)
-
-    if not output_path.exists():
-        return []
-
-    grib_files = sorted(output_path.glob("wind_ens_*.grib2"))
-    return [str(f) for f in grib_files]
-
-
-def get_file_info(filepath: str) -> Dict[str, Union[str, int]]:
-    """
-    Extract information from wind GRIB filename.
-
-    Expected format: wind_ens_YYYY-MM-DD_rHH_fHHHh.grib2
-    Example: wind_ens_2025-10-12_r00_f024h.grib2
-
-    Args:
-        filepath (str): Path to wind GRIB file
-
-    Returns:
-        dict: File information with keys:
-            - date: Forecast date
-            - run_time: Run time (0, 6, 12, 18)
-            - forecast_hour: Forecast lead time in hours
-            - filename: Original filename
-    """
-    import re
-
-    filename = os.path.basename(filepath)
-
-    # Parse filename: matches both _pf.grib2 and _cf.grib2 suffixes
-    pattern = r'wind_ens_(\d{4}-\d{2}-\d{2})_r(\d{2})_f(\d{3})h_(?:pf|cf)\.grib2'
-    match = re.match(pattern, filename)
-
-    if match:
-        date_str, run_str, hour_str = match.groups()
-        return {
-            'date': date_str,
-            'run_time': int(run_str),
-            'forecast_hour': int(hour_str),
-            'filename': filename,
-            'filepath': filepath
-        }
-
-    return {}

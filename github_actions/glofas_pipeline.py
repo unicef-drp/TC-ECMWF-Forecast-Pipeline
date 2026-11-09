@@ -14,8 +14,9 @@ github_actions/main.py), NOT wired into its steps. Two reasons this is standalon
    than the TC pipeline's other steps, bundling it in would force the whole TC
    pipeline's timeout to accommodate GloFAS's own, unrelated duration.
 
-Requires the RP2 threshold file to already be cached, see setup_glofas_thresholds.py
-(run once, manually, not part of any recurring schedule).
+The RP threshold files (rl_2.0..rl_100.0) can be pre-populated with
+setup_glofas_thresholds.py (run manually, not part of any recurring schedule);
+otherwise each is fetched from ECMWF on first use and cached.
 
 Shared config/orchestration lives in glofas_pipeline_core.py (mirrors how
 github_actions/main.py adds only password-auth specifics on top of
@@ -80,7 +81,7 @@ def main():
     # github_actions/main.py: the write below opens its own ad-hoc connection whenever real
     # Snowflake credentials are present (have_snowflake_creds, independent of `conn` above,
     # which is only opened when needs_snowflake_creds() says the configured MODE requires
-    # it -- a fully-independent BLOB config leaves `conn` None even with real credentials
+    # it: a fully-independent BLOB config leaves `conn` None even with real credentials
     # sitting in the environment); a genuinely credential-less deployment logs a warning
     # and skips it instead of writing nothing silently.
     upload_to_stage = config.data_pipeline_db in ('SNOWFLAKE', 'BLOB')
@@ -111,7 +112,7 @@ def main():
                 if existing:
                     logger.info(f"CDS requests already submitted for "
                                 f"{existing['actual_date'].strftime('%Y-%m-%d')} "
-                                f"({existing['requests']}) -- skipping duplicate submission")
+                                f"({existing['requests']}), skipping duplicate submission")
                     sys.exit(0)
 
             submitted = run_glofas_submit_pipeline(config, snowflake_conn=conn)
@@ -131,13 +132,13 @@ def main():
                 rows = save_cds_request_ids(submitted['actual_date'], submitted['requests'], conn)
                 if rows < len(submitted['requests']):
                     logger.error(f"Only saved {rows} of {len(submitted['requests'])} CDS request "
-                                 f"ID(s) -- the process step will not be able to resume the "
+                                 f"ID(s), the process step will not be able to resume the "
                                  f"unsaved request(s) and will submit a fresh pair instead, "
                                  f"wasting the CDS requests just fired")
                     sys.exit(1)
                 logger.info(f"Saved {rows} CDS request ID(s) for the later process step to resume")
             else:
-                logger.warning("No Snowflake connection -- submitted request IDs cannot be "
+                logger.warning("No Snowflake connection, submitted request IDs cannot be "
                                 "resumed later; the process step will submit fresh instead")
 
             logger.info("GloFAS submit step completed successfully!")
@@ -145,7 +146,7 @@ def main():
 
         # GLOFAS_MODE=process (default): resume a prior submit step's request IDs
         # if one was saved for this date; falls back to a fresh submit-and-block
-        # (today's original behavior) if there's nothing to resume from.
+        # (submit-and-block) if there's nothing to resume from.
         pre_submitted = None
         if conn:
             forecast_date_str = config.download_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -159,10 +160,10 @@ def main():
         # RIVER_FORECASTS pointer rows: `conn` above is only opened when needs_snowflake_
         # creds() says the configured MODE requires it, so a fully-independent BLOB config
         # leaves it None even when real Snowflake credentials are sitting right there in the
-        # environment -- previously left the discharge/extent files sitting in Blob with
-        # nothing in Snowflake ever pointing at them. write_conn reuses `conn` if already
-        # open, otherwise opens its own ad-hoc connection whenever real credentials are
-        # present, matching the sibling MET_FORECASTS write in github_actions/main.py.
+        # environment. write_conn reuses `conn` if already open, otherwise opens its own
+        # ad-hoc connection whenever real credentials are present, matching the sibling
+        # MET_FORECASTS write in github_actions/main.py, so Blob files always get a
+        # Snowflake pointer row.
         have_snowflake_creds = all([
             config.sf_account, config.sf_user, config.sf_password,
             config.sf_warehouse, config.sf_database, config.sf_schema,
@@ -207,31 +208,31 @@ def main():
                 else:
                     logger.warning(
                         "No stage_path in result (local day-cache hit before this run's "
-                        "data was ever staged) -- skipping metadata load this run"
+                        "data was ever staged), skipping metadata load this run"
                     )
             elif upload_to_stage:
                 logger.warning(
-                    "No Snowflake credentials configured -- RIVER_FORECASTS pointer row(s) "
+                    "No Snowflake credentials configured, RIVER_FORECASTS pointer row(s) "
                     "not written; the discharge/extent data is safely in Blob, but nothing "
                     "in Snowflake records where it is until a RIVER_FORECASTS row is "
                     "written separately"
                 )
 
-            # Extent-masking step (GloFAS x JRC v2.1), best-effort, never fails this
-            # run even if it produces nothing. See run_glofas_extent_pipeline's own
-            # docstring for why (a JRC-cache hiccup must not take down the
-            # already-critical raw discharge pipeline that shares this run).
+            # Extent-masking step (GloFAS x JRC v2.1), best-effort: a step-level failure
+            # never fails this run (a JRC-cache hiccup must not take down the
+            # already-critical raw discharge pipeline that shares this run), but a tier whose
+            # compact write or upload failed is reported below so the run ends non-zero.
             extent_results = run_glofas_extent_pipeline(config, snowflake_conn=conn, discharge_result=result)
+            failed_extent_tiers = getattr(extent_results, 'failed_tiers', [])
+            if failed_extent_tiers:
+                metadata_load_errors.append(
+                    f"Compact extent file failed for RP tier(s) {', '.join(failed_extent_tiers)} on "
+                    f"{result['forecast_date']}; tier(s) skipped, no pointer registered, retried next run"
+                )
             if extent_results and upload_to_stage and write_conn:
+                # Compact bitmask file: PARAM extent_bymask_rp{N}, registered only for a file
+                # that was actually uploaded.
                 metadata_rows = [{
-                    'forecast_time': result['forecast_date'],
-                    'param': f"extent_rp{int(float(r['rp']))}_bymember",
-                    'is_standin': r['is_standin'],
-                    'stage_path': r['stage_path'],
-                } for r in extent_results if r.get('stage_path')]
-                # Compact bitmask companion file: its own PARAM (not 'extent_rp%') so
-                # per-member extent_rp lookups never match it.
-                metadata_rows += [{
                     'forecast_time': result['forecast_date'],
                     'param': f"extent_bymask_rp{int(float(r['rp']))}",
                     'is_standin': r['is_standin'],

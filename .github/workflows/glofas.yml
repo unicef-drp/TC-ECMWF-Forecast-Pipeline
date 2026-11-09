@@ -5,16 +5,16 @@ on:
   # while waiting on the CDS queue:
   #  - submit  (15:00 UTC): fires the 2 CDS requests and exits in seconds
   #  - process (15:40 UTC, CDS_PROCESS_DELAY_MINUTES=40 in glofas_downloader.py):
-  #    resumes those request IDs, waiting-then-downloading. Real observed CDS
-  #    queue times so far: ~12-40 min across several real test runs; 40 min is a
-  #    real-data-informed starting point with headroom, not a guess. If CDS still
-  #    isn't ready by 15:40 this step just waits out the remainder itself (the
-  #    same patient wait-and-retry the original single-step flow always used)
+  #    resumes those request IDs, waiting-then-downloading. Observed CDS queue
+  #    times are ~12-40 min, so 40 min leaves headroom. If CDS still isn't ready
+  #    by 15:40 this step waits out the remainder itself (patient wait-and-retry)
   #  - process (19:00 UTC): a retry later the same day, for when today's forecast
-  #    genuinely had not been published by CDS yet at 15:40. The file existence
-  #    check in _glofas_already_downloaded(), scoped to the same day only, makes
-  #    this a cheap no op if the 15:40 run already succeeded; it only does real
-  #    work if that run did not.
+  #    genuinely had not been published by CDS yet at 15:40. Process runs
+  #    short-circuit via the day-level cache hit in download_glofas_forecast()
+  #    and, for extent, via _already_computed_extent_tiers() (reused only if all
+  #    6 compact files exist), so this is a cheap no op if the 15:40 run already
+  #    succeeded; it only does real work if that run did not.
+  #    _glofas_already_downloaded() guards only the submit trigger.
   schedule:
     - cron: '0 15 * * *'   # submit
     - cron: '40 15 * * *'  # process
@@ -27,7 +27,7 @@ on:
         required: false
         type: string
       mode:
-        description: 'GLOFAS_MODE override -- submit (fire CDS requests, exit) or process (resume/full run, waits for CDS if needed)'
+        description: 'GLOFAS_MODE override: submit (fire CDS requests, exit) or process (resume/full run, waits for CDS if needed)'
         required: false
         type: choice
         options:

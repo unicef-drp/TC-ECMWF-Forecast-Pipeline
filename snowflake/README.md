@@ -11,7 +11,7 @@ This directory contains the SPCS entry point for the ECMWF TC Forecast Pipeline.
 - **Flexible Authentication**: SPCS OAuth, private key, or password
 - **Phase-level Timing**: per-phase timing logged to `unicef_pipeline.log`
 
-All data processing steps (1–6) are shared with the GitHub Actions pipeline via `pipeline_core.py`. This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
+All data processing steps (1 to 6) are shared with the GitHub Actions pipeline via `pipeline_core.py`. This entry point adds only the SPCS-specific Snowflake loading (`phase4_snowflake_loading`) and passes concurrency parameters to `step3_transform` and `step5_process_wind`.
 
 Execution sequence:
 1. **Phase 1**: Download combined BUFR file → extract named storms → split per-storm CSVs
@@ -21,7 +21,7 @@ Execution sequence:
 5. **Phase 3c** *(optional)*: Download global met GRIB files → convert to Zarr → PUT to Snowflake stage. Runs regardless of whether named storms were found.
 6. **Phase 4**: Load `TC_TRACKS`, `TC_ENVELOPES_INDIVIDUAL`, `TC_ENVELOPES_COMBINED`, `TC_GUST_ENVELOPES_INDIVIDUAL`, `TC_GUST_ENVELOPES_COMBINED`, and `MET_FORECASTS` to Snowflake
 
-> **No named storms**: If Phase 1 finds no named storms, Phases 2–3 (wind) are skipped. Phase 3b (precipitation) still runs when `PROCESS_MET=true`, then the pipeline exits cleanly.
+> **No named storms**: If Phase 1 finds no named storms, Phases 2 to 3 (wind) are skipped. Phase 3c (precipitation) still runs when `PROCESS_MET=true`, then the pipeline exits cleanly.
 
 ## Files
 
@@ -329,7 +329,7 @@ Wind data download depends on TC data:
 3. Wind data is then downloaded for:
    - The same date as the TC data
    - The same run time as the TC data
-   - Forecast hours determined by analyzing the TC data (typically 0-144 hours in 6-hour increments)
+   - Forecast hours determined by analyzing the TC data (the track's max lead time rounded up to 6h, plus a 12h buffer, capped at 144h; 3-hourly from 0, so at most 49 steps)
 
 **If TC download fails or returns no files**: Wind download is skipped with a warning
 
@@ -357,7 +357,7 @@ own image rather than as a step inside the main pipeline.
 `snowflake/Dockerfile.glofas`, a dedicated, leaner image (no eccodes, no system
 libgdal/geos/proj built from source; GloFAS never touches BUFR/GRIB/wind processing),
 using `requirements-glofas.txt` instead of `requirements-ci.txt`. It does include
-`rasterio` for the extent-masking step's GeoTIFF I/O, but rasterio's PyPI wheel
+`rasterio` for reading the JRC GeoTIFF inputs of the extent-masking step, but rasterio's PyPI wheel
 bundles its own GDAL, so no system geospatial packages are needed. This is a
 genuinely separate Docker image from `tc-ecmwf-pipeline` above, the main image's
 `CMD` is hardcoded to `spcs_pipeline.py` and never copies any GloFAS files in, so it
@@ -416,36 +416,39 @@ EXECUTE JOB SERVICE
 
 **CDS idle-wait-time cost fix (submit/process split):** schedule via **two**
 Snowflake TASKs calling this `EXECUTE JOB SERVICE`, not one: one with `GLOFAS_MODE: "submit"`
-at the original once-daily time (past GloFAS's ~11h publication latency, e.g.
+at the once-daily time (past GloFAS's ~11h publication latency, e.g.
 12-13 UTC), and a second with `GLOFAS_MODE: "process"` `CDS_PROCESS_DELAY_MINUTES` later
 (currently 40 min, see `glofas_downloader.py`). `submit` fires the 2 real CDS requests and exits
 in seconds, saving the returned request IDs to a new `GLOFAS_CDS_REQUESTS` table; `process`
-resumes those requests (patient wait-then-download, same behavior the original single-step flow
-always had), falling back to a fresh submit-and-block if nothing was saved. This is what makes
+resumes those requests (patient wait-then-download), falling back to a fresh submit-and-block if nothing was saved. This is what makes
 `GLOFAS_MODE` default to `process` and safe to omit entirely for a deployment that only wants
 one task, at the cost of not benefiting from the split.
 
-**Prerequisite:** `setup_glofas_thresholds.py` must have been run once already
-(manually, not part of any recurring job) to populate
+**Optional prerequisite:** `setup_glofas_thresholds.py` can be run once
+(manually, not part of any recurring job) to pre-populate
 `@{stage}/glofas/thresholds_cache/rl_*.nc`. The sparse cell filter depends on
-these being present and will fail without them (unless `GLOFAS_THRESHOLD_SOURCE=local`
-with a pre-populated local directory instead).
+these files; any missing one is fetched from ECMWF on first use and cached to the
+stage. With `GLOFAS_THRESHOLD_SOURCE=local`, a pre-populated local directory is
+required instead.
 
 Extent masking (GloFAS x JRC v2.1 flood-extent, enabled by default via
 `GLOFAS_EXTENT_ENABLED`) additionally requires `setup_jrc_extents.py` to have been
 run once already (manually) to populate `@{stage}/glofas/jrc_extent_cache/v2_1/*.tif`,
 a plain script with no credentials of its own, it fetches directly from JRC's own
 file server (unless `GLOFAS_JRC_SOURCE=local` with a pre-populated local directory
-instead).
+instead). For a Blob source, copy its `--local-only` output to
+`<container>/glofas/jrc_extent_cache/v2_1/`.
 
 **Snowflake table:** `RIVER_FORECASTS`: same staging+MERGE pattern as the main
 pipeline's `MET_FORECASTS`, key `(FORECAST_TIME, PARAM)`. Shared by both products:
-raw discharge rows use `PARAM='dis24'`; per-member flood-extent rows use
-`PARAM='extent_rp{2,5,10,20,50,100}_bymember'` plus an `IS_STANDIN` column (true only
-for the RP2/RP5 stand-in tiers, which reuse RP10's own extent , JRC has no native map
-below RP10). Each `_bymember` row points at a Parquet file (not a GeoTIFF), a sparse
-table, one row per pixel/member/step actually flooded for that member, not a blended
-probability across all 51 members.
+raw discharge rows use `PARAM='dis24'`; compact flood-extent rows use
+`PARAM='extent_bymask_rp{2,5,10,20,50,100}'` plus an `IS_STANDIN` column (true only
+for the RP2/RP5 stand-in tiers, which reuse RP10's own extent, JRC has no native map
+below RP10). Each row points at a Parquet file (not a GeoTIFF) with one row per
+flooded pixel and one uint64 member bitmask per lead step (bit = member id - 1), not a
+blended probability across all 51 members. A tier whose write or upload failed has no
+row for that date and is retried on the next run (the SPCS entry point only logs the ERROR;
+the GitHub Actions entry point exits non-zero).
 
 **Snowflake table (submit/process split):** `GLOFAS_CDS_REQUESTS`: key
 `(FORECAST_DATE, PRODUCT_TYPE)`, columns `REQUEST_ID`, `SUBMITTED_AT`. Written by the

@@ -16,7 +16,7 @@ Storage format:
   Zarr ZipStore (.zarr.zip): single file, chunked (1, 1, lat, lon), float16, zstd.
   dims: (member=51, step=25, lat, lon)
   values: accumulated from T+0 (subtract consecutive steps for period values)
-  spatial: 60°S–60°N (all TC-active basins; Arctic/Antarctica excluded)
+  spatial: 60°S to 60°N (all TC-active basins; Arctic/Antarctica excluded)
 
 Storage destinations:
   DATA_PIPELINE_DB=SNOWFLAKE  →  PUT to Snowflake internal stage @{SNOWFLAKE_STAGE_NAME}
@@ -27,8 +27,7 @@ Storage destinations:
   DATA_PIPELINE_DB=LOCAL       →  ZipStore kept in met_data/ on disk
 
 Member 51 (HRES control):
-  stream=enfo, type=cf was deprecated in IFS Cycle 50r1 (May 2026).
-  Member 51 is now downloaded as stream=oper, type=fc (HRES deterministic forecast).
+  Member 51 is downloaded as stream=oper, type=fc (HRES deterministic forecast).
   HRES open data is at 0.25°, same grid as ENS, no regridding needed.
 """
 
@@ -51,7 +50,7 @@ logger = logging.getLogger(__name__)
 LAT_MIN = -60.0
 LAT_MAX = 60.0
 
-# All 25 forecast steps: 0–144h at 6h intervals (ENS pf covers all run times)
+# All 25 forecast steps: 0 to 144h at 6h intervals (ENS pf covers all run times)
 FORECAST_STEPS = list(range(0, 145, 6))
 
 # HRES (stream=oper, type=fc) max step per run time.
@@ -67,7 +66,7 @@ DEFAULT_MET_DIR = 'met_data'
 
 def _download_pf_step(client: Client, param: str, forecast_date: datetime,
                       run_time: int, step: int, grib_dir: Path) -> Dict:
-    """Download one step of ENS perturbed members 1–50 (stream=enfo, type=pf)."""
+    """Download one step of ENS perturbed members 1 to 50 (stream=enfo, type=pf)."""
     fname = f'{param}_pf_{forecast_date.strftime("%Y-%m-%d")}_r{run_time:02d}_f{step:03d}h.grib2'
     fpath = grib_dir / fname
 
@@ -91,7 +90,7 @@ def _download_hres_step(client: Client, param: str, forecast_date: datetime,
                         run_time: int, step: int, grib_dir: Path) -> Dict:
     """
     Download one step of HRES control (member 51).
-    stream=oper, type=fc replaces deprecated stream=enfo, type=cf since Cycle 50r1.
+    Uses stream=oper, type=fc (IFS Cycle 50r1 removed enfo/cf).
     Published at 0.25°, same grid as ENS, stacks directly.
     """
     fname = f'{param}_hres_{forecast_date.strftime("%Y-%m-%d")}_r{run_time:02d}_f{step:03d}h.grib2'
@@ -150,7 +149,7 @@ def _load_grib_step(param: str, pf_path: Path, hres_path: Path,
     """
     Load one forecast step from pf + hres GRIB2 files.
     Returns (members [51, lat, lon] float32 mm, lats, lons).
-    Members 0–49: ENS perturbed.  Member 50: HRES control (NaN if hres_path absent).
+    Members 0 to 49: ENS perturbed.  Member 50: HRES control (NaN if hres_path absent).
     """
     idx_pf = str(pf_path) + '.idx'
 
@@ -221,7 +220,7 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
     chunks: (1, 1, lat, lon), one chunk per member per step; fast random access
     comp:   Blosc/zstd-3/bitshuffle
     values: accumulated mm from T+0 (raw ECMWF output)
-             → period values = step_n − step_(n-6) computed at read time
+             → period values = step_n - step_(n-6) computed at read time
 
     Returns path to the .zarr.zip file.
     """
@@ -236,7 +235,7 @@ def build_zarr_zipstore(param: str, forecast_date: datetime, run_time: int,
 
     all_steps: List[np.ndarray] = []
     lats = lons = None
-    pf_numbers = None  # GRIB member numbers 1–50, captured from first step
+    pf_numbers = None  # GRIB member numbers 1 to 50, captured from first step
 
     for step in FORECAST_STEPS:
         pf_name   = f'{param}_pf_{forecast_date.strftime("%Y-%m-%d")}_r{run_time:02d}_f{step:03d}h.grib2'
@@ -459,8 +458,8 @@ def download_ensemble_param(
     if verbose:
         logger.info('=' * 70)
         logger.info(f'ECMWF ENS, {param.upper()}  {forecast_date.strftime("%Y-%m-%d")} {run_time:02d}Z')
-        logger.info(f'  Steps: {len(FORECAST_STEPS)} (0–144h at 6h)  |  Members: 51 (50 pf + 1 hres)')
-        logger.info(f'  Spatial: {LAT_MIN}°–{LAT_MAX}°  |  Upload: {"stage" if upload_to_stage else "local"}')
+        logger.info(f'  Steps: {len(FORECAST_STEPS)} (0 to 144h at 6h)  |  Members: 51 (50 pf + 1 hres)')
+        logger.info(f'  Spatial: {LAT_MIN}° to {LAT_MAX}°  |  Upload: {"stage" if upload_to_stage else "local"}')
         logger.info('=' * 70)
 
     # Step 1: Download all GRIB2 files

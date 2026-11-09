@@ -2,19 +2,20 @@
 """
 GloFAS discharge x JRC flood-extent masking
 
-Combines the sparse per-cell discharge-exceedance probability already built by
-glofas_downloader.py with JRC v2.1's static, pre-cached flood-extent rasters
+Combines the sparse per-cell, per-member discharge exceedance of each RP
+threshold (from the Zarr built by glofas_downloader.py) with JRC v2.1's static,
+pre-cached flood-extent rasters, as follows:
 
   - Full 6-tier severity ladder: RP2/RP5 (no native JRC map: reuse RP10's
     own extent as a labeled upper-bound stand-in) + RP10/RP20/RP50/RP100
     (native JRC tier match).
   - Nearest-cell "hard" assignment: each JRC pixel within a GloFAS cell's
-    0.05deg footprint inherits that cell's own probability.
+    0.05deg footprint inherits that cell's own per-member exceedance.
   - Permanent water excluded (JRC's own permanent_water_class band).
   - uparea < 500km^2 is flagged via a `below_min_basin` column, NOT excluded.
     IMPORTANT: this is NOT a confidence flag on the GloFAS discharge forecast
     or the RP threshold comparison, both are dense, global, unrestricted
-    products (confirmed directly: every cell has a real RP threshold value,
+    products (every cell has a real RP threshold value,
     even down to ~28km^2 catchments). 500km^2 is specifically JRC's own
     minimum-catchment cutoff for generating the flood-EXTENT map itself (the
     LISFLOOD-FP hydraulic simulation), below it, there may be no flood
@@ -22,12 +23,16 @@ glofas_downloader.py with JRC v2.1's static, pre-cached flood-extent rasters
     forecast-quality one. See
     https://confluence.ecmwf.int/spaces/CEMS/pages/340774762/CEMS-Flood+flood+inundation+maps
 
-Output: one tiled GeoTIFF per RP tier per forecast date, 7 bands (one per
-lead step, 24h-168h), globally scoped (60S-60N, no country/region split,
-mirrors the raw discharge Zarr's own "nominally global, actually sparse"
-storage philosophy; GloFAS's real active-cell coverage on any given day is a
-small fraction of the full band, so a sparse/nodata-heavy tiled GeoTIFF
-compresses well despite nominal global extent).
+Output: one compact Parquet file per RP tier per forecast date
+(river_extent_rp{N}_bymask_<YYYYMMDD>.parquet), globally scoped (60S-60N, no
+country/region split, mirrors the raw discharge Zarr's own "nominally global,
+actually sparse" storage philosophy). Each row is one flooded JRC pixel
+(pixel_lat, pixel_lon as float64) with one uint64 member bitmask per lead step
+(m024..m168, bit = member id - 1) and the below_min_basin flag. Rows are in
+Morton order, zstd-compressed, in 262144-row groups.
+
+compute_tier_probabilities() and combine_tier() together produce an
+aggregate-probability GeoTIFF; they are demo-only and not part of this output.
 """
 
 import logging
@@ -57,8 +62,8 @@ logger = logging.getLogger(__name__)
 
 # RP2/RP5 have no native JRC map (JRC only covers RP10 and up), they borrow
 # RP10's own extent as a labeled upper-bound stand-in, since flood extent
-# grows monotonically with return period (confirmed both at the aggregate
-# area level and at the pixel level).
+# grows monotonically with return period (at both the aggregate
+# area level and the pixel level).
 EXTENT_SOURCE_TIER = {"2.0": "10.0", "5.0": "10.0", "10.0": "10.0",
                        "20.0": "20.0", "50.0": "50.0", "100.0": "100.0"}
 IS_STANDIN = {"2.0": True, "5.0": True, "10.0": False,
@@ -78,10 +83,8 @@ JRC_STAGE_PREFIX = f"glofas/jrc_extent_cache/{JRC_VERSION}"
 # same forecast, so they live in the same date folder on stage.
 EXTENT_STAGE_PREFIX = "glofas"
 
-# Compact companion to the per-member file: one row per distinct flooded pixel with
-# one uint64 member bitmask per lead step (bit = member id - 1), written alongside the
-# per-member file in the same cell loop. Needs member ids 1..64.
-EXTENT_BYMASK_ENABLED = True
+# Compact extent file: one row per distinct flooded pixel with one uint64 member bitmask
+# per lead step (bit = member id - 1). Needs member ids 1..64.
 BYMASK_ROW_GROUP_SIZE = 262144
 BYMASK_MAX_MEMBERS = 64
 # Granularity of the Morton (z-order) cell index that orders the bymask rows.
@@ -162,7 +165,7 @@ def _resolve_jrc_file(fname: str, jrc_source: str, jrc_local_dir: Union[str, Pat
         if not local_path.exists():
             raise FileNotFoundError(
                 f"JRC cache file {fname} not found on stage at {JRC_STAGE_PREFIX}/{fname}. "
-                f"Run setup_jrc_extents.py first (no credentials needed -- direct JRC download)."
+                f"Run setup_jrc_extents.py first (no credentials needed, direct JRC download)."
             )
         return local_path
 
@@ -179,7 +182,8 @@ def _resolve_jrc_file(fname: str, jrc_source: str, jrc_local_dir: Union[str, Pat
         if not download_from_blob(blob_account_url, blob_sas_token, blob_container, blob_path, local_path):
             raise FileNotFoundError(
                 f"JRC cache file {fname} not found on Blob at {blob_path}. "
-                f"Run setup_jrc_extents.py first (no credentials needed -- direct JRC download)."
+                f"Run setup_jrc_extents.py --local-only <dir> first (no credentials needed, "
+                f"direct JRC download), then copy <dir> to <container>/{JRC_STAGE_PREFIX}/."
             )
         return local_path
 
@@ -249,7 +253,6 @@ def compute_tier_probabilities(cell_lat: np.ndarray, cell_lon: np.ndarray, data:
 
     ONLY used in the demo notebook for now.
     """
-    n_steps = data.shape[1]
     result = {}
     for rp in EXTENT_RP_LEVELS:
         threshold_path = _fetch_threshold_file(
@@ -278,8 +281,8 @@ def compute_tier_member_exceedance(cell_lat: np.ndarray, cell_lon: np.ndarray, d
     Returns {rp: array of shape (n_members, n_steps, n_cells)} boolean: per-member
     exceedance of that tier's threshold, NOT collapsed across the member axis (unlike
     compute_tier_probabilities(), which discards this to produce one aggregate
-    probability). Powers combine_tier_per_member_parquet()'s per-member flood-extent
-    output.
+    probability). Feeds combine_tier_bymask_parquet(), which packs the member axis
+    into per-step uint64 bitmasks.
 
     NaN thresholds (a cell with no valid RP value in the official threshold file) do
     not need explicit masking here: `data > nan` already evaluates to False for
@@ -289,11 +292,9 @@ def compute_tier_member_exceedance(cell_lat: np.ndarray, cell_lon: np.ndarray, d
     fault-isolation contract: one tier's threshold fetch/load failure (a bad
     Snowflake stage GET that also fails its ECMWF-download fallback, a corrupted
     cached .nc file, etc.) is logged and that tier is simply absent from the
-    returned dict, it never discards tiers already computed earlier in this
-    same call, and it never aborts the whole function the way one shared
-    try/except around the entire loop used to.
+    returned dict. Tiers already computed in the same call are kept, and no
+    single failure aborts the whole function.
     """
-    n_steps = data.shape[1]
     result = {}
     for rp in EXTENT_RP_LEVELS:
         try:
@@ -401,7 +402,7 @@ def combine_tier(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
         if depth_src.transform != water_src.transform or depth_src.shape != water_src.shape:
             raise ValueError(
                 f"JRC depth ({depth_path.name}) and permanent-water ({water_path.name}) rasters "
-                f"do not share the same grid -- setup_jrc_extents.py must produce co-registered outputs"
+                f"do not share the same grid; setup_jrc_extents.py must produce co-registered outputs"
             )
         profile = depth_src.profile.copy()
         profile.update(count=n_steps, dtype="float32", nodata=0.0,
@@ -568,154 +569,71 @@ class _BymaskWriter:
             pass
 
 
-def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
-                                     exceed_by_member: Dict[str, np.ndarray], keep_mask: np.ndarray,
-                                     jrc_paths: Dict[str, Path], leadtime_hours: List[int],
-                                     member_numbers: np.ndarray, out_path: Path,
-                                     below_min_basin: Optional[np.ndarray] = None,
-                                     flush_every_rows: int = 2_000_000,
-                                     bymask_path: Optional[Path] = None) -> Dict:
+def combine_tier_bymask_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.ndarray,
+                                 exceed_by_member: Dict[str, np.ndarray], keep_mask: np.ndarray,
+                                 jrc_paths: Dict[str, Path], leadtime_hours: List[int],
+                                 member_numbers: np.ndarray, bymask_path: Path,
+                                 below_min_basin: Optional[np.ndarray] = None) -> Dict:
     """
-    Writes one Parquet file for a single RP tier: one row per (pixel, member,
-    step) that IS flooded for that member after JRC pixel-matching: sparse,
-    True-only (the overwhelming majority of pixel/member/step combinations
-    are NOT flooded, so only writing the positive case keeps this small).
+    Writes the compact extent file for a single RP tier: one row per distinct flooded
+    pixel (after JRC pixel-matching) with columns pixel_lat, pixel_lon, one uint64 member
+    bitmask per lead step (m024..m168, bit = member id - 1, per step, not cumulative) and
+    below_min_basin (True if this cell's own uparea is known to be below JRC's own 500km^2
+    minimum-catchment cutoff for generating flood-extent maps, a matching-availability flag,
+    not a statement about this cell's discharge forecast being less trustworthy;
+    `below_min_basin` is per-cell (shape (n_cells,), aligned to cell_lat/cell_lon),
+    broadcast onto every row a given cell contributes. None means "not evaluated", every
+    row gets False). Only pixels with at least one nonzero step mask are written.
 
-    Columns: pixel_lat, pixel_lon, member (real ECMWF member id, 1-50 pf /
-    51 control), step_h, below_min_basin (True if this cell's own uparea is
-    known to be below JRC's own 500km^2 minimum-catchment cutoff for
-    generating flood-extent maps, a matching-availability flag, not a
-    statement about this cell's discharge forecast being less trustworthy;
-    `below_min_basin` is per-cell (shape (n_cells,), aligned to cell_lat/
-    cell_lon), broadcast onto every row a given cell contributes. None (the
-    default) means "not evaluated", every row gets False, same as an
-    unknown/NaN uparea value upstream.
+    Reuses _cell_jrc_window_and_mask(): the exact same window/JRC-read/membership logic
+    combine_tier() uses for the aggregate case, so the expensive per-cell geometry is
+    identical between the two paths. Cells are visited in Morton order of their 0.05deg
+    grid index, so each row group spans a compact lat/lon box.
 
-    Reuses _cell_jrc_window_and_mask(): the exact same window/JRC-read/
-    membership logic combine_tier() uses for the aggregate case, so the
-    expensive per-cell geometry (computed once per cell, unaffected by
-    member count) is identical between the two paths. Only the innermost
-    "what do we do with this cell's mask" step differs: instead of blending
-    across members into one probability value, every member that exceeds
-    this cell's threshold on a given step gets its own row for every masked
-    pixel in that cell.
-
-    Streams to disk via a pyarrow ParquetWriter, flushing every
-    `flush_every_rows` accumulated rows, rather than building one giant
-    in-memory table across every cell before writing once.
-
-    If `bymask_path` is given, the same cell loop (one JRC read per cell) also writes the
-    compact companion file: one row per distinct flooded pixel with columns pixel_lat,
-    pixel_lon, one uint64 member bitmask per lead step (m024..m168, bit = member id - 1,
-    per step, not cumulative) and below_min_basin. Only pixels with at least one nonzero
-    step mask are written. Cells are visited in Morton order of their 0.05deg grid index,
-    so each row group spans a compact lat/lon box. The two outputs are fault-isolated: a
-    bitmask failure only drops the bitmask file (returned `bymask_path` is None), and the
-    per-member file is never affected. If the per-member output itself aborts, the
-    incomplete bitmask file is discarded. Member ids above BYMASK_MAX_MEMBERS cannot be
-    represented, which skips only the bitmask file.
+    A single cell's JRC read failure only drops that cell. Any tier-level failure (member
+    ids outside 1..BYMASK_MAX_MEMBERS, JRC grid mismatch, a write error) raises, and the
+    partial file is discarded, so the caller skips the tier.
     """
     source_tier = EXTENT_SOURCE_TIER[rp]
     depth_path = jrc_paths[source_tier]
     water_path = jrc_paths["water"]
-    n_steps = len(leadtime_hours)
     exceed = exceed_by_member[rp]  # (n_members, n_steps, n_cells) boolean
-    if bymask_path is not None:
-        member_arr = np.asarray(member_numbers)
-        if member_arr.size == 0 or int(member_arr.max()) > BYMASK_MAX_MEMBERS or int(member_arr.min()) < 1:
-            logger.error(f"  RP{rp}: member ids outside 1..{BYMASK_MAX_MEMBERS} "
+    member_arr = np.asarray(member_numbers)
+    if member_arr.size == 0 or int(member_arr.max()) > BYMASK_MAX_MEMBERS or int(member_arr.min()) < 1:
+        raise ValueError(f"RP{rp}: member ids outside 1..{BYMASK_MAX_MEMBERS} "
                          f"(max {int(member_arr.max()) if member_arr.size else 'n/a'}), "
-                         f"cannot build the uint64 bitmask file -- skipping it for this tier "
-                         f"(the per-member file is unaffected)")
-            bymask_path = None
+                         f"cannot build the uint64 bitmask file")
     if below_min_basin is None:
         below_min_basin = np.zeros(len(cell_lat), dtype=bool)
 
-    schema = pa.schema([
-        ("pixel_lat", pa.float64()), ("pixel_lon", pa.float64()),
-        ("member", pa.int16()), ("step_h", pa.int16()),
-        ("below_min_basin", pa.bool_()),
-    ])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    lat_chunks, lon_chunks, member_chunks, step_chunks, basin_chunks = [], [], [], [], []
-    buffered_rows = 0
-    total_rows = 0
-    writer = None
     mask_writer = None
-    n_mask_rows = 0
-
-    def drop_mask_writer(reason):
-        nonlocal mask_writer
-        logger.error(f"  RP{rp}: bitmask file failed, skipping it for this tier "
-                     f"(the per-member file is unaffected): {reason}")
-        if mask_writer is not None:
-            mask_writer.abort()
-        mask_writer = None
-
-    def flush():
-        nonlocal lat_chunks, lon_chunks, member_chunks, step_chunks, basin_chunks, buffered_rows, total_rows
-        if not lat_chunks:
-            return
-        table = pa.table({
-            "pixel_lat": np.concatenate(lat_chunks),
-            "pixel_lon": np.concatenate(lon_chunks),
-            "member": np.concatenate(member_chunks).astype(np.int16),
-            "step_h": np.concatenate(step_chunks),
-            "below_min_basin": np.concatenate(basin_chunks),
-        }, schema=schema)
-        writer.write_table(table)
-        total_rows += buffered_rows
-        lat_chunks, lon_chunks, member_chunks, step_chunks, basin_chunks = [], [], [], [], []
-        buffered_rows = 0
-
     try:
         with rasterio.open(depth_path) as depth_src, rasterio.open(water_path) as water_src:
             if depth_src.transform != water_src.transform or depth_src.shape != water_src.shape:
                 raise ValueError(
                     f"JRC depth ({depth_path.name}) and permanent-water ({water_path.name}) rasters "
-                    f"do not share the same grid -- setup_jrc_extents.py must produce co-registered outputs"
+                    f"do not share the same grid; setup_jrc_extents.py must produce co-registered outputs"
                 )
-            # Only create the output file AFTER the co-registration check above
-            # can no longer raise, matches combine_tier()'s own ordering
-            # (its GeoTIFF is likewise only opened once that same check has
-            # already passed). Creating the writer any earlier would leave a
-            # stale, misleadingly "successful-looking" empty Parquet file on
-            # disk if this tier fails validation before processing any cells.
-            writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+            # The writer is created only after the co-registration check passes, so a tier
+            # failing validation leaves no file on disk.
+            mask_writer = _BymaskWriter(bymask_path, bymask_step_columns(leadtime_hours))
 
             transform = depth_src.transform
             active_idx = np.where(keep_mask)[0]
-            if bymask_path is not None:
-                try:
-                    mask_writer = _BymaskWriter(bymask_path, bymask_step_columns(leadtime_hours))
-                    active_idx = active_idx[morton_cell_order(cell_lat[active_idx], cell_lon[active_idx])]
-                except Exception as e:
-                    logger.error(f"  RP{rp}: could not start the bitmask file, skipping it for this "
-                                 f"tier (the per-member file is unaffected): {e}")
-                    mask_writer = None
+            active_idx = active_idx[morton_cell_order(cell_lat[active_idx], cell_lon[active_idx])]
             n_cells_failed = 0
 
             for i in active_idx:
-                # Same per-cell exception isolation as combine_tier(): one cell's
-                # failure must only drop that cell, never the whole tier. The
-                # periodic flush() call below is deliberately OUTSIDE this
-                # try/except. A flush-time write error is a real, tier-level
-                # I/O failure (not this cell's fault), and letting it propagate
-                # (instead of being caught and mislabeled as "this cell failed"
-                # while its already-buffered rows from many prior cells are
-                # silently retained rather than retried or discarded) is the
-                # correct behavior: it aborts this tier loudly via the outer
-                # try/finally, same as a genuine unrecoverable error should.
+                # Per-cell exception isolation as in combine_tier(): one cell's JRC read
+                # failure must only drop that cell, never the whole tier. The add_cell()
+                # write below is deliberately OUTSIDE this try/except, since a write error
+                # is a tier-level failure that must abort the tier.
                 try:
                     result = _cell_jrc_window_and_mask(
                         float(cell_lat[i]), float(cell_lon[i]), depth_src, water_src, transform)
                     if result is None:
                         continue
                     window, mask = result
-
-                    # Pixel lat/lon for this cell's masked pixels, member/step
-                    # independent, computed once per cell and reused below.
                     mask_rows, mask_cols = np.where(mask)
                     if mask_rows.size == 0:
                         continue
@@ -723,62 +641,25 @@ def combine_tier_per_member_parquet(rp: str, cell_lat: np.ndarray, cell_lon: np.
                         transform, mask_rows + window.row_off, mask_cols + window.col_off)
                     px_lat_1d = np.asarray(px_lat_1d, dtype=np.float64)
                     px_lon_1d = np.asarray(px_lon_1d, dtype=np.float64)
-                    n_px = px_lat_1d.size
-
-                    if mask_writer is not None:
-                        try:
-                            step_masks = cell_member_masks(exceed[:, :, i], member_numbers)
-                            if step_masks.any():
-                                mask_writer.add_cell(px_lat_1d, px_lon_1d, step_masks, bool(below_min_basin[i]))
-                        except Exception as e:
-                            drop_mask_writer(e)
-
-                    for step_idx in range(n_steps):
-                        members_exceeding = np.where(exceed[:, step_idx, i])[0]
-                        if members_exceeding.size == 0:
-                            continue
-                        member_ids = member_numbers[members_exceeding]
-                        n_mem = member_ids.size
-                        # Cartesian product of this cell's masked pixels x this
-                        # step's exceeding members, vectorized (np.tile/repeat),
-                        # not a Python-level double loop over members.
-                        lat_chunks.append(np.tile(px_lat_1d, n_mem))
-                        lon_chunks.append(np.tile(px_lon_1d, n_mem))
-                        member_chunks.append(np.repeat(member_ids, n_px))
-                        step_chunks.append(np.full(n_mem * n_px, leadtime_hours[step_idx], dtype=np.int16))
-                        basin_chunks.append(np.full(n_mem * n_px, bool(below_min_basin[i])))
-                        buffered_rows += n_mem * n_px
+                    step_masks = cell_member_masks(exceed[:, :, i], member_numbers)
                 except Exception as e:
                     n_cells_failed += 1
                     logger.warning(f"  RP{rp}: cell ({cell_lat[i]:.4f}, {cell_lon[i]:.4f}) failed, "
                                     f"skipping just this cell: {e}")
                     continue
-
-                if buffered_rows >= flush_every_rows:
-                    flush()
+                if step_masks.any():
+                    mask_writer.add_cell(px_lat_1d, px_lon_1d, step_masks, bool(below_min_basin[i]))
             if n_cells_failed:
                 logger.warning(f"  RP{rp}: {n_cells_failed} of {len(active_idx)} cells failed and were skipped")
 
-        flush()  # final partial batch
+        n_mask_rows = mask_writer.finish()
     except BaseException:
-        # An aborted per-member output leaves the bitmask file incomplete, so it is discarded.
         if mask_writer is not None:
             mask_writer.abort()
         raise
-    finally:
-        if writer is not None:
-            writer.close()
 
-    if mask_writer is not None:
-        try:
-            n_mask_rows = mask_writer.finish()
-        except Exception as e:
-            drop_mask_writer(e)
-
-    return {"rp": rp, "n_cells": int(len(active_idx)), "n_rows": total_rows,
-            "is_standin": IS_STANDIN[rp], "path": out_path,
-            "bymask_path": bymask_path if mask_writer is not None else None,
-            "n_bymask_rows": n_mask_rows if mask_writer is not None else 0}
+    return {"rp": rp, "n_cells": int(len(active_idx)), "bymask_path": bymask_path,
+            "n_bymask_rows": n_mask_rows}
 
 
 def _upload_extent_file(local_path: Path, rp: str, date_str: str, snowflake_conn,
@@ -786,29 +667,33 @@ def _upload_extent_file(local_path: Path, rp: str, date_str: str, snowflake_conn
                          blob_account_url: Optional[str], blob_sas_token: Optional[str],
                          blob_container: Optional[str]) -> Optional[str]:
     """
-    Uploads one extent output file under glofas/{date}/ on the configured remote store and
-    returns its stage path, or None if there is no usable store or the upload failed
-    (never raises).
+    Uploads the extent file under glofas/{date}/ on the configured remote store and returns
+    its stage path, or None if there is no usable store (the file stays local only).
+    Raises if the upload itself fails, so the caller never registers a file that is not there.
     """
-    try:
-        stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{local_path.name}"
-        if data_pipeline_db == 'BLOB':
-            if not (blob_account_url and blob_sas_token and blob_container):
-                logger.warning(f"  RP{rp}: no Blob credentials -- keeping {local_path.name} local only")
-                return None
-            ok = upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, stage_path)
-        elif not snowflake_conn or not snowflake_stage_name:
-            logger.warning(f"  RP{rp}: no Snowflake connection -- keeping {local_path.name} local only")
+    stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{local_path.name}"
+    if data_pipeline_db == 'BLOB':
+        if not (blob_account_url and blob_sas_token and blob_container):
+            logger.warning(f"  RP{rp}: no Blob credentials, keeping {local_path.name} local only")
             return None
-        else:
-            ok = upload_to_snowflake_stage(local_path, snowflake_stage_name, stage_path, snowflake_conn)
-        if not ok:
-            logger.error(f"  RP{rp}: upload of {local_path.name} failed -- skipping its metadata row")
-            return None
-        return stage_path
-    except Exception as e:
-        logger.error(f"  RP{rp}: upload of {local_path.name} failed -- skipping its metadata row: {e}")
+        ok = upload_to_blob(local_path, blob_account_url, blob_sas_token, blob_container, stage_path)
+    elif not snowflake_conn or not snowflake_stage_name:
+        logger.warning(f"  RP{rp}: no Snowflake connection, keeping {local_path.name} local only")
         return None
+    else:
+        ok = upload_to_snowflake_stage(local_path, snowflake_stage_name, stage_path, snowflake_conn)
+    if not ok:
+        raise RuntimeError(f"upload of {local_path.name} to {stage_path} failed")
+    return stage_path
+
+
+class ExtentResults(list):
+    """Per-tier result dicts for the tiers produced, plus `failed_tiers`: the RP tiers whose
+    compact write or upload failed (skipped, nothing registered, retried next run)."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.failed_tiers: List[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -831,25 +716,27 @@ def run_glofas_extent_masking(
         blob_sas_token: Optional[str] = None,
         blob_container: Optional[str] = None,
         min_basin_km2: float = MIN_BASIN_KM2,
-) -> List[Dict]:
+) -> ExtentResults:
     """
     Reads the sparse cell set from the just-built raw-discharge Zarr,
     computes per-tier per-member exceedance, combines with the cached JRC
-    extent + permanent-water rasters, writes one Parquet file per RP tier
-    (one row per pixel/member/step that's flooded for that member, JRC
+    extent + permanent-water rasters, writes one compact Parquet file per RP tier
+    (one row per flooded pixel with per-step member bitmasks, JRC
     pixel-matched, plus a `below_min_basin` column flagging cells under
     JRC's own 500km^2 minimum-catchment cutoff for generating flood-extent
-    maps, and (if upload_to_stage) PUTs each to
-    the Snowflake stage. Best-effort per tier, so one tier's failure is logged
-    and skipped, never aborts the others or the raw-discharge upload that
-    already succeeded upstream.
+    maps), and (if upload_to_stage and credentials exist) uploads each to the
+    configured remote store (Blob or Snowflake stage); otherwise the file stays
+    local only. Best-effort per tier, so one tier's failure is logged and
+    skipped, never aborts the others or the raw-discharge upload that already
+    succeeded upstream.
 
-    Returns a list of metadata dicts (one per successfully-written tier):
-    {rp, is_standin, stage_path, n_cells, n_rows, bymask_stage_path, n_bymask_rows},
-    the caller maps `rp` into PARAM values ('extent_rp{N}_bymember' for stage_path,
-    'extent_bymask_rp{N}' for bymask_stage_path when set) and loads these alongside
-    raw discharge rows via load_riverine_metadata_to_snowflake() (one shared
-    RIVER_FORECASTS table, not a separate RIVER_EXTENT_FORECASTS).
+    Returns an ExtentResults list of metadata dicts (one per successfully-written tier):
+    {rp, is_standin, n_cells, bymask_stage_path, n_bymask_rows},
+    the caller maps `rp` into the PARAM value 'extent_bymask_rp{N}' for bymask_stage_path
+    and loads these alongside raw discharge rows via load_riverine_metadata_to_snowflake()
+    (one shared RIVER_FORECASTS table). bymask_stage_path is None for a local-only file
+    (no pointer should be registered). A tier whose compact write, member-limit check
+    or upload fails is left out of the list and named in the returned ExtentResults.failed_tiers.
     """
     date_str = forecast_date.strftime("%Y%m%d")
     output_path = Path(output_dir)
@@ -871,7 +758,7 @@ def run_glofas_extent_masking(
     logger.info(f"Extent masking: {n_cells:,} candidate cells from {zarr_path.name}")
     if n_cells == 0:
         logger.info("  No active cells today, nothing to combine")
-        return []
+        return ExtentResults()
 
     # NOT used as an exclusion criteria
     below_min_basin = (np.zeros(n_cells, dtype=bool) if cell_uparea_km2 is None
@@ -896,7 +783,7 @@ def run_glofas_extent_masking(
         )
     except Exception as e:
         logger.error(f"  Could not compute per-tier member exceedance, aborting extent masking: {e}")
-        return []
+        return ExtentResults()
 
     # resolve_jrc_cache() is itself per-file tolerant (never raises)
     # missing/corrupted JRC file for one tier must not take down every tier.
@@ -910,94 +797,54 @@ def run_glofas_extent_masking(
                                        blob_container=blob_container)
     except Exception as e:
         logger.error(f"  Could not resolve JRC cache at all, aborting extent masking: {e}")
-        return []
+        return ExtentResults()
 
-    results = []
+    results = ExtentResults()
     for rp in EXTENT_RP_LEVELS:
         source_tier = EXTENT_SOURCE_TIER[rp]
         if source_tier not in jrc_paths or "water" not in jrc_paths:
             logger.info(f"  RP{rp}: required JRC cache file(s) unavailable ({source_tier} depth "
-                        f"and/or permanent-water) -- skipping this tier")
+                        f"and/or permanent-water), skipping this tier")
             continue
 
         if rp not in exceed_by_tier:
             # compute_tier_member_exceedance() already logged why (its own
-            # per-tier try/except), this tier's threshold fetch/load failed
-            # and was skipped there, not a bug here.
-            logger.info(f"  RP{rp}: member exceedance unavailable for this tier -- skipping")
+            # per-tier try/except): this tier's threshold fetch/load failed
+            # and was skipped there.
+            logger.info(f"  RP{rp}: member exceedance unavailable for this tier, skipping")
             continue
 
         exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
         keep_mask = exceed.any(axis=(0, 1))
         if not keep_mask.any():
-            logger.info(f"  RP{rp}: no cells survive filtering -- skipping")
+            logger.info(f"  RP{rp}: no cells survive filtering, skipping")
             continue
 
-        # rp_int (not the raw "10.0" string) so the filename matches the extent_rp{N}
-        # PARAM convention used everywhere else for this tier (e.g. extent_rp10, not
-        # extent_rp10.0). Local path mirrors the Snowflake stage's own {date}/ layout
-        # exactly (no separate "extent/" subfolder), both raw discharge and this
-        # per-member output are per-cycle products of the same forecast date.
+        # rp_int (not the raw "10.0" string) so the filename matches the extent_bymask_rp{N}
+        # PARAM convention used everywhere else for this tier. Local path mirrors the stage's
+        # own {date}/ layout exactly (no separate "extent/" subfolder).
         rp_int = int(float(rp))
-        out_path = output_path / date_str / f"river_extent_rp{rp_int}_bymember_{date_str}.parquet"
-        bymask_path = (output_path / date_str / bymask_filename(rp_int, date_str)
-                       if EXTENT_BYMASK_ENABLED else None)
+        bymask_path = output_path / date_str / bymask_filename(rp_int, date_str)
         try:
-            info = combine_tier_per_member_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
-                                                    jrc_paths, leadtime_hours, member_numbers, out_path,
-                                                    below_min_basin=below_min_basin, bymask_path=bymask_path)
+            info = combine_tier_bymask_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
+                                                jrc_paths, leadtime_hours, member_numbers, bymask_path,
+                                                below_min_basin=below_min_basin)
+            n_flagged_cells = int((keep_mask & below_min_basin).sum())
+            logger.info(f"  RP{rp}: {info['n_cells']} cells ({n_flagged_cells} below_min_basin), "
+                        f"{info['n_bymask_rows']:,} flooded pixel rows -> {bymask_path.name}")
+            bymask_stage_path = None
+            if upload_to_stage:
+                bymask_stage_path = _upload_extent_file(
+                    bymask_path, rp, date_str, snowflake_conn, snowflake_stage_name,
+                    data_pipeline_db, blob_account_url, blob_sas_token, blob_container)
         except Exception as e:
-            logger.error(f"  RP{rp}: combination failed, skipping this tier: {e}")
-            continue
-        n_flagged_cells = int((keep_mask & below_min_basin).sum())
-        logger.info(f"  RP{rp}: {info['n_cells']} cells ({n_flagged_cells} below_min_basin), "
-                    f"{info['n_rows']:,} flooded pixel/member/step rows -> {out_path.name}")
-        if info.get("bymask_path") is not None:
-            logger.info(f"  RP{rp}: {info['n_bymask_rows']:,} flooded pixel rows -> {info['bymask_path'].name}")
-
-        # The bitmask file is uploaded first and on its own: its outcome never gates the
-        # per-member upload/registration below, and vice versa.
-        bymask_stage_path = None
-        if info.get("bymask_path") is not None and upload_to_stage:
-            bymask_stage_path = _upload_extent_file(
-                info["bymask_path"], rp, date_str, snowflake_conn, snowflake_stage_name,
-                data_pipeline_db, blob_account_url, blob_sas_token, blob_container)
-
-        stage_path = None
-        upload_ok = True
-        if upload_to_stage:
-            if data_pipeline_db == 'BLOB':
-                if not (blob_account_url and blob_sas_token and blob_container):
-                    logger.warning(f"  RP{rp}: upload_to_stage requested but no Blob credentials -- keeping local only")
-                else:
-                    stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{out_path.name}"
-                    ok = upload_to_blob(out_path, blob_account_url, blob_sas_token, blob_container, stage_path)
-                    if not ok:
-                        logger.error(f"  RP{rp}: Blob upload failed -- skipping metadata row for this tier")
-                        upload_ok = False
-            elif not snowflake_conn or not snowflake_stage_name:
-                logger.warning(f"  RP{rp}: upload_to_stage requested but no Snowflake connection -- keeping local only")
-            else:
-                stage_path = f"{EXTENT_STAGE_PREFIX}/{date_str}/{out_path.name}"
-                ok = upload_to_snowflake_stage(out_path, snowflake_stage_name, stage_path, snowflake_conn)
-                if not ok:
-                    logger.error(f"  RP{rp}: stage upload failed -- skipping metadata row for this tier")
-                    upload_ok = False
-
-        if not upload_ok:
-            # Per-member upload failed: no per-member row for this tier, but a bitmask file that
-            # did upload is still reported (stage_path None is skipped by per-member registration).
-            if bymask_stage_path:
-                results.append({
-                    "rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": None,
-                    "n_cells": info["n_cells"], "n_rows": info["n_rows"],
-                    "bymask_stage_path": bymask_stage_path, "n_bymask_rows": info["n_bymask_rows"],
-                })
+            logger.error(f"  RP{rp}: compact extent file for {date_str} failed, tier skipped, no pointer "
+                         f"registered, will be retried on the next run: {e}")
+            results.failed_tiers.append(rp)
             continue
 
         results.append({
-            "rp": rp, "is_standin": IS_STANDIN[rp], "stage_path": stage_path,
-            "n_cells": info["n_cells"], "n_rows": info["n_rows"],
+            "rp": rp, "is_standin": IS_STANDIN[rp], "n_cells": info["n_cells"],
             "bymask_stage_path": bymask_stage_path, "n_bymask_rows": info["n_bymask_rows"],
         })
 

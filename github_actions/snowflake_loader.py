@@ -609,13 +609,13 @@ def load_precip_metadata_to_snowflake(metadata_rows: list, conn) -> int:
 def load_riverine_metadata_to_snowflake(metadata_rows: list, conn) -> int:
     """
     Load GloFAS riverine metadata rows into RIVER_FORECASTS table; both raw
-    discharge (PARAM='dis24') and JRC per-member flood-extent output
-    (PARAM='extent_rp{N}_bymember', with IS_STANDIN true for the RP2/RP5
+    discharge (PARAM='dis24') and JRC compact flood-extent output
+    (PARAM='extent_bymask_rp{N}', with IS_STANDIN true for the RP2/RP5
     stand-in tiers) share this one table.
 
     Args:
         metadata_rows: list of dicts with keys forecast_time, param, stage_path,
-            and optionally is_standin (only meaningful for extent_rp2/extent_rp5 rows)
+            and optionally is_standin (only meaningful for extent_bymask_rp2/extent_bymask_rp5 rows)
         conn: active Snowflake connection
 
     Returns number of rows merged.

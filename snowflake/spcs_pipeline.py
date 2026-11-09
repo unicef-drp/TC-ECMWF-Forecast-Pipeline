@@ -113,10 +113,8 @@ class PipelineConfig(BasePipelineConfig):
 
         BLOB, SNOWFLAKE, and LOCAL are genuinely independent, matching the base class's own
         validate() (pipeline_core.py) and the GitHub Actions entry point (github_actions/main.py);
-        this override previously required sf_account and (when PROCESS_MET=true)
-        SNOWFLAKE_STAGE_NAME unconditionally for any non-LOCAL mode, including BLOB, which both
-        contradicted the base class's documented independence and made a correctly-configured
-        BLOB-only SPCS deployment fail validation before it could even run.
+        BLOB requires no Snowflake settings; SNOWFLAKE requires sf_account, the auth
+        settings for the chosen mode, and, when PROCESS_MET=true, SNOWFLAKE_STAGE_NAME.
         """
         if self.data_pipeline_db == 'BLOB':
             blob_missing = [var for var, val in (
@@ -130,7 +128,7 @@ class PipelineConfig(BasePipelineConfig):
             return self._validate_run_time()
 
         if self.data_pipeline_db == 'LOCAL':
-            logger.info("DATA_PIPELINE_DB=LOCAL -- Snowflake credentials not required")
+            logger.info("DATA_PIPELINE_DB=LOCAL, Snowflake credentials not required")
             return self._validate_run_time()
 
         if not self.sf_account:
@@ -277,7 +275,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
     phase_start = datetime.now()
 
     if config.data_pipeline_db == 'LOCAL':
-        logger.info("DATA_PIPELINE_DB=LOCAL -- skipping Snowflake load, files kept locally")
+        logger.info("DATA_PIPELINE_DB=LOCAL, skipping Snowflake load, files kept locally")
         logger.info(f"  Transformed tracks : {config.transformed_data_dir}")
         logger.info(f"  Wind envelopes     : {config.wind_extracted_dir}")
         logger.info(f"  Wind rasters       : {len(raster_files)} file(s) in {config.wind_extracted_dir}")
@@ -296,9 +294,9 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
         # the identical pipeline (this file is the SPCS entry point for the same pipeline).
         # TC_TRACKS/TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_* are not written from these
         # CSVs directly: a separate, already-built manual loader
-        # (blob_to_snowflake_loader.py, not run automatically by any real scheduled
-        # workflow today) reads these same Blob prefixes back and MERGEs them in.
-        logger.info("DATA_PIPELINE_DB=BLOB -- uploading CSVs to Blob, TC_TRACKS/TC_ENVELOPES_COMBINED not updated")
+        # (blob_to_snowflake_loader.py, run manually or through the manual-dispatch
+        # sync-tracks-to-snowflake.yml workflow) reads these same Blob prefixes back and MERGEs them in.
+        logger.info("DATA_PIPELINE_DB=BLOB, uploading CSVs to Blob, TC_TRACKS/TC_ENVELOPES_COMBINED not updated")
         from ecmwf_met_downloader import upload_to_blob
         uploaded = 0
         for csv_file in transformed_files:
@@ -367,7 +365,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                         met_conn.close()
             else:
                 logger.warning(
-                    "No Snowflake credentials configured -- MET_FORECASTS pointer row(s) not "
+                    "No Snowflake credentials configured, MET_FORECASTS pointer row(s) not "
                     "written; the precip/runoff data is safely in Blob, but nothing in "
                     "Snowflake records where it is until a MET_FORECASTS row is written "
                     "separately"
@@ -401,7 +399,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 nonlocal total_rows
                 rows = load_csv_to_snowflake(csv_file, conn, table_type=table_type)
                 if rows is None:
-                    error_msg = f"Failed to load {csv_file.name} into {table_type} -- see error above"
+                    error_msg = f"Failed to load {csv_file.name} into {table_type}, see error above"
                     logger.error(error_msg)
                     stats.errors.append(error_msg)
                     stats.upload_failed_filenames.add(csv_file.name)
@@ -481,7 +479,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
                 _set_context()
                 # TC_TRACKS/TC_ENVELOPES_* are the already-proven core wind
                 # path, a failure reading their own counts stays a hard
-                # error (matches this block's original behavior). Only the
+                # error. Only the
                 # newer gust/precip tables get the fault-tolerant treatment.
                 cursor.execute("SELECT COUNT(*) FROM TC_TRACKS")
                 tracks_count = cursor.fetchone()[0]
@@ -528,7 +526,7 @@ def phase4_snowflake_loading(config: PipelineConfig, stats: PipelineStats,
 def main():
     """Run the concurrent pipeline."""
     logger.info("=" * 70)
-    logger.info("TC ECMWF FORECAST PIPELINE -- CONCURRENT EXECUTION")
+    logger.info("TC ECMWF FORECAST PIPELINE: CONCURRENT EXECUTION")
     logger.info("=" * 70)
     logger.info(f"Start: {datetime.now().isoformat()}")
 
@@ -571,9 +569,9 @@ def main():
 
         csv_files = step2_extract(config, stats, bufr_files)
         if not csv_files:
-            logger.warning("No named storms found in BUFR data -- skipping wind processing.")
+            logger.warning("No named storms found in BUFR data, skipping wind processing.")
             if config.process_met:
-                logger.info("PROCESS_MET=true -- running met download anyway.")
+                logger.info("PROCESS_MET=true, running met download anyway.")
                 tc_data_info = extract_tc_data_info_from_bufr(bufr_files)
                 _precip_conn = None
                 if config.data_pipeline_db == 'SNOWFLAKE':
