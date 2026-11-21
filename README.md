@@ -20,7 +20,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 4b. **Download Gust Data**: Downloads ensemble 10fg (maximum wind gust) GRIB files for the same run time and lead times as Step 4
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
 5b. **Extract Gust Envelopes**: Creates gust threshold envelope polygons from 10fg GRIB files (step 0 skipped: no accumulation period at T+0)
-5c. **Extract Storm Surge Envelopes** *(optional, `PROCESS_SURGE=true`)*: Computes coastal storm surge from the Step 4 wind with the CLIMADA bathtub method and creates surge threshold envelope polygons (0.5, 1, 2, 3 m). See [Storm Surge](#storm-surge-step-5c) below
+5c. **Compute Storm Surge Rasters** *(optional, `PROCESS_SURGE=true`)*: Computes coastal storm surge from the Step 4 wind with the CLIMADA bathtub method and writes one GeoTIFF per storm with the maximum surge depth of each ensemble member, uploaded to `surge/`. See [Storm Surge](#storm-surge-step-5c) below
 6. **Download Gridded Parameters** *(optional)*: Downloads global GRIB files for `tp` (total precipitation) and `ro` (total runoff), converts each to a Zarr ZipStore, and uploads to a Snowflake internal stage. Runs regardless of whether named storms were found.
 7. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
 
@@ -35,8 +35,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_envelopes_combined.csv` | `TC_ENVELOPES_COMBINED` | Unioned polygon per member × threshold |
 | `*_gust_envelopes_individual.csv` | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygon per member × step (10fg, m/s thresholds) |
 | `*_gust_envelopes_combined.csv` | `TC_GUST_ENVELOPES_COMBINED` | Unioned gust polygon per member × threshold |
-| `*_surge_envelopes_individual.csv` | `TC_SURGE_ENVELOPES_INDIVIDUAL` | Storm surge threshold polygon per member × step (cm thresholds: 50, 100, 200, 300) |
-| `*_surge_envelopes_combined.csv` | `TC_SURGE_ENVELOPES_COMBINED` | Unioned surge polygon per member × threshold |
+| `*_surge_raster.tif` | none (file in `surge/` on Blob or the Snowflake stage) | Storm surge: maximum depth (m) over lead times, one band per member, on the 15″ coastal grid |
 | `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param): `tp` total precipitation (global) |
 | `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param): `ro` total runoff (land-only) |
 | `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24'): GloFAS riverine discharge, standalone pipeline, see below |
@@ -184,7 +183,7 @@ github_actions/snowflake_loader.py  ← Step 7: MERGE into Snowflake
 | `snowflake/spcs_pipeline.py` | Concurrent entry point: ProcessPool/SPCS OAuth |
 | `github_actions/snowflake_loader.py` | Snowflake loader for GitHub Actions (password auth) |
 | `snowflake/snowflake_loader.py` | Snowflake loader for SPCS (OAuth + private key support) |
-| `ecmwf_surge_envelope_extractor.py` | Step 5c: bathtub storm surge and surge envelopes |
+| `ecmwf_surge_envelope_extractor.py` | Step 5c: bathtub storm surge and maximum-surge rasters |
 | `setup_surge_dem.py` | One-time build of the coastal elevation cache used by step 5c |
 
 ### Snowflake Loading
@@ -299,7 +298,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `tc_data/` | Downloaded BUFR files and extracted per-storm CSVs |
 | `tc_data_transformed/` | Transformed TC CSVs |
 | `wind_data/` | Wind GRIB files |
-| `wind_extracted/` | Envelope CSV files |
+| `wind_extracted/` | Envelope CSV files, wind/gust/surge GeoTIFFs |
 | `met_data/` | Precipitation Zarr ZipStore files |
 | `glofas_data/` | GloFAS riverine discharge Zarr ZipStore files (standalone pipeline, see below) |
 
@@ -312,14 +311,12 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `TC_ENVELOPES_COMBINED` | Combined wind threshold polygons across all forecast steps |
 | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygons per forecast step (10fg, m/s) |
 | `TC_GUST_ENVELOPES_COMBINED` | Combined gust threshold polygons across all forecast steps |
-| `TC_SURGE_ENVELOPES_INDIVIDUAL` | Storm surge threshold polygons per forecast step (cm) |
-| `TC_SURGE_ENVELOPES_COMBINED` | Combined storm surge threshold polygons across all forecast steps |
 | `MET_FORECASTS` | Metadata: one row per (forecast_time, param) with Zarr stage path |
 | `RIVER_FORECASTS` | Metadata: one row per (forecast_time, param) with stage path: `param='dis24'` for raw discharge, `param='extent_bymask_rp{2,5,10,20,50,100}'` (plus `IS_STANDIN`) for GloFAS x JRC compact flood extent |
 
 ## Storm Surge (Step 5c)
 
-Step 5c adds coastal storm surge to the wind and gust envelopes, from the same ECMWF 51-member
+Step 5c adds coastal storm surge to the wind and gust outputs, from the same ECMWF 51-member
 10 m wind already downloaded in Step 4. It is off by default (`PROCESS_SURGE=false`).
 
 **Method.** CLIMADA Petals `TCSurgeBathtub` formulation, re-implemented with numpy so the
@@ -328,7 +325,18 @@ pipeline does not depend on CLIMADA at run time (equivalence with CLIMADA is che
 
 * surge = 0.1023 × max(V − 26.8224, 0) + 1.8288 − elevation − 0.2 × distance to coast (km), V the 10 m wind in m/s (Xu 2010)
 * only on coastal land 0–10 m high and within 50 km of the coast, where V ≥ 34 kt
-* per member and per lead time, on a 15″ (~450 m) grid; polygons are the union of grid cells above each threshold
+* per member and per lead time, on a 15″ (~450 m) grid, then the maximum over lead times
+
+**Output.** One GeoTIFF per storm and forecast cycle, `<STORM>_<YYYYMMDDTHHZ>_surge_raster.tif` (`_w0`/`_w1`
+suffix for a storm crossing the antimeridian), uploaded to `surge/` on Blob Storage (`DATA_PIPELINE_DB=BLOB`)
+or on the Snowflake stage (`DATA_PIPELINE_DB=SNOWFLAKE`); no Snowflake table. EPSG:4326, on the elevation cache
+grid, cropped to the coastal cells of the storm area:
+
+* 51 bands, one per ensemble member (bands 1–50: perturbed members 1–50, band 51: control), named `member_<n>`
+* maximum surge depth above ground over all lead times, in m (float32); 0 on a coastal cell that is not flooded,
+  nodata (NaN) everywhere else (sea, inland, ground at 10 m or above)
+* no threshold: the exposure step chooses its own (e.g. a 2 km tile counts as reached when any of its cells is)
+* tags: `storm`, `forecast_time`, `lead_times_h`, `member_numbers`, `control_member`, `units`, `elevation_source`
 
 **Elevation cache.** Built once by `setup_surge_dem.py` from DeltaDTM v1.1 (Deltares / TU Delft,
 1″ coastal bare-earth terrain model, EGM2008, CC BY 4.0) and Natural Earth coastlines, then stored
@@ -352,6 +360,13 @@ python setup_surge_dem.py --deltadtm-dir deltadtm --bbox -79 17 -76 19 --local-o
 | `SURGE_DEM_LOCAL_DIR` | `surge_dem` | Folder with `surge_coastal_dem.tif` when `SURGE_DEM_SOURCE=local` |
 
 See `pipeline_demonstration_surge.ipynb` for a worked example (Hurricane Melissa, Jamaica, 28 Oct 2025).
+
+**Method assessment notebooks** (`tests/surge_model_comparison/notebooks/`, not part of the pipeline): the
+bathtub/GeoClaw comparison that selected the method (`01_surge_bathtub`, `02_surge_geoclaw`,
+`03_surge_comparison`) and the sensitivity tests that selected DeltaDTM and kept the 0.25° wind
+(`00_coastal_dem_gee`: DeltaDTM and GEM-15 download through Google Earth Engine, `01_surge_bathtub_v2`: bathtub
+with SRTM, GEM-15 or DeltaDTM, `04_hres_wind_resolution`: ECMWF HRES wind at 25 km and 9 km). They read their
+inputs from `data/` and write to `outputs/` in that folder, both git-ignored.
 
 ## GloFAS Riverine Discharge Pipeline (standalone)
 
