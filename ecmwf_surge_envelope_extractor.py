@@ -24,7 +24,7 @@ Surge method
 
 Elevation
     Coastal lowland cells (elevation + distance to coast) are read from the
-    cache built once by setup_surge_dem.py (SRTM through GigaSpatial, 15"
+    cache built once by setup_surge_dem.py (DeltaDTM coastal terrain model, 15"
     grid by default). The surge is computed on that grid, not on the 0.25
     degree wind grid, so the footprint follows the real coastline.
 """

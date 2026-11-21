@@ -330,14 +330,19 @@ pipeline does not depend on CLIMADA at run time (equivalence with CLIMADA is che
 * only on coastal land 0–10 m high and within 50 km of the coast, where V ≥ 34 kt
 * per member and per lead time, on a 15″ (~450 m) grid; polygons are the union of grid cells above each threshold
 
-**Elevation cache.** Built once by `setup_surge_dem.py` from NASA SRTM 90 m (downloaded through
-GigaSpatial, Earthdata login) and Natural Earth coastlines, then stored on the Snowflake stage
-(`surge/coastal_dem/v1/surge_coastal_dem.tif`), on Blob, or locally, read according to `SURGE_DEM_SOURCE`.
+**Elevation cache.** Built once by `setup_surge_dem.py` from DeltaDTM v1.1 (Deltares / TU Delft,
+1″ coastal bare-earth terrain model, EGM2008, CC BY 4.0) and Natural Earth coastlines, then stored
+under `surge/coastal_dem/v1/surge_coastal_dem.tif` on the Snowflake stage, on Blob Storage, or
+locally, and read according to `SURGE_DEM_SOURCE`. The script downloads DeltaDTM itself from
+[4TU.ResearchData](https://doi.org/10.4121/21997565) into `deltadtm/` (git-ignored): only the
+continent archives covering the bbox (`North_America.zip`, 6.9 GB, for the Caribbean; ~36 GB for
+the global run), reused on later runs, resumed if interrupted and checked against their md5.
+No extra dependency is needed beyond `requirements.txt`.
 
 ```bash
-pip install -r requirements-surge-setup.txt          # one-time setup only (adds giga-spatial)
-python setup_surge_dem.py                             # global 56S-60N, upload to Snowflake stage
-python setup_surge_dem.py --bbox -79 17 -76 19 --local-only surge_dem   # one region, local
+python setup_surge_dem.py --deltadtm-dir deltadtm                       # global 56S-60N, Snowflake stage
+python setup_surge_dem.py --deltadtm-dir deltadtm --upload blob         # global 56S-60N, Blob Storage
+python setup_surge_dem.py --deltadtm-dir deltadtm --bbox -79 17 -76 19 --local-only surge_dem   # one region, local
 ```
 
 | Variable | Default | Description |

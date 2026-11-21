@@ -59,10 +59,6 @@ SURGE_DEM_SOURCE=snowflake
 # Local dir containing surge_coastal_dem.tif, used only when SURGE_DEM_SOURCE=local
 SURGE_DEM_LOCAL_DIR=surge_dem
 
-# Earthdata login, only for the one-time setup_surge_dem.py SRTM download (GigaSpatial)
-EARTHDATA_USERNAME=your_earthdata_username
-EARTHDATA_PASSWORD=your_earthdata_password
-
 # Filter to named storms only (true/false, default: true)
 NAMED_STORMS_ONLY=true
 
