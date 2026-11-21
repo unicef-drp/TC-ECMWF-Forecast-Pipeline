@@ -689,9 +689,21 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
         return [], []
 
 
-def step5c_extract_surge_envelopes(config: BasePipelineConfig, stats: PipelineStats,
-                                    snowflake_conn=None) -> List[Path]:
-    """Step 5c: Extract storm surge envelope polygons from the 10 m wind GRIB files.
+def raster_upload_prefix(filename: str) -> str:
+    """Upload folder (Blob container root or Snowflake stage) of a raster file,
+    from the dataset token in its own name: surge/ for the storm surge rasters
+    (step 5c), gust_raster/ and wind_raster/ for the wind/gust speed fields."""
+    if '_surge_raster' in filename:
+        return 'surge'
+    if 'gust_raster' in filename:
+        return 'gust_raster'
+    return 'wind_raster'
+
+
+def step5c_compute_surge_rasters(config: BasePipelineConfig, stats: PipelineStats,
+                                 snowflake_conn=None) -> List[Path]:
+    """Step 5c: Compute storm surge from the 10 m wind GRIB files and write one
+    maximum-surge GeoTIFF per storm and forecast cycle (one band per member).
 
     Same inputs as step 5 (transformed tracks + wind_ens_* GRIB files), plus the
     coastal elevation cache (setup_surge_dem.py), resolved from
@@ -699,16 +711,17 @@ def step5c_extract_surge_envelopes(config: BasePipelineConfig, stats: PipelineSt
     'snowflake' and the cache is not already on local disk.
 
     Returns:
-        surge_files: the *_surge_envelopes_{individual,combined}.csv files.
+        surge_raster_files: the *_surge_raster*.tif files written this run,
+        uploaded by the load step to surge/ (see raster_upload_prefix).
     """
     if not config.process_wind_data:
-        logger.info("Wind data processing disabled -- skipping surge envelope extraction")
+        logger.info("Wind data processing disabled -- skipping surge")
         return []
     if not config.process_surge:
-        logger.info("PROCESS_SURGE=false -- skipping surge envelope extraction")
+        logger.info("PROCESS_SURGE=false -- skipping surge")
         return []
     logger.info("=" * 70)
-    logger.info("STEP 5c: Extracting storm surge envelopes (bathtub) from 10 m wind...")
+    logger.info("STEP 5c: Computing storm surge rasters (bathtub) from 10 m wind...")
     logger.info("=" * 70)
     try:
         dem_path = resolve_surge_dem(
@@ -719,20 +732,22 @@ def step5c_extract_surge_envelopes(config: BasePipelineConfig, stats: PipelineSt
             blob_sas_token=config.blob_sas_token,
             blob_container=config.blob_container,
         )
-        process_surge_combination(
+        result = process_surge_combination(
             tc_data_dir=config.transformed_data_dir,
             wind_data_dir=config.wind_data_dir,
             output_dir=config.wind_extracted_dir,
             dem_path=dem_path,
         )
-        surge_files = sorted(config.wind_extracted_dir.glob('*_surge_envelopes_*.csv'))
+        # Files written this run only (never a glob), so a stale raster from an
+        # interrupted earlier run is never uploaded as if it were this cycle's
+        surge_files = result['raster_files']
         if surge_files:
-            logger.info(f"Surge envelope files: {[f.name for f in surge_files]}")
+            logger.info(f"Surge raster files: {[f.name for f in surge_files]}")
         else:
-            logger.info("No surge envelope files generated (no low-lying coast reached by any member)")
+            logger.info("No surge raster generated (no low-lying coast near any storm)")
         return surge_files
     except Exception as e:
-        error_msg = f"Surge envelope extraction failed: {e}"
+        error_msg = f"Surge computation failed: {e}"
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return []
@@ -872,7 +887,8 @@ def cleanup_files(config: BasePipelineConfig, upload_failed_filenames=None):
             # newly produced this cycle. Same LOCAL-mode exemption as the CSV
             # line above (LOCAL mode's rasters are themselves the final output).
             *([("*_wind_raster_*.tif", config.wind_extracted_dir),
-               ("*_gust_raster_*.tif", config.wind_extracted_dir)] if not local_mode else []),
+               ("*_gust_raster_*.tif", config.wind_extracted_dir),
+               ("*_surge_raster*.tif", config.wind_extracted_dir)] if not local_mode else []),
             # precip: grib_tmp only; ZipStore is the persistent output, keep it
             ("*.grib2", config.met_data_dir / "grib_tmp"),
             ("*.idx",   config.met_data_dir / "grib_tmp"),

@@ -28,7 +28,8 @@ from pipeline_core import (
     step4b_download_gust,
     step5_process_wind,
     step5b_extract_gust_envelopes,
-    step5c_extract_surge_envelopes,
+    step5c_compute_surge_rasters,
+    raster_upload_prefix,
     step6_download_precip,
     cleanup_files,
 )
@@ -126,17 +127,17 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
         # having to keep them apart.
         raster_uploaded = 0
         for tif_file in raster_files:
-            prefix = 'gust_raster' if 'gust_raster' in tif_file.name else 'wind_raster'
+            prefix = raster_upload_prefix(tif_file.name)
             if upload_to_blob(tif_file, config.blob_account_url, config.blob_sas_token,
                                config.blob_container, f'{prefix}/{tif_file.name}'):
                 raster_uploaded += 1
             else:
                 stats.upload_failed_filenames.add(tif_file.name)
         if raster_files and raster_uploaded < len(raster_files):
-            error_msg = f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) uploaded to Blob successfully"
+            error_msg = f"Only {raster_uploaded}/{len(raster_files)} wind/gust/surge raster(s) uploaded to Blob successfully"
             logger.warning(error_msg)  # warning, not error: additive output, must not fail an otherwise-successful run
         elif raster_files:
-            logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Blob (wind_raster/ and gust_raster/)")
+            logger.info(f"Uploaded {raster_uploaded} wind/gust/surge raster(s) to Blob (wind_raster/, gust_raster/, surge/)")
         stats.files_loaded = uploaded + raster_uploaded
         stats.rows_loaded = 0
         stats._local_mode = True
@@ -329,20 +330,20 @@ def step7_load(config: PipelineConfig, stats: PipelineStats,
             if raster_files and config.snowflake_stage_name:
                 from ecmwf_met_downloader import upload_to_snowflake_stage
                 for tif_file in raster_files:
-                    prefix = 'gust_raster' if 'gust_raster' in tif_file.name else 'wind_raster'
+                    prefix = raster_upload_prefix(tif_file.name)
                     if upload_to_snowflake_stage(tif_file, config.snowflake_stage_name,
                                                   f'{prefix}/{tif_file.name}', conn):
                         raster_uploaded += 1
                     else:
                         stats.upload_failed_filenames.add(tif_file.name)
                 if raster_uploaded < len(raster_files):
-                    logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust raster(s) "
+                    logger.warning(f"Only {raster_uploaded}/{len(raster_files)} wind/gust/surge raster(s) "
                                     f"uploaded to Snowflake stage successfully")
                 else:
-                    logger.info(f"Uploaded {raster_uploaded} wind/gust raster(s) to Snowflake stage "
-                                f"(wind_raster/ and gust_raster/)")
+                    logger.info(f"Uploaded {raster_uploaded} wind/gust/surge raster(s) to Snowflake stage "
+                                f"(wind_raster/, gust_raster/, surge/)")
             elif raster_files:
-                logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust raster(s) not "
+                logger.warning("SNOWFLAKE_STAGE_NAME not configured, wind/gust/surge raster(s) not "
                                 "uploaded to Snowflake stage")
                 stats.upload_failed_filenames.update(f.name for f in raster_files)
 
@@ -505,7 +506,7 @@ def main():
             os.environ['SNOWFLAKE_SCHEMA'] = config.sf_schema
             _surge_conn = get_snowflake_connection()
         try:
-            surge_files = step5c_extract_surge_envelopes(config, stats, snowflake_conn=_surge_conn)
+            surge_raster_files = step5c_compute_surge_rasters(config, stats, snowflake_conn=_surge_conn)
         finally:
             if _surge_conn:
                 _surge_conn.close()
@@ -528,8 +529,8 @@ def main():
             if _precip_conn:
                 _precip_conn.close()
 
-        step7_load(config, stats, transformed_files, envelope_files + gust_files + surge_files, precip_metadata,
-                   raster_files=raster_files + gust_raster_files)
+        step7_load(config, stats, transformed_files, envelope_files + gust_files, precip_metadata,
+                   raster_files=raster_files + gust_raster_files + surge_raster_files)
 
         cleanup_files(config, stats.upload_failed_filenames)
         stats.log_summary()
