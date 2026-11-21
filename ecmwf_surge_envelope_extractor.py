@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-ECMWF Storm Surge Envelope Extractor
+ECMWF Storm Surge Raster Extractor
 
 Computes coastal storm surge for every ensemble member and lead time from the
-ECMWF 10 m wind already downloaded by step 4, and extracts surge threshold
-polygons per storm. Mirrors ecmwf_gust_envelope_extractor.py:
+ECMWF 10 m wind already downloaded by step 4, and writes, for each storm and
+forecast cycle, one GeoTIFF of the maximum surge depth per member:
   - source: wind_ens_YYYY-MM-DD_rHH_f{lead}h_{pf|cf}.grib2 (u10/v10, step 4)
   - surge:  CLIMADA TCSurgeBathtub method (see bathtub_surge below)
-  - thresholds: SURGE_THRESHOLDS_M (keys are integer cm labels)
-  - output: TC_SURGE_ENVELOPES_INDIVIDUAL / TC_SURGE_ENVELOPES_COMBINED
+  - output: {storm}_{YYYYMMDDTHHZ}_surge_raster.tif, one band per ensemble
+            member (bands 1-50: perturbed members 1-50, band 51: control),
+            maximum surge depth above ground in m over all lead times. No
+            threshold is applied: the exposure step chooses its own.
 
 Surge method
     Same formulation as CLIMADA Petals TCSurgeBathtub.from_tc_winds
@@ -22,11 +24,15 @@ Surge method
       4. negative values are set to 0
     Equivalence with CLIMADA is checked by tests/test_surge_bathtub.py.
 
-Elevation
+Elevation and output grid
     Coastal lowland cells (elevation + distance to coast) are read from the
     cache built once by setup_surge_dem.py (DeltaDTM coastal terrain model, 15"
     grid by default). The surge is computed on that grid, not on the 0.25
-    degree wind grid, so the footprint follows the real coastline.
+    degree wind grid, so the footprint follows the real coastline, and the
+    raster is written on the same grid, cropped to the coastal cells of the
+    storm area:
+      - coastal cell:        maximum surge depth in m (0 = not flooded)
+      - everything else:     nodata (NaN): sea, inland or higher ground
 """
 
 import argparse
@@ -40,17 +46,13 @@ import numpy as np
 import pandas as pd
 import rasterio
 import xarray as xr
-from rasterio.features import shapes
 from rasterio.windows import Window, from_bounds
-from shapely.geometry import MultiPolygon, shape
-from shapely.ops import unary_union
 
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
     get_bounding_box,
     get_longitude_windows,
     load_wind_data_all_members,
-    polygon_to_wkt,
 )
 from ecmwf_tc_wind_combination import (
     find_tc_data_files,
@@ -67,13 +69,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Surge thresholds in m (keys are integer cm labels, stored in SURGE_THRESHOLD)
-SURGE_THRESHOLDS_M: Dict[int, float] = {
-    50: 0.5,
-    100: 1.0,
-    200: 2.0,
-    300: 3.0,
-}
+# Pipeline member numbering (same as the tracks): 1-50 perturbed, 51 control
+CONTROL_MEMBER = 51
 
 # Wind below 34 kt is not tropical-cyclone wind: no surge is computed there.
 # Same value as the lowest AOS wind threshold and CLIMADA TropCyclone's own
@@ -189,6 +186,7 @@ class CoastalCells:
                 # Storm area outside the cache extent (e.g. a regional cache): no coastal cells
                 elev = dist = np.full((0, 0), np.nan, dtype=np.float32)
                 self.transform = src.transform
+            self.elevation_source = src.tags().get('elevation_source', 'unknown')
         self.shape = elev.shape
         rows, cols = np.nonzero(np.isfinite(elev) & np.isfinite(dist))
         self.rows, self.cols = rows, cols
@@ -210,50 +208,42 @@ class CoastalCells:
         values[values < MIN_TC_WIND_MS] = 0.0
         return values
 
-    def polygons(self, surge: np.ndarray, thresholds: Dict[int, float]) -> Dict[int, Optional[object]]:
-        """Union of the grid cells at or above each threshold, as (Multi)Polygons."""
-        out = {}
-        for label, value in thresholds.items():
-            hit = surge >= value
-            if not hit.any():
-                out[label] = None
-                continue
-            r, c = self.rows[hit], self.cols[hit]
-            r0, c0 = r.min(), c.min()
-            mask = np.zeros((r.max() - r0 + 1, c.max() - c0 + 1), dtype=np.uint8)
-            mask[r - r0, c - c0] = 1
-            sub_transform = self.transform * rasterio.Affine.translation(c0, r0)
-            geoms = [shape(g) for g, v in shapes(mask, mask=mask.astype(bool), transform=sub_transform) if v == 1]
-            # shapes() already returns one polygon per connected region, never
-            # overlapping, so no (slow) union is needed here
-            out[label] = (geoms[0] if len(geoms) == 1 else MultiPolygon(geoms)) if geoms else None
-        return out
-
 
 # ---------------------------------------------------------------------------
-# Output records
+# Raster output
 # ---------------------------------------------------------------------------
 
-def _polygons_to_records(cells: List[CoastalCells], member_surge: List[Optional[np.ndarray]],
-                         thresholds: Dict[int, float], base: Dict) -> List[Dict]:
-    """One record per threshold reached, polygons merged across longitude windows."""
-    merged: Dict[int, List] = {k: [] for k in thresholds}
-    for c, surge in zip(cells, member_surge):
-        if surge is None or not (surge >= min(thresholds.values())).any():
-            continue
-        for label, poly in c.polygons(surge, thresholds).items():
-            if poly is not None:
-                merged[label].append(poly)
+def write_surge_raster(cells: CoastalCells, peaks: Dict[int, Optional[np.ndarray]],
+                       members: List[int], output_path: Path, tags: Dict) -> None:
+    """Write one multi-band GeoTIFF of maximum surge depth (m), one band per member.
 
-    records = []
-    for label, polys in merged.items():
-        if not polys:
-            continue
-        geom = polys[0] if len(polys) == 1 else unary_union(polys)
-        wkt_poly = polygon_to_wkt(geom)
-        if wkt_poly:
-            records.append({**base, 'surge_threshold': label, 'envelope_region': wkt_poly})
-    return records
+    The raster is on the DEM cache grid, cropped to the bounding box of the
+    coastal cells. Coastal cells hold the surge depth (0 when not flooded),
+    every other pixel is nodata (NaN). A member without any wind file gets an
+    all-nodata band. Bands are written one at a time to keep memory low.
+    """
+    r0, r1 = int(cells.rows.min()), int(cells.rows.max())
+    c0, c1 = int(cells.cols.min()), int(cells.cols.max())
+    height, width = r1 - r0 + 1, c1 - c0 + 1
+    rr, cc = cells.rows - r0, cells.cols - c0
+
+    profile = {
+        'driver': 'GTiff', 'height': height, 'width': width, 'count': len(members),
+        'dtype': 'float32', 'crs': 'EPSG:4326',
+        'transform': cells.transform * rasterio.Affine.translation(c0, r0),
+        'nodata': np.nan, 'compress': 'deflate', 'predictor': 3,
+        'tiled': True, 'blockxsize': 256, 'blockysize': 256, 'BIGTIFF': 'IF_SAFER',
+    }
+    band = np.full((height, width), np.nan, dtype=np.float32)
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        for i, member in enumerate(members, start=1):
+            band.fill(np.nan)
+            peak = peaks.get(member)
+            if peak is not None:
+                band[rr, cc] = peak
+            dst.write(band, i)
+            dst.set_band_description(i, f'member_{member}')
+        dst.update_tags(**{k: str(v) for k, v in tags.items()})
 
 
 # ---------------------------------------------------------------------------
@@ -265,65 +255,61 @@ def process_surge_combination(
     wind_data_dir,
     output_dir,
     dem_path,
-    thresholds: Dict[int, float] = SURGE_THRESHOLDS_M,
     verbose: bool = False,
 ) -> Dict:
     """
-    Extract surge envelope polygons for all TC storms and write individual + combined CSVs.
+    Compute the surge of all TC storms and write one maximum-surge raster per
+    storm and forecast cycle (two for a storm crossing the antimeridian).
 
     Args:
         tc_data_dir: Directory containing transformed TC CSV files (step 3)
         wind_data_dir: Directory containing wind GRIB files (step 4, wind_ens_* prefix)
-        output_dir: Directory to write output CSV files
+        output_dir: Directory to write the surge GeoTIFFs
         dem_path: Local path to the surge DEM cache (see resolve_surge_dem)
-        thresholds: Surge thresholds, {cm label: m}
 
     Returns:
-        dict with 'processed_storms', 'total_envelope_files' and 'timings'
+        dict with 'processed_storms', 'raster_files' (list of Path) and 'timings'
     """
     tc_data_dir, wind_data_dir, output_dir = Path(tc_data_dir), Path(wind_data_dir), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
-    logger.info("ECMWF STORM SURGE ENVELOPE EXTRACTION (bathtub)")
+    logger.info("ECMWF STORM SURGE RASTERS (bathtub)")
     logger.info("=" * 70)
 
     wind_files = [f for f in wind_data_dir.glob('wind_ens_*.grib2')]
     if not wind_files:
         logger.warning(f"No wind files found in {wind_data_dir}")
-        return {'processed_storms': 0, 'total_envelope_files': 0, 'timings': {}}
+        return {'processed_storms': 0, 'raster_files': [], 'timings': {}}
 
     storm_configs = find_tc_data_files(tc_data_dir)
     if not storm_configs:
         logger.warning("No TC data files found -- nothing to process")
-        return {'processed_storms': 0, 'total_envelope_files': 0, 'timings': {}}
+        return {'processed_storms': 0, 'raster_files': [], 'timings': {}}
 
-    processed_storms, total_files, timings = 0, 0, {}
+    processed_storms, raster_files, timings = 0, [], {}
 
-    # One GDAL environment for the whole step: rasterio.features.shapes() would
-    # otherwise open (and tear down) a new one on every call, thousands per storm.
     with rasterio.Env():
         for storm_config in storm_configs:
             storm_name = storm_config['storm_name']
-            logger.info(f"\n{'=' * 50}\nSurge envelopes for storm: {storm_name}\n{'=' * 50}")
+            logger.info(f"\n{'=' * 50}\nSurge raster for storm: {storm_name}\n{'=' * 50}")
             t_storm = time.time()
             try:
-                total_files += _process_storm(storm_name, storm_config['track_csv'], wind_files,
-                                              Path(dem_path), output_dir, thresholds, verbose)
+                raster_files += _process_storm(storm_name, storm_config['track_csv'], wind_files,
+                                               Path(dem_path), output_dir, verbose)
                 processed_storms += 1
                 timings[storm_name] = round(time.time() - t_storm, 1)
                 logger.info(f"  {storm_name}: {timings[storm_name]} s")
             except Exception as e:
-                logger.error(f"  Surge extraction failed for {storm_name}: {e}", exc_info=verbose)
+                logger.error(f"  Surge computation failed for {storm_name}: {e}", exc_info=verbose)
 
-    logger.info(f"Surge: {processed_storms} storm(s), {total_files} file(s) written in {output_dir}")
-    return {'processed_storms': processed_storms, 'total_envelope_files': total_files, 'timings': timings}
+    logger.info(f"Surge: {processed_storms} storm(s), {len(raster_files)} raster(s) written in {output_dir}")
+    return {'processed_storms': processed_storms, 'raster_files': raster_files, 'timings': timings}
 
 
 def _process_storm(storm_name: str, track_csv: str, wind_files: List[Path], dem_path: Path,
-                   output_dir: Path, thresholds: Dict[int, float], verbose: bool) -> int:
-    """Surge envelopes for one storm. Returns the number of CSV files written."""
-    n_files = 0
+                   output_dir: Path, verbose: bool) -> List[Path]:
+    """Maximum surge per member for one storm. Returns the raster files written."""
     track_df = load_tc_track_data(track_csv)
     bbox = get_bounding_box(create_buffered_track_polygon(track_df, TRACK_BUFFER_KM),
                             buffer=BBOX_BUFFER_DEG)
@@ -333,27 +319,28 @@ def _process_storm(storm_name: str, track_csv: str, wind_files: List[Path], dem_
     n_cells = sum(len(c) for c in cells)
     logger.info(f"  {n_cells:,} coastal lowland cells in the storm area")
     if n_cells == 0:
-        logger.info("  No low-lying coast near this storm -- no surge envelopes")
-        return 0
+        logger.info("  No low-lying coast near this storm -- no surge raster")
+        return []
 
     has_ft = 'forecast_time' in track_df.columns
     run_ft = _resolve_run_forecast_time(track_df, has_ft)
     lead_times = _wind_lead_times_for_run(run_ft, wind_files) if run_ft is not None \
         else sorted(track_df['lead_time'].unique())
-    members = sorted(track_df['ensemble_member'].unique())
+    members = sorted(int(m) for m in track_df['ensemble_member'].unique())
     rows_by_lead = _synthesize_rows_by_lead(lead_times, members, run_ft)
 
-    records: List[Dict] = []
+    # Running maximum over lead times, per member and per longitude window
     max_surge: Dict[int, List[Optional[np.ndarray]]] = {}
-    lead_times_seen: Dict[int, List[int]] = {}
+    lead_times_seen: List[int] = []
     for lead_time in lead_times:
         pf_file = _match_wind_file(run_ft, lead_time, 1, wind_files)
-        cf_file = _match_wind_file(run_ft, lead_time, 51, wind_files)
+        cf_file = _match_wind_file(run_ft, lead_time, CONTROL_MEMBER, wind_files)
         pf_windows = load_wind_data_all_members(str(pf_file), bbox) if pf_file else []
         cf_windows = load_wind_data_all_members(str(cf_file), bbox) if cf_file else []
         if not pf_windows and not cf_windows:
             logger.warning(f"    No wind file for lead {lead_time}h")
             continue
+        lead_times_seen.append(int(lead_time))
 
         # Surge for all members at once, per longitude window:
         # {member: [surge array per window]}
@@ -366,7 +353,7 @@ def _process_storm(storm_name: str, track_csv: str, wind_files: List[Path], dem_
                 for k, number in enumerate(pf_windows[i]['number'].values):
                     surge_by_member.setdefault(int(number), [None] * len(cells))[i] = pf_surge[k]
             if cf_windows:
-                surge_by_member.setdefault(51, [None] * len(cells))[i] = bathtub_surge(
+                surge_by_member.setdefault(CONTROL_MEMBER, [None] * len(cells))[i] = bathtub_surge(
                     c.wind_at_cells(cf_windows[i]), c.elevation, c.dist_km)
 
         for row in rows_by_lead[lead_time]:
@@ -374,60 +361,54 @@ def _process_storm(storm_name: str, track_csv: str, wind_files: List[Path], dem_
             member_surge = surge_by_member.get(member)
             if member_surge is None:
                 continue
-            lead_times_seen.setdefault(member, []).append(lead_time)
-
-            # Running maximum over lead times: the combined envelope
-            # (union over steps of surge >= threshold) is exactly the
-            # envelope of the maximum surge, cell by cell
             peak = max_surge.setdefault(member, [None] * len(cells))
             for i, surge in enumerate(member_surge):
                 if surge is not None:
                     peak[i] = surge if peak[i] is None else np.maximum(peak[i], surge)
-
-            records.extend(_polygons_to_records(cells, member_surge, thresholds, {
-                'forecast_time': row['forecast_time'],
-                'track_id': storm_name,
-                'ensemble_member': member,
-                'valid_time': row['valid_time'],
-                'lead_time': lead_time,
-            }))
         if verbose:
-            logger.info(f"  lead {lead_time}h: {len(records)} records so far")
+            logger.info(f"  lead {lead_time}h: {len(max_surge)} member(s) so far")
+
+    if not max_surge:
+        logger.info("  No wind data for this storm -- no surge raster")
+        return []
 
     ft_suffix = pd.to_datetime(run_ft).strftime('%Y%m%dT%HZ') if run_ft is not None else None
     stem = f"{storm_name}_{ft_suffix}" if ft_suffix else storm_name
+    tags = {
+        'dataset': 'surge',
+        'units': 'm',
+        'description': 'Maximum storm surge depth above ground over all lead times, '
+                       'CLIMADA TCSurgeBathtub method; 0 = coastal cell not flooded, '
+                       'nodata = not low-lying coastal land',
+        'storm': storm_name,
+        'forecast_time': run_ft if run_ft is not None else '',
+        'lead_times_h': f"{min(lead_times_seen)}-{max(lead_times_seen)}",
+        'member_numbers': ','.join(str(m) for m in members),
+        'control_member': CONTROL_MEMBER,
+        'elevation_source': cells[0].elevation_source,
+    }
 
-    if records:
-        individual_file = output_dir / f"{stem}_surge_envelopes_individual.csv"
-        pd.DataFrame(records).to_csv(individual_file, index=False)
-        logger.info(f"  Saved surge individual: {individual_file.name} ({len(records)} records)")
-        n_files += 1
-
-        combined = []
-        for member, peak in max_surge.items():
-            lts = lead_times_seen[member]
-            combined.extend(_polygons_to_records(cells, peak, thresholds, {
-                'forecast_time': run_ft,
-                'track_id': storm_name,
-                'ensemble_member': member,
-                'lead_time': f"{min(lts)}-{max(lts)}",
-            }))
-        if combined:
-            combined_file = output_dir / f"{stem}_surge_envelopes_combined.csv"
-            pd.DataFrame(combined).to_csv(combined_file, index=False)
-            logger.info(f"  Saved surge combined: {combined_file.name} ({len(combined)} records)")
-            n_files += 1
-    else:
-        logger.info("  No surge above the lowest threshold for any member -- no files written")
-
-    return n_files
+    written = []
+    for i, c in enumerate(cells):
+        if len(c) == 0:
+            continue
+        suffix = f"_w{i}" if len(cells) > 1 else ""
+        path = output_dir / f"{stem}_surge_raster{suffix}.tif"
+        peaks = {m: p[i] for m, p in max_surge.items()}
+        write_surge_raster(c, peaks, members, path, tags)
+        flooded = sum(int((p[i] > 0).any()) for p in max_surge.values() if p[i] is not None)
+        logger.info(f"  Saved {path.name}: {len(members)} bands, {len(c):,} coastal cells, "
+                    f"{flooded} member(s) with surge > 0")
+        written.append(path)
+    return written
 
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone run of the storm surge step (for testing)")
     parser.add_argument("--tc-dir", default=os.getenv('TRANSFORMED_DATA_DIR', 'tc_data_transformed'))
     parser.add_argument("--wind-dir", default=os.getenv('WIND_DATA_DIR', 'wind_data'))
-    parser.add_argument("--output-dir", default=os.getenv('WIND_EXTRACTED_DIR', 'wind_extracted'))
+    parser.add_argument("--output-dir", default=os.getenv('WIND_EXTRACTED_DIR', 'wind_extracted'),
+                        help="Folder for the surge GeoTIFFs")
     parser.add_argument("--dem", default=str(Path(os.getenv('SURGE_DEM_LOCAL_DIR', 'surge_dem')) / SURGE_DEM_FILENAME))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
