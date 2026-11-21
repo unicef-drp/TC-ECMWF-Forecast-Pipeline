@@ -247,7 +247,7 @@ def write_surge_raster(cells: CoastalCells, peaks: Dict[int, Optional[np.ndarray
 
 
 # ---------------------------------------------------------------------------
-# Main entry point (called by pipeline_core.step5c_extract_surge_envelopes)
+# Main entry point (called by pipeline_core.step5c_compute_surge_rasters)
 # ---------------------------------------------------------------------------
 
 def process_surge_combination(
