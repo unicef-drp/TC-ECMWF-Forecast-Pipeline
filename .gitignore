@@ -55,3 +55,4 @@ surge_dem_cache/
 deltadtm/
 demo_surge/
 tests/surge_model_comparison/data/
+tests/surge_model_comparison/outputs/
