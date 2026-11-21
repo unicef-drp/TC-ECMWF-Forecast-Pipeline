@@ -27,6 +27,7 @@ COPY ecmwf_wind_data_downloader.py .
 COPY ecmwf_wind_data_extractor.py .
 COPY ecmwf_tc_wind_combination.py .
 COPY ecmwf_gust_envelope_extractor.py .
+COPY ecmwf_surge_envelope_extractor.py .
 COPY ecmwf_met_downloader.py .
 COPY ecmwf_wind_raster_writer.py .
 COPY ecmwf_tc_lineage.py .

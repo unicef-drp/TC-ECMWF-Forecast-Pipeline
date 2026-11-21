@@ -24,7 +24,6 @@ from ecmwf_tc_data_extractor import extract_tc_data, filter_tc_data, save_per_st
 from ecmwf_wind_data_downloader import download_ensemble_wind, download_ensemble_gust
 from ecmwf_tc_wind_combination import process_wind_combination, analyze_required_forecast_hours
 from ecmwf_gust_envelope_extractor import process_gust_combination
-from ecmwf_surge_envelope_extractor import process_surge_combination, resolve_surge_dem
 from ecmwf_met_downloader import download_ensemble_param
 
 logger = logging.getLogger(__name__)
@@ -724,6 +723,9 @@ def step5c_compute_surge_rasters(config: BasePipelineConfig, stats: PipelineStat
     logger.info("STEP 5c: Computing storm surge rasters (bathtub) from 10 m wind...")
     logger.info("=" * 70)
     try:
+        # Imported here, not at module level: the surge step needs rasterio,
+        # which a run with PROCESS_SURGE=false must not depend on
+        from ecmwf_surge_envelope_extractor import process_surge_combination, resolve_surge_dem
         dem_path = resolve_surge_dem(
             config.surge_dem_source, config.surge_dem_local_dir,
             snowflake_conn=snowflake_conn,

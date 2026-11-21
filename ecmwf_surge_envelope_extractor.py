@@ -47,6 +47,7 @@ import pandas as pd
 import rasterio
 import xarray as xr
 from rasterio.windows import Window, from_bounds
+from rasterio.windows import transform as window_transform
 
 from ecmwf_wind_data_extractor import (
     create_buffered_track_polygon,
@@ -230,7 +231,7 @@ def write_surge_raster(cells: CoastalCells, peaks: Dict[int, Optional[np.ndarray
     profile = {
         'driver': 'GTiff', 'height': height, 'width': width, 'count': len(members),
         'dtype': 'float32', 'crs': 'EPSG:4326',
-        'transform': cells.transform * rasterio.Affine.translation(c0, r0),
+        'transform': window_transform(Window(c0, r0, width, height), cells.transform),
         'nodata': np.nan, 'compress': 'deflate', 'predictor': 3,
         'tiled': True, 'blockxsize': 256, 'blockysize': 256, 'BIGTIFF': 'IF_SAFER',
     }
