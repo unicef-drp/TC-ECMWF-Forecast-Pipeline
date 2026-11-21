@@ -67,7 +67,7 @@ def get_forecast_data(track_id, forecast_time):
     )
 
     query = f"""
-    SELECT 
+    SELECT
         ENSEMBLE_MEMBER,
         LEAD_TIME,
         VALID_TIME,
@@ -102,7 +102,7 @@ def get_combined_envelopes(track_id, forecast_time):
     )
 
     query = f"""
-    SELECT 
+    SELECT
         ENSEMBLE_MEMBER,
         LEAD_TIME_RANGE,
         WIND_THRESHOLD,

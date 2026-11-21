@@ -22,7 +22,7 @@ import logging
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import requests
 from ecmwf.opendata import Client
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_DIR = "tc_data"
 
 # Candidate TC forecast steps by run time (hours), tried in order against the primary
-# source before falling back to DISS. 
+# source before falling back to DISS.
 _STEP_CANDIDATES = {0: [360, 240], 6: [144], 12: [360, 240], 18: [144]}
 
 
@@ -89,7 +89,7 @@ def _download_diss_and_combine(
         logger.info("DISS: no TC track files found for this run (no active named storms)")
         return False
 
-    logger.info(f"DISS: found {len(tc_urls)} TC track file(s) -- downloading and combining")
+    logger.info(f"DISS: found {len(tc_urls)} TC track file(s), downloading and combining")
 
     total_bytes = 0
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -160,7 +160,7 @@ def download_tc_data(
     targets = _resolve_targets(date, run_time, limit)
 
     if not targets:
-        logger.error("No forecast targets resolved -- nothing to download")
+        logger.error("No forecast targets resolved, nothing to download")
         return {'downloaded': 0, 'failed': 0, 'files': []}
 
     downloaded = 0
@@ -218,7 +218,7 @@ def download_tc_data(
         else:
             failed += 1
 
-    logger.info(f"TC download complete -- downloaded: {downloaded}, failed: {failed}")
+    logger.info(f"TC download complete, downloaded: {downloaded}, failed: {failed}")
     return {'downloaded': downloaded, 'failed': failed, 'files': files}
 
 

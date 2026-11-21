@@ -16,7 +16,7 @@ SNOWFLAKE_SCHEMA=your_schema
 # NOTES
 # ==============================================================================
 # - All Snowflake variables are required for the dashboard to function
-# - The dashboard reads data from the TC_TRACKS, TC_ENVELOPES_INDIVIDUAL, 
+# - The dashboard reads data from the TC_TRACKS, TC_ENVELOPES_INDIVIDUAL,
 #   and TC_ENVELOPES_COMBINED tables in Snowflake
 # - Ensure the Snowflake user has SELECT permissions on these tables
 # - For production, never commit the .env file with real credentials

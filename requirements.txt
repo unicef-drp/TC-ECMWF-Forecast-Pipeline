@@ -35,5 +35,3 @@ azure-storage-blob>=12.19.0
 zarr>=3.0.0
 numcodecs>=0.14.0  # zarr 3.x requires >=0.14; older versions cause CompatibilityError
 blosc2>=2.0.0      # required by zarr BloscCodec at write time (not in zarr's own deps)
-
-# Dash web app dependencies live in web/requirements.txt; not needed by the pipeline

@@ -80,7 +80,7 @@ def load_gust_data_all_members(grib_file: str, bbox: Dict) -> List[xr.DataArray]
 
     Returns:
         List[xr.DataArray]: One loaded, cropped DataArray per real longitude
-            window (length 1, bbox clipped exactly as before, for the
+            window (length 1, bbox clipped to the single window, for the
             overwhelming majority of storms; length 2 only when bbox
             straddles the antimeridian). Callers must extract contours once
             per element and merge results (see merge_contour_dicts), never
@@ -295,7 +295,7 @@ def process_gust_combination(
     # Find storm CSV files
     storm_configs = find_tc_data_files(tc_data_dir)
     if not storm_configs:
-        logger.warning("No TC data files found -- nothing to process")
+        logger.warning("No TC data files found, nothing to process")
         return {'processed_storms': 0, 'total_envelope_files': 0}
 
     processed_storms = 0

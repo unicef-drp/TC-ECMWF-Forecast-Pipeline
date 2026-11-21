@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from shapely import wkt
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import MultiPolygon
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from pathlib import Path
@@ -163,7 +163,7 @@ def visualize_tc_tracks(csv_file, output_dir=DEFAULT_OUTPUT_DIR, show_plot=True,
     print(f"Ensemble members: {len(members)}")
 
     # Create figure
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
 
     # Get bounds
@@ -267,7 +267,7 @@ def visualize_tracks_with_wind_polygons(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     print(f"Wind polygon columns: {polygon_cols}")
 
     # Create figure
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
 
     # Get bounds
@@ -711,14 +711,14 @@ def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
 
     Args:
         zarr_path:  Path to tp_YYYYMMDD_HH.zarr.zip
-        step_h:     Accumulated-total forecast hour shown (0–144, multiple of 6)
+        step_h:     Accumulated-total forecast hour shown (0 to 144, multiple of 6)
         track_csv:  Optional TC track CSV for spatial extent + overlay
         output_dir: Directory for saved PNG
         show_plot:  Display interactively
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("PRECIPITATION -- ENSEMBLE MEAN")
+    print("PRECIPITATION: ENSEMBLE MEAN")
     print("=" * 60)
 
     p = _load_precip_zarr(zarr_path)
@@ -749,7 +749,7 @@ def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
 
     print(f"  Step: {step_h}h  |  Ensemble max mean: {plot_data.max():.1f}mm")
 
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
     setup_map(ax, bounds)
 
@@ -774,9 +774,9 @@ def visualize_precip_ensemble_mean(zarr_path, step_h=72, track_csv=None,
                     transform=ccrs.PlateCarree(), label='HRES (member 51)', zorder=5)
         ax.legend(loc='upper right', fontsize=9)
 
-    title = f"Ensemble Mean Accumulated Precipitation -- {step_h}h"
+    title = f"Ensemble Mean Accumulated Precipitation: {step_h}h"
     if storm_name:
-        title = f"{storm_name} -- {title}"
+        title = f"{storm_name}: {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -813,7 +813,7 @@ def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("PRECIPITATION -- PERIOD ACCUMULATION PANELS")
+    print("PRECIPITATION: PERIOD ACCUMULATION PANELS")
     print("=" * 60)
 
     if periods is None:
@@ -889,9 +889,9 @@ def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
                         color='red', linewidth=2.5, alpha=0.95,
                         transform=ccrs.PlateCarree(), zorder=5)
 
-        ax.set_title(f"{start_h}–{end_h}h period  (max {period_means[i].max():.1f}mm)",
+        ax.set_title(f"{start_h} to {end_h}h period  (max {period_means[i].max():.1f}mm)",
                      fontsize=11, fontweight='bold')
-        print(f"  {start_h:>3d}–{end_h:>3d}h: max {period_means[i].max():.1f}mm")
+        print(f"  {start_h:>3d} to {end_h:>3d}h: max {period_means[i].max():.1f}mm")
 
     for i in range(n, len(axes)):
         axes[i].set_visible(False)
@@ -902,7 +902,7 @@ def visualize_precip_period_panels(zarr_path, track_csv=None, periods=None,
 
     title = 'Ensemble Mean Period Precipitation'
     if storm_name:
-        title = f"{storm_name} -- {title}"
+        title = f"{storm_name}: {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     fig.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
 
@@ -931,21 +931,21 @@ def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv
     Args:
         zarr_path:      Path to tp_YYYYMMDD_HH.zarr.zip
         threshold_mm:   Precipitation threshold in mm
-        step_h:         Forecast hour for the accumulated total (0–144)
+        step_h:         Forecast hour for the accumulated total (0 to 144)
         track_csv:      Optional TC track CSV for spatial extent + overlay
         output_dir:     Directory for saved PNG
         show_plot:      Display interactively
         save_plot:      Save PNG to output_dir
     """
     print("=" * 60)
-    print(f"PRECIPITATION -- EXCEEDANCE PROBABILITY (>{threshold_mm}mm by {step_h}h)")
+    print(f"PRECIPITATION: EXCEEDANCE PROBABILITY (>{threshold_mm}mm by {step_h}h)")
     print("=" * 60)
 
     p = _load_precip_zarr(zarr_path)
     sidx = _step_index(p['steps'], step_h)
 
     arr = np.asarray(p['data'][:, sidx, :, :]).astype(np.float32)    # (51, lat, lon)
-    exceed_pct = (arr > threshold_mm).mean(axis=0) * 100              # (lat, lon) 0–100%
+    exceed_pct = (arr > threshold_mm).mean(axis=0) * 100              # (lat, lon) 0 to 100%
 
     if track_csv:
         bounds = _precip_bounds_from_track(track_csv)
@@ -967,7 +967,7 @@ def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv
     print(f"  Max exceedance probability : {plot_data.max():.1f}%")
     print(f"  Grid cells with P > 50%   : {(plot_data > 50).sum()}")
 
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
     setup_map(ax, bounds)
 
@@ -995,7 +995,7 @@ def visualize_precip_exceedance(zarr_path, threshold_mm=50, step_h=72, track_csv
 
     title = f"Exceedance Probability: >{threshold_mm}mm by {step_h}h"
     if storm_name:
-        title = f"{storm_name} -- {title}"
+        title = f"{storm_name}: {title}"
     title += f"\nForecast: {p['forecast_date']} {p['run_time']:02d}Z | {len(p['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -1179,7 +1179,7 @@ def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_c
     """
     threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
     if not threshold_path.exists():
-        print(f"  RP{rp} threshold file not found at {threshold_path} -- cannot find a hotspot.")
+        print(f"  RP{rp} threshold file not found at {threshold_path}, cannot find a hotspot.")
         return None
 
     g = _load_glofas_zarr(zarr_path)
@@ -1193,7 +1193,7 @@ def find_glofas_hotspot(zarr_path, threshold_local_dir='glofas_data/thresholds_c
     exceed_pct[valid] = (disch[:, valid] > thr_at_cells[valid]).mean(axis=0) * 100
 
     if not (exceed_pct > 0).any():
-        print("  No exceedance found anywhere -- cannot pick a hotspot.")
+        print("  No exceedance found anywhere, cannot pick a hotspot.")
         return None
 
     # Densest cluster of high-exceedance cells: bin into 2deg cells, find the bin
@@ -1276,7 +1276,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
         save_plot:            Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS -- GAUGE HYDROGRAPH")
+    print("GLOFAS: GAUGE HYDROGRAPH")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1344,7 +1344,7 @@ def visualize_glofas_gauge_hydrograph(zarr_path, cell_lat=None, cell_lon=None,
     ax.grid(alpha=0.25)
     ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
 
-    title = f"GloFAS Gauge Hydrograph -- lat={actual_lat:.2f}, lon={actual_lon:.2f}"
+    title = f"GloFAS Gauge Hydrograph: lat={actual_lat:.2f}, lon={actual_lon:.2f}"
     title += f"\nIssued: {g['forecast_date']} | {series.shape[0]} members"
     ax.set_title(title, fontsize=13, fontweight='bold', pad=12)
 
@@ -1386,7 +1386,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
         save_plot:  Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS -- ENSEMBLE MEAN DISCHARGE")
+    print("GLOFAS: ENSEMBLE MEAN DISCHARGE")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1401,7 +1401,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
     cells_note = f"{g['n_cells_kept']:,}" + (f" of {n_total:,} total" if n_total else "")
     print(f"  Lead: +{step_h}h  |  Cells: {cells_note}  |  Max mean discharge: {mean_val.max():.0f} m3/s")
 
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
     _setup_glofas_map(ax, bounds, regional=(bounds != GLOFAS_DEFAULT_BOUNDS))
 
@@ -1414,7 +1414,7 @@ def visualize_glofas_ensemble_mean(zarr_path, step_h=72, bounds=None,
     plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
                  label='Ensemble mean discharge (m3/s, log scale)', shrink=0.7)
 
-    title = f"GloFAS Ensemble Mean River Discharge -- +{step_h}h"
+    title = f"GloFAS Ensemble Mean River Discharge: +{step_h}h"
     title += (f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
               f" | filtered to {g['filter_threshold']}")
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
@@ -1452,7 +1452,7 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
         save_plot:   Save PNG to output_dir
     """
     print("=" * 60)
-    print("GLOFAS -- MULTI-DAY ENSEMBLE MAX PANELS")
+    print("GLOFAS: MULTI-DAY ENSEMBLE MAX PANELS")
     print("=" * 60)
 
     g = _load_glofas_zarr(zarr_path)
@@ -1489,7 +1489,7 @@ def visualize_glofas_period_panels(zarr_path, lead_hours=None,
 
     fig.colorbar(mesh, ax=axes[:n_panels].tolist(), orientation='horizontal',
                 pad=0.05, label='Ensemble max discharge (m3/s, log scale)', shrink=0.6)
-    fig.suptitle(f"GloFAS Ensemble Max Discharge by Lead Time -- issued {g['forecast_date']}",
+    fig.suptitle(f"GloFAS Ensemble Max Discharge by Lead Time, issued {g['forecast_date']}",
                 fontsize=14, fontweight='bold')
 
     filepath = None
@@ -1530,12 +1530,12 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
     """
     zoomed = bounds is not None
     print("=" * 60)
-    print(f"GLOFAS -- RP{rp}yr EXCEEDANCE PROBABILITY (+{step_h}h)" + ("  [ZOOMED]" if zoomed else ""))
+    print(f"GLOFAS: RP{rp}yr EXCEEDANCE PROBABILITY (+{step_h}h)" + ("  [ZOOMED]" if zoomed else ""))
     print("=" * 60)
 
     threshold_path = Path(threshold_local_dir) / f"rl_{rp}.nc"
     if not threshold_path.exists():
-        print(f"  RP{rp} threshold file not found at {threshold_path} -- skipping.")
+        print(f"  RP{rp} threshold file not found at {threshold_path}, skipping.")
         print(f"  Run: python3 setup_glofas_thresholds.py --local-only {threshold_local_dir}")
         return None
 
@@ -1556,7 +1556,7 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
     print(f"  Cells with any threshold data : {valid.sum():,} of {len(g['cell_lat']):,}")
     print(f"  Cells with >50% members exceeding RP{rp}yr : {(exceed_pct > 50).sum():,}")
 
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     ax = plt.axes(projection=ccrs.PlateCarree())
     _setup_glofas_map(ax, plot_bounds, regional=zoomed)
 
@@ -1566,7 +1566,7 @@ def visualize_glofas_exceedance(zarr_path, threshold_local_dir='glofas_data/thre
     plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.02,
                 label=f'P(discharge > RP{rp}yr) at +{step_h}h  [%]', shrink=0.7)
 
-    title = f"GloFAS RP{rp}yr Exceedance Probability -- +{step_h}h" + (" (zoomed to hotspot)" if zoomed else "")
+    title = f"GloFAS RP{rp}yr Exceedance Probability: +{step_h}h" + (" (zoomed to hotspot)" if zoomed else "")
     title += f"\nIssued: {g['forecast_date']} | {len(g['member_numbers'])} members"
     plt.title(title, fontsize=14, fontweight='bold', pad=15)
 
@@ -1618,7 +1618,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
 
     Naively multiplying a whole GloFAS 0.05deg (~5km) cell's population by its raw
     exceedance probability overstates exposure. A GloFAS cell is a channel/discharge
-    property, not a locally-uniform hazard the way a rain cell is. combine_naive=True
+    property, not a locally-uniform hazard the way a rain cell is. compare_naive=True
     shows why, side by side: the naive whole-cell probability vs. the same probability
     masked down to JRC's actual flood-extent footprint within each cell.
 
@@ -1635,9 +1635,9 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
     )
     import rasterio as _rasterio
 
-    standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
+    standin_note = " [RP10 stand-in, no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
     print("=" * 60)
-    print(f"GLOFAS x JRC -- EXTENT-MASKED RP{rp}yr (+{step_h}h){standin_note}")
+    print(f"GLOFAS x JRC: EXTENT-MASKED RP{rp}yr (+{step_h}h){standin_note}")
     print("=" * 60)
 
     if rp not in EXTENT_RP_LEVELS:
@@ -1669,7 +1669,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
     cell_lon = g['cell_lon'][in_jrc]
     data = g['data'][:, :, in_jrc]
     print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
-          f"cached JRC coverage ({jrc_local_dir}) -- restricting to those before combining")
+          f"cached JRC coverage ({jrc_local_dir}), restricting to those before combining")
 
     prob_by_tier = compute_tier_probabilities(
         cell_lat, cell_lon, data, len(g['member_numbers']),
@@ -1678,7 +1678,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
     prob = prob_by_tier[rp]  # (n_steps, n_cells), fraction of members exceeding RP{rp}
     keep_mask = (prob > 0).any(axis=0)
     if not keep_mask.any():
-        print(f"  No cells exceed RP{rp}yr anywhere in this forecast -- try a lower tier or a different date.")
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast, try a lower tier or a different date.")
         return None
 
     out_path = Path(output_dir) / f"_demo_extent_rp{rp}.tif"
@@ -1712,8 +1712,8 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
         masked_pixels = int(np.nansum(~np.isnan(masked_pct) & (masked_pct > 0)))
         print(f"  Naive whole-cell footprint: {naive_pixels:,} pixels at 0.05deg native resolution "
               f"(not directly comparable pixel-for-pixel to the {masked_pixels:,} JRC-resolution "
-              f"pixels above -- different grids -- but illustrates the same 'whole cell vs. real "
-              f"extent' gap the README's 84x/2x overstatement numbers quantify precisely)")
+              f"pixels above, different grids, but illustrates the same 'whole cell vs. real "
+              f"extent' gap)")
 
     fig = plt.figure(figsize=(FIGSIZE[0] * (1.8 if compare_naive else 1), FIGSIZE[1]), dpi=DPI)
 
@@ -1736,7 +1736,7 @@ def visualize_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_exten
                 label=f'Extent-masked P(exceed RP{rp}yr)  [%]')
     ax2.set_title(f"GloFAS x JRC extent-masked (RP{source_tier} extent)\nreal flood-prone area only", fontsize=11)
 
-    suptitle = f"GloFAS x JRC Flood-Extent Masking -- RP{rp}yr -- +{step_h}h{standin_note}"
+    suptitle = f"GloFAS x JRC Flood-Extent Masking: RP{rp}yr, +{step_h}h{standin_note}"
     plt.suptitle(suptitle, fontsize=14, fontweight='bold')
 
     filepath = None
@@ -1764,6 +1764,27 @@ def show_glofas_extent_mask(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cac
                                         compare_naive=compare_naive, show_plot=True, save_plot=False)
 
 
+def expand_bymask_member_rows(bymask_path, leadtime_hours):
+    """Expands a compact extent file into one row per flooded (pixel, member, step):
+    columns pixel_lat, pixel_lon, member, step_h, below_min_basin. For demo plots;
+    each step's bitmask holds up to 64 member bits (member = bit + 1)."""
+    from glofas_extent_masking import bymask_step_columns
+    t = pd.read_parquet(bymask_path)
+    parts = []
+    for h, col in zip(leadtime_hours, bymask_step_columns(leadtime_hours)):
+        masks = t[col].to_numpy(dtype=np.uint64)
+        for bit in range(64):
+            hit = ((masks >> np.uint64(bit)) & np.uint64(1)).astype(bool)
+            if hit.any():
+                sub = t.loc[hit, ['pixel_lat', 'pixel_lon', 'below_min_basin']].copy()
+                sub['member'] = bit + 1
+                sub['step_h'] = int(h)
+                parts.append(sub)
+    if not parts:
+        return pd.DataFrame(columns=['pixel_lat', 'pixel_lon', 'below_min_basin', 'member', 'step_h'])
+    return pd.concat(parts, ignore_index=True)
+
+
 def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_extent_cache', rp='100.0',
                                     step_h=168, members=(1, 2), threshold_local_dir='glofas_data/thresholds_cache',
                                     bounds=None, output_dir=DEFAULT_OUTPUT_DIR, show_plot=True, save_plot=False):
@@ -1771,7 +1792,8 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     GloFAS x JRC PER-MEMBER flood-extent demo
 
     Shows 2+ specific ensemble members' own flood-extent footprints side by
-    side
+    side. Builds the production compact bitmask file for this tier, then expands
+    it to per-member rows for plotting.
 
     Requires: the RP threshold file for `rp` cached locally
     (setup_glofas_thresholds.py) AND the JRC cache for this tier +
@@ -1780,14 +1802,14 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     """
     from glofas_downloader import EXTENT_RP_LEVELS
     from glofas_extent_masking import (
-        compute_tier_member_exceedance, resolve_jrc_cache, combine_tier_per_member_parquet,
+        compute_tier_member_exceedance, resolve_jrc_cache, combine_tier_bymask_parquet,
         EXTENT_SOURCE_TIER, IS_STANDIN,
     )
     import rasterio as _rasterio
 
-    standin_note = " [RP10 stand-in -- no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
+    standin_note = " [RP10 stand-in, no native JRC map at this tier]" if IS_STANDIN.get(rp) else ""
     print("=" * 60)
-    print(f"GLOFAS x JRC -- PER-MEMBER FLOOD EXTENT RP{rp}yr (+{step_h}h){standin_note}")
+    print(f"GLOFAS x JRC: PER-MEMBER FLOOD EXTENT RP{rp}yr (+{step_h}h){standin_note}")
     print("=" * 60)
 
     if rp not in EXTENT_RP_LEVELS:
@@ -1816,7 +1838,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     cell_lon = g['cell_lon'][in_jrc]
     data = g['data'][:, :, in_jrc]
     print(f"  {int(in_jrc.sum())} of {len(g['cell_lat']):,} candidate cells fall within the "
-          f"cached JRC coverage ({jrc_local_dir}) -- restricting to those before combining")
+          f"cached JRC coverage ({jrc_local_dir}), restricting to those before combining")
 
     exceed_by_tier = compute_tier_member_exceedance(
         cell_lat, cell_lon, data, threshold_source='local', threshold_local_dir=threshold_local_dir,
@@ -1824,18 +1846,19 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
     exceed = exceed_by_tier[rp]  # (n_members, n_steps, n_cells)
     keep_mask = exceed.any(axis=(0, 1))
     if not keep_mask.any():
-        print(f"  No cells exceed RP{rp}yr anywhere in this forecast -- try a lower tier or a different date.")
+        print(f"  No cells exceed RP{rp}yr anywhere in this forecast, try a lower tier or a different date.")
         return None
 
     member_numbers = np.asarray(g['member_numbers'])
-    out_path = Path(output_dir) / f"_demo_extent_rp{rp}_bymember.parquet"
+    out_path = Path(output_dir) / f"_demo_extent_rp{rp}_bymask.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    info = combine_tier_per_member_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
-                                            jrc_paths, g['leadtime_hours'], member_numbers, out_path)
-    print(f"  Per-member extent: {info['n_cells']} GloFAS cells, {info['n_rows']:,} flooded "
-          f"pixel/member/step rows (using JRC RP{source_tier} extent + permanent-water mask)")
+    info = combine_tier_bymask_parquet(rp, cell_lat, cell_lon, exceed_by_tier, keep_mask,
+                                        jrc_paths, g['leadtime_hours'], member_numbers, out_path)
+    table = expand_bymask_member_rows(out_path, g['leadtime_hours'])
+    print(f"  Per-member extent: {info['n_cells']} GloFAS cells, {info['n_bymask_rows']:,} flooded "
+          f"pixels, {len(table):,} pixel/member/step rows (using JRC RP{source_tier} extent + "
+          f"permanent-water mask)")
 
-    table = pd.read_parquet(out_path)
     step_rows = table[table['step_h'] == step_h]
 
     plot_bounds = bounds or (float(cell_lon.min()), float(cell_lon.max()),
@@ -1853,7 +1876,7 @@ def visualize_glofas_member_extent(zarr_path, jrc_local_dir='glofas_data/jrc_ext
                        marker='s', transform=ccrs.PlateCarree(), zorder=2, alpha=0.8)
         ax.set_title(f"Member {member_no}\n{n_px:,} flooded pixels", fontsize=11)
 
-    suptitle = f"GloFAS x JRC Per-Member Flood Extent -- RP{rp}yr -- +{step_h}h{standin_note}"
+    suptitle = f"GloFAS x JRC Per-Member Flood Extent: RP{rp}yr, +{step_h}h{standin_note}"
     plt.suptitle(suptitle, fontsize=14, fontweight='bold')
 
     filepath = None
@@ -2010,7 +2033,7 @@ def visualize_individual_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
     for i in range(n_steps, len(axes)):
         axes[i].set_visible(False)
 
-    fig.suptitle(f"Storm: {storm_name} -- Member {member} Gust Envelopes\nForecast: {forecast_time}",
+    fig.suptitle(f"Storm: {storm_name} | Member {member} Gust Envelopes\nForecast: {forecast_time}",
                  fontsize=14, fontweight='bold')
 
     if n_steps > 0:
@@ -2124,14 +2147,14 @@ def visualize_combined_gust_envelopes(csv_file, output_dir=DEFAULT_OUTPUT_DIR,
 
         if thresholds_present:
             ax.text(0.02, 0.98,
-                    f"{min(thresholds_present)}–{max(thresholds_present)} m/s",
+                    f"{min(thresholds_present)} to {max(thresholds_present)} m/s",
                     transform=ax.transAxes, fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     for i in range(n_members, len(axes)):
         axes[i].set_visible(False)
 
-    fig.suptitle(f"Storm: {storm_name} -- Combined Gust Envelopes\nForecast: {forecast_time}",
+    fig.suptitle(f"Storm: {storm_name} | Combined Gust Envelopes\nForecast: {forecast_time}",
                  fontsize=16, fontweight='bold')
 
     if n_members > 0:
@@ -2317,7 +2340,7 @@ def visualize_wind_vs_gust_comparison(wind_individual_csv, gust_individual_csv,
         axes[i].set_visible(False)
 
     fig.suptitle(
-        f"Storm: {storm_name} -- Sustained Wind ({wind_kt} kt) vs Gust ({gust_ms} m/s) -- Member {member}\n"
+        f"Storm: {storm_name} | Sustained Wind ({wind_kt} kt) vs Gust ({gust_ms} m/s) | Member {member}\n"
         f"Forecast: {forecast_time}  |  Gust envelopes extend beyond sustained-wind envelopes",
         fontsize=12, fontweight='bold'
     )

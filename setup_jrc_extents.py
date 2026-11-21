@@ -26,7 +26,7 @@ Mosaicking: JRC's own tiles are downloaded as-is, then streamed one at a time
         into a single per-band output GeoTIFF via rasterio.warp.reproject()
         (never an in-memory full-mosaic array; see build_band_mosaic) so
         glofas_extent_masking.py's resolve_jrc_cache()/combine_tier() can keep
-        treating each band as one file, unchanged.
+        treating each band as one file.
 
 Usage:
     python3 setup_jrc_extents.py                                            # upload to Snowflake stage
@@ -34,7 +34,7 @@ Usage:
                                                                             # (this is glofas_extent_masking.py's
                                                                             # own local default: one root dir,
                                                                             # no separate top-level cache)
-    python3 setup_jrc_extents.py --bbox 88 20 93 26                         # smaller region, for testing
+    python3 setup_jrc_extents.py --bbox 88 20 93 26                         # smaller region
                                                                             # (west south east north)
 """
 
@@ -45,7 +45,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio
@@ -144,7 +144,7 @@ def download_tile(url: str, dest_path: Path) -> None:
         if attempt < MAX_FETCH_RETRIES:
             backoff = RETRY_BACKOFF_BASE_S * (2 ** attempt)
             logger.warning(f"    {url}: {last_error} (attempt {attempt + 1}/"
-                            f"{MAX_FETCH_RETRIES + 1}) -- retrying in {backoff:.0f}s")
+                            f"{MAX_FETCH_RETRIES + 1}), retrying in {backoff:.0f}s")
             time.sleep(backoff)
 
     raise PersistentTileFetchError(f"Persistent failure downloading {url}: {last_error}")
@@ -183,7 +183,7 @@ def build_band_mosaic(rp_key: str, bbox: Tuple[float, float, float, float], scal
             logger.info(f"    {i + 1}/{len(tile_index)} tiles downloaded")
 
     if not tile_paths:
-        raise RuntimeError(f"{folder}: no tiles intersect bbox {bbox} -- check bbox")
+        raise RuntimeError(f"{folder}: no tiles intersect bbox {bbox}, check bbox")
 
     logger.info(f"  {folder}: mosaicking {len(tile_paths)} tiles ...")
     # bounds/res are pinned to the FULL requested bbox/scale (not derived from
@@ -205,11 +205,10 @@ def build_band_mosaic(rp_key: str, bbox: Tuple[float, float, float, float], scal
     # nodata (255), not an explicit 0 the way the depth bands' nodata works.
     # combine_tier()'s mask requires water==0 for "not water"; left as 255
     # that condition is never true anywhere, silently zeroing every cell
-    # (confirmed directly: 0 combined pixels despite a real, populated depth
-    # mosaic). Fixed by remapping nodata->0 for this band specifically
-    # safe because combine_tier()'s depth>0.1m condition already gates real
-    # coverage, so collapsing "land, not water" and "no JRC coverage here"
-    # into the same 0 loses no information the mask logic actually uses.
+    # (0 combined pixels despite a populated depth mosaic). Remapping
+    # nodata->0 for this band specifically is safe because
+    # combine_tier()'s depth>0.1m condition already gates real coverage, so
+    # collapsing "land, not water" and "no JRC coverage here" into the same 0 loses no information the mask logic actually uses.
     water_nodata = ref.nodata if is_water else None
     if is_water:
         profile["nodata"] = 0
@@ -226,12 +225,10 @@ def build_band_mosaic(rp_key: str, bbox: Tuple[float, float, float, float], scal
     #
     # reproject(destination=rasterio.band(dst, 1)) does NOT read-modify-write:
     # each call fills dst_nodata across the ENTIRE destination extent outside
-    # the source's own footprint, silently wiping out every previously-written
-    # tile (confirmed directly: writing tile 2 zeroed out tile 1's already-
-    # written pixels). Same class of bug as the combine_tier() overlap bug
-    # fixed earlier; fixed the same way: reproject into a small array scoped
-    # to just this tile's own destination window, then np.where() it against
-    # the window's EXISTING contents before writing back.
+    # the source's own footprint, which would wipe every already-written tile.
+    # So each tile is reprojected into a small array scoped to its own destination
+    # window, then np.where() combines it with the window's EXISTING contents
+    # before writing back.
     nodata = profile.get("nodata")
     dtype = profile["dtype"]
     inv_transform = ~out_transform
@@ -305,7 +302,7 @@ def main():
                          help="Local working directory for downloads/mosaics (default: jrc_extents_tmp)")
     parser.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"),
                          default=None, help="Override the default 60S-60N global bbox "
-                                             "(for testing against a smaller region)")
+                                             "(restrict to a smaller region)")
     parser.add_argument("--scale", type=float, default=DEFAULT_SCALE_M,
                          help=f"Output mosaic resolution in meters (default: {DEFAULT_SCALE_M})")
     args = parser.parse_args()
@@ -315,13 +312,13 @@ def main():
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
-    logger.info(f"JRC v2.1 flood-extent cache setup -- bbox {bbox}, scale {args.scale}m")
+    logger.info(f"JRC v2.1 flood-extent cache setup: bbox {bbox}, scale {args.scale}m")
     logger.info(f"Source: direct JRC download (no GEE, no auth, no quota)")
     logger.info("=" * 70)
 
     # "already built" is otherwise judged purely by filename (jrc_rp10.tif etc.), with no
-    # check that an existing file was actually built for THIS run's bbox/scale, a leftover
-    # small-bbox test mosaic in the same dest_dir would be silently reused as the finished
+    # check that an existing file was actually built for THIS run's bbox/scale, a mosaic
+    # built from a different bbox in the same dest_dir would be silently reused as the finished
     # cache and uploaded to the Snowflake stage as if it were the real global build. This
     # manifest records the bbox/scale that produced dest_dir's current files, and forces a
     # full rebuild (rather than a partial, mixed-provenance one) whenever they don't match.
@@ -335,7 +332,7 @@ def main():
         if prev_manifest != current_manifest:
             logger.warning(
                 f"  Existing files in {dest_dir} were built with a different bbox/scale "
-                f"({prev_manifest}) than this run ({current_manifest}) -- deleting them and "
+                f"({prev_manifest}) than this run ({current_manifest}), deleting them and "
                 f"forcing a full rebuild rather than silently reusing a stale/mismatched mosaic"
             )
             for rp_key in RP_FOLDER:
@@ -352,14 +349,14 @@ def main():
         if not out_path.exists():
             build_band_mosaic(rp_key, bbox, args.scale, dest_dir / "raw_tiles", out_path, tile_index)
         else:
-            logger.info(f"  {OUTPUT_FILENAME[rp_key]} already built -- skipping")
+            logger.info(f"  {OUTPUT_FILENAME[rp_key]} already built, skipping")
         out_paths[rp_key] = out_path
 
     water_out = dest_dir / OUTPUT_FILENAME["water"]
     if not water_out.exists():
         build_band_mosaic("water", bbox, args.scale, dest_dir / "raw_tiles", water_out, tile_index)
     else:
-        logger.info(f"  {OUTPUT_FILENAME['water']} already built -- skipping")
+        logger.info(f"  {OUTPUT_FILENAME['water']} already built, skipping")
     out_paths["water"] = water_out
 
     # Co-registration check: glofas_extent_masking.py hard-requires this.
@@ -369,10 +366,10 @@ def main():
         with rasterio.open(p) as src:
             if src.transform != ref_transform or src.shape != ref_shape:
                 logger.error(f"  {p.name} is not co-registered with {out_paths['10.0'].name} "
-                              f"({src.shape} vs {ref_shape}) -- glofas_extent_masking.py requires "
+                              f"({src.shape} vs {ref_shape}), glofas_extent_masking.py requires "
                               f"identical grids across all cached bands")
                 sys.exit(1)
-    logger.info("  Co-registration check passed -- all bands share one grid")
+    logger.info("  Co-registration check passed: all bands share one grid")
 
     if args.local_only:
         local_only_dir = Path(args.local_only)
@@ -381,7 +378,7 @@ def main():
             target = local_only_dir / p.name
             if p.resolve() != target.resolve():
                 target.write_bytes(p.read_bytes())
-        logger.info(f"Done -- {len(out_paths)} files kept locally in {local_only_dir} "
+        logger.info(f"Done: {len(out_paths)} files kept locally in {local_only_dir} "
                     f"(GLOFAS_JRC_SOURCE=local should point here)")
         return
 
@@ -390,11 +387,11 @@ def main():
     for var in ('SNOWFLAKE_ACCOUNT', 'SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD',
                 'SNOWFLAKE_WAREHOUSE', 'SNOWFLAKE_DATABASE', 'SNOWFLAKE_SCHEMA'):
         if not os.getenv(var):
-            logger.error(f"{var} not set -- required for Snowflake stage upload")
+            logger.error(f"{var} not set, required for Snowflake stage upload")
             sys.exit(1)
     stage_name = os.getenv('SNOWFLAKE_STAGE_NAME')
     if not stage_name:
-        logger.error("SNOWFLAKE_STAGE_NAME not set -- required for Snowflake stage upload")
+        logger.error("SNOWFLAKE_STAGE_NAME not set, required for Snowflake stage upload")
         sys.exit(1)
 
     conn = get_snowflake_connection()
@@ -406,7 +403,7 @@ def main():
     finally:
         conn.close()
 
-    logger.info(f"Done -- {len(out_paths)} JRC cache files staged at @{stage_name}/{STAGE_PREFIX}/")
+    logger.info(f"Done: {len(out_paths)} JRC cache files staged at @{stage_name}/{STAGE_PREFIX}/")
 
 
 if __name__ == "__main__":
