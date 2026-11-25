@@ -47,6 +47,18 @@ SNOWFLAKE_STAGE_NAME=your_stage_name
 # PROCESS_WIND_DATA
 PROCESS_GUST=true
 
+# Enable storm surge rasters, step 5c (true/false, default: false). Requires
+# PROCESS_WIND_DATA (reuses the 10 m wind files) and the coastal elevation cache
+# built once by setup_surge_dem.py. Output: one GeoTIFF per storm, uploaded to surge/
+PROCESS_SURGE=false
+
+# Where the surge elevation cache is read from: snowflake, blob, or local.
+# Defaults to DATA_PIPELINE_DB
+SURGE_DEM_SOURCE=snowflake
+
+# Local dir containing surge_coastal_dem.tif, used only when SURGE_DEM_SOURCE=local
+SURGE_DEM_LOCAL_DIR=surge_dem
+
 # Filter to named storms only (true/false, default: true)
 NAMED_STORMS_ONLY=true
 

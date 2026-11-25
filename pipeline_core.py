@@ -98,6 +98,17 @@ class BasePipelineConfig:
         # TC track data).
         self.process_gust = os.getenv('PROCESS_GUST', 'true').lower() == 'true'
 
+        # Storm surge (step 5c, ecmwf_surge_envelope_extractor.py): CLIMADA
+        # bathtub surge computed from the same ECMWF 10 m wind files as step 5,
+        # so it also requires process_wind_data. Default OFF until validated in
+        # production. Needs the coastal elevation cache built once by
+        # setup_surge_dem.py.
+        self.process_surge = os.getenv('PROCESS_SURGE', 'false').lower() == 'true'
+        # Where that cache is read from: snowflake, blob, or local. Defaults to
+        # DATA_PIPELINE_DB, same convention as GLOFAS_JRC_SOURCE.
+        self.surge_dem_source = os.getenv('SURGE_DEM_SOURCE', self.data_pipeline_db).lower()
+        self.surge_dem_local_dir = Path(os.getenv('SURGE_DEM_LOCAL_DIR', 'surge_dem'))
+
         # Wind/gust speed-field raster persistence (ecmwf_wind_raster_writer.py):
         # optional output, not read by downstream consumers.
         # DATAPIPELINE's own impact-computation code rasterizes the
@@ -609,7 +620,7 @@ def step5_process_wind(config: BasePipelineConfig, stats: PipelineStats,
             logger.info(f"Processed wind data for {result['processed_storms']} storm(s)")
             envelope_files = [
                 f for f in config.wind_extracted_dir.glob("*_envelopes_*.csv")
-                if 'gust' not in f.name
+                if 'gust' not in f.name and 'surge' not in f.name
             ]
             logger.info(f"Envelope files: {[f.name for f in envelope_files]}")
             # Gated on publish_raster, not just globbed unconditionally: a stale
@@ -675,6 +686,73 @@ def step5b_extract_gust_envelopes(config: BasePipelineConfig,
         logger.error(error_msg)
         stats.errors.append(error_msg)
         return [], []
+
+
+def raster_upload_prefix(filename: str) -> str:
+    """Upload folder (Blob container root or Snowflake stage) of a raster file,
+    from the dataset token in its own name: surge/ for the storm surge rasters
+    (step 5c), gust_raster/ and wind_raster/ for the wind/gust speed fields."""
+    if '_surge_raster' in filename:
+        return 'surge'
+    if 'gust_raster' in filename:
+        return 'gust_raster'
+    return 'wind_raster'
+
+
+def step5c_compute_surge_rasters(config: BasePipelineConfig, stats: PipelineStats,
+                                 snowflake_conn=None) -> List[Path]:
+    """Step 5c: Compute storm surge from the 10 m wind GRIB files and write one
+    maximum-surge GeoTIFF per storm and forecast cycle (one band per member).
+
+    Same inputs as step 5 (transformed tracks + wind_ens_* GRIB files), plus the
+    coastal elevation cache (setup_surge_dem.py), resolved from
+    SURGE_DEM_SOURCE. snowflake_conn is only needed when that source is
+    'snowflake' and the cache is not already on local disk.
+
+    Returns:
+        surge_raster_files: the *_surge_raster*.tif files written this run,
+        uploaded by the load step to surge/ (see raster_upload_prefix).
+    """
+    if not config.process_wind_data:
+        logger.info("Wind data processing disabled -- skipping surge")
+        return []
+    if not config.process_surge:
+        logger.info("PROCESS_SURGE=false -- skipping surge")
+        return []
+    logger.info("=" * 70)
+    logger.info("STEP 5c: Computing storm surge rasters (bathtub) from 10 m wind...")
+    logger.info("=" * 70)
+    try:
+        # Imported here, not at module level: the surge step needs rasterio,
+        # which a run with PROCESS_SURGE=false must not depend on
+        from ecmwf_surge_envelope_extractor import process_surge_combination, resolve_surge_dem
+        dem_path = resolve_surge_dem(
+            config.surge_dem_source, config.surge_dem_local_dir,
+            snowflake_conn=snowflake_conn,
+            snowflake_stage_name=config.snowflake_stage_name,
+            blob_account_url=config.blob_account_url,
+            blob_sas_token=config.blob_sas_token,
+            blob_container=config.blob_container,
+        )
+        result = process_surge_combination(
+            tc_data_dir=config.transformed_data_dir,
+            wind_data_dir=config.wind_data_dir,
+            output_dir=config.wind_extracted_dir,
+            dem_path=dem_path,
+        )
+        # Files written this run only (never a glob), so a stale raster from an
+        # interrupted earlier run is never uploaded as if it were this cycle's
+        surge_files = result['raster_files']
+        if surge_files:
+            logger.info(f"Surge raster files: {[f.name for f in surge_files]}")
+        else:
+            logger.info("No surge raster generated (no low-lying coast near any storm)")
+        return surge_files
+    except Exception as e:
+        error_msg = f"Surge computation failed: {e}"
+        logger.error(error_msg)
+        stats.errors.append(error_msg)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +889,8 @@ def cleanup_files(config: BasePipelineConfig, upload_failed_filenames=None):
             # newly produced this cycle. Same LOCAL-mode exemption as the CSV
             # line above (LOCAL mode's rasters are themselves the final output).
             *([("*_wind_raster_*.tif", config.wind_extracted_dir),
-               ("*_gust_raster_*.tif", config.wind_extracted_dir)] if not local_mode else []),
+               ("*_gust_raster_*.tif", config.wind_extracted_dir),
+               ("*_surge_raster*.tif", config.wind_extracted_dir)] if not local_mode else []),
             # precip: grib_tmp only; ZipStore is the persistent output, keep it
             ("*.grib2", config.met_data_dir / "grib_tmp"),
             ("*.idx",   config.met_data_dir / "grib_tmp"),
