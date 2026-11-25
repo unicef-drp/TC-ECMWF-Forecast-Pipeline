@@ -892,8 +892,13 @@ def download_from_blob(account_url: str, sas_token: str, container: str,
         service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
         blob_client = service_client.get_container_client(container).get_blob_client(blob_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(local_path, 'wb') as f:
-            f.write(blob_client.download_blob().readall())
+        # Download first, write to a temp file, then rename: a missing blob or a
+        # failed download must never leave an empty or partial file at local_path
+        data = blob_client.download_blob().readall()
+        tmp_path = local_path.with_name(local_path.name + '.part')
+        with open(tmp_path, 'wb') as f:
+            f.write(data)
+        tmp_path.replace(local_path)
         return True
     except Exception as e:
         logger.info(f"  Blob GET for {blob_path} failed or file not present: {e}")

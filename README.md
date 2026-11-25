@@ -20,7 +20,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 4b. **Download Gust Data**: Downloads ensemble 10fg (maximum wind gust) GRIB files for the same run time and lead times as Step 4
 5. **Process Wind Combination**: Creates wind threshold envelope polygons by combining TC tracks with wind forecast data
 5b. **Extract Gust Envelopes**: Creates gust threshold envelope polygons from 10fg GRIB files (step 0 skipped: no accumulation period at T+0)
-5c. **Compute Storm Surge Rasters** *(optional, `PROCESS_SURGE=true`)*: Computes coastal storm surge from the Step 4 wind with the CLIMADA bathtub method and writes one GeoTIFF per storm with the maximum surge depth of each ensemble member, uploaded to `surge/`. See [Storm Surge](#storm-surge-step-5c) below
+5c. **Compute Storm Surge** *(optional, `PROCESS_SURGE=true`)*: Computes coastal storm surge from the Step 4 wind with the CLIMADA bathtub method and writes one sparse Parquet table per storm with the maximum surge depth of each ensemble member for every flooded cell, uploaded to `surge/`. See [Storm Surge](#storm-surge-step-5c) below
 6. **Download Gridded Parameters** *(optional)*: Downloads global GRIB files for `tp` (total precipitation) and `ro` (total runoff), converts each to a Zarr ZipStore, and uploads to a Snowflake internal stage. Runs regardless of whether named storms were found.
 7. **Load to Snowflake** *(or keep locally)*: Loads processed data into Snowflake using a staging table → MERGE pattern, or skips the load entirely when `DATA_PIPELINE_DB=LOCAL`
 
@@ -35,7 +35,7 @@ The pipeline processes ECMWF ensemble tropical cyclone forecasts through the fol
 | `*_envelopes_combined.csv` | `TC_ENVELOPES_COMBINED` | Unioned polygon per member × threshold |
 | `*_gust_envelopes_individual.csv` | `TC_GUST_ENVELOPES_INDIVIDUAL` | Gust threshold polygon per member × step (10fg, m/s thresholds) |
 | `*_gust_envelopes_combined.csv` | `TC_GUST_ENVELOPES_COMBINED` | Unioned gust polygon per member × threshold |
-| `*_surge_raster.tif` | none (file in `surge/` on Blob or the Snowflake stage) | Storm surge: maximum depth (m) over lead times, one band per member, on the 15″ coastal grid |
+| `*_surge.parquet` | none (file in `surge/` on Blob or the Snowflake stage) | Storm surge: maximum depth (m) over lead times, one row per flooded 15″ coastal cell, one column per member |
 | `met_data/tp_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param): `tp` total precipitation (global) |
 | `met_data/ro_*.zarr.zip` | `MET_FORECASTS` | One row per (forecast_time, param): `ro` total runoff (land-only) |
 | `glofas_data/river_*.zarr.zip` | `RIVER_FORECASTS` | One row per (forecast_time, param='dis24'): GloFAS riverine discharge, standalone pipeline, see below |
@@ -183,7 +183,7 @@ github_actions/snowflake_loader.py  ← Step 7: MERGE into Snowflake
 | `snowflake/spcs_pipeline.py` | Concurrent entry point: ProcessPool/SPCS OAuth |
 | `github_actions/snowflake_loader.py` | Snowflake loader for GitHub Actions (password auth) |
 | `snowflake/snowflake_loader.py` | Snowflake loader for SPCS (OAuth + private key support) |
-| `ecmwf_surge_envelope_extractor.py` | Step 5c: bathtub storm surge and maximum-surge rasters |
+| `ecmwf_surge_envelope_extractor.py` | Step 5c: bathtub storm surge and the maximum-surge tables |
 | `setup_surge_dem.py` | One-time build of the coastal elevation cache used by step 5c |
 
 ### Snowflake Loading
@@ -298,7 +298,7 @@ Install eccodes: `brew install eccodes` (macOS) or `apt-get install libeccodes-d
 | `tc_data/` | Downloaded BUFR files and extracted per-storm CSVs |
 | `tc_data_transformed/` | Transformed TC CSVs |
 | `wind_data/` | Wind GRIB files |
-| `wind_extracted/` | Envelope CSV files, wind/gust/surge GeoTIFFs |
+| `wind_extracted/` | Envelope CSV files, wind/gust rasters, surge Parquet tables |
 | `met_data/` | Precipitation Zarr ZipStore files |
 | `glofas_data/` | GloFAS riverine discharge Zarr ZipStore files (standalone pipeline, see below) |
 
@@ -327,16 +327,20 @@ pipeline does not depend on CLIMADA at run time (equivalence with CLIMADA is che
 * only on coastal land 0–10 m high and within 50 km of the coast, where V ≥ 34 kt
 * per member and per lead time, on a 15″ (~450 m) grid, then the maximum over lead times
 
-**Output.** One GeoTIFF per storm and forecast cycle, `<STORM>_<YYYYMMDDTHHZ>_surge_raster.tif` (`_w0`/`_w1`
-suffix for a storm crossing the antimeridian), uploaded to `surge/` on Blob Storage (`DATA_PIPELINE_DB=BLOB`)
-or on the Snowflake stage (`DATA_PIPELINE_DB=SNOWFLAKE`); no Snowflake table. EPSG:4326, on the elevation cache
-grid, cropped to the coastal cells of the storm area:
+**Output.** One sparse Parquet table per storm and forecast cycle, `<STORM>_<YYYYMMDDTHHZ>_surge.parquet`
+(one file even for a storm crossing the antimeridian), uploaded to `surge/` on Blob Storage
+(`DATA_PIPELINE_DB=BLOB`) or on the Snowflake stage (`DATA_PIPELINE_DB=SNOWFLAKE`); no Snowflake table. One row per
+coastal cell that is flooded by at least one member, so the file stays small however large the storm area is:
 
-* 51 bands, one per ensemble member (bands 1–50: perturbed members 1–50, band 51: control), named `member_<n>`
-* maximum surge depth above ground over all lead times, in m (float32); 0 on a coastal cell that is not flooded,
-  nodata (NaN) everywhere else (sea, inland, ground at 10 m or above)
+* `cell_row`, `cell_col`: pixel row and column of the cell in the global elevation cache grid (EPSG:4326, 15″;
+  `grid_transform`, `grid_height`, `grid_width` are in the file metadata), `longitude`, `latitude`: the cell centre
+* `member_1` … `member_51` (float32): maximum surge depth above ground over all lead times, in m, for each ensemble
+  member (1–50 perturbed, 51 control); 0 where that member does not flood the cell, an all-NaN column for a member
+  without wind data
+* cells that are not listed are not flooded by any member, or are not low-lying coastal land
 * no threshold: the exposure step chooses its own (e.g. a 2 km tile counts as reached when any of its cells is)
-* tags: `storm`, `forecast_time`, `lead_times_h`, `member_numbers`, `control_member`, `units`, `elevation_source`
+* file metadata: `storm`, `forecast_time`, `lead_times_h`, `member_numbers`, `control_member`, `units`,
+  `elevation_source`
 
 **Elevation cache.** Built once by `setup_surge_dem.py` from DeltaDTM v1.1 (Deltares / TU Delft,
 1″ coastal bare-earth terrain model, EGM2008, CC BY 4.0) and Natural Earth coastlines, then stored
@@ -348,8 +352,8 @@ the global run), reused on later runs, resumed if interrupted and checked agains
 No extra dependency is needed beyond `requirements.txt`.
 
 ```bash
-python setup_surge_dem.py --deltadtm-dir deltadtm                       # global 56S-60N, Snowflake stage
-python setup_surge_dem.py --deltadtm-dir deltadtm --upload blob         # global 56S-60N, Blob Storage
+python setup_surge_dem.py --deltadtm-dir deltadtm                       # global 56S-60N, Blob Storage (default)
+python setup_surge_dem.py --deltadtm-dir deltadtm --upload snowflake    # global 56S-60N, Snowflake stage
 python setup_surge_dem.py --deltadtm-dir deltadtm --bbox -79 17 -76 19 --local-only surge_dem   # one region, local
 ```
 

@@ -49,9 +49,9 @@ PROCESS_WIND_DATA=true
 # PROCESS_WIND_DATA
 PROCESS_GUST=true
 
-# Storm surge rasters, step 5c (default: false); see root sample_env.txt
+# Storm surge, step 5c (default: false); see root sample_env.txt
 PROCESS_SURGE=false
-SURGE_DEM_SOURCE=snowflake
+SURGE_DEM_SOURCE=blob
 SURGE_DEM_LOCAL_DIR=surge_dem
 
 # Filter to named storms only (true/false, default: true)

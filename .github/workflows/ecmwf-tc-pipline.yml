@@ -95,6 +95,10 @@ jobs:
           RUN_TIME: ${{ github.event.inputs.run_time }}
           DOWNLOAD_LIMIT: '1'
           PROCESS_WIND_DATA: 'true'
+          # Storm surge rasters (step 5c) -> surge/ on Blob. Needs the coastal elevation
+          # cache at surge/coastal_dem/v1/ on Blob first (setup_surge_dem.py)
+          PROCESS_SURGE: 'true'
+          SURGE_DEM_SOURCE: 'blob'
           CLEANUP_AFTER_LOAD: ${{ github.event.inputs.cleanup || 'true' }}
           SKIP_EXISTING: 'false'  # Always process new data in CI
 

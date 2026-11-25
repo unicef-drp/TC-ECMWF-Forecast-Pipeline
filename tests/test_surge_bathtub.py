@@ -6,9 +6,9 @@ pipeline's numpy re-implementation gives the same surge heights as CLIMADA
 Petals TCSurgeBathtub.from_tc_winds. It needs climada + climada_petals (dev
 only, not a pipeline dependency) and is skipped when they are not installed.
 
-TestSurgeRaster: the output raster, on a small synthetic elevation cache and
-synthetic wind (no GRIB file, no download): one band per member, maximum over
-lead times, 0 on dry coastal cells, nodata everywhere else.
+TestSurgeRaster: the output table, on a small synthetic elevation cache and
+synthetic wind (no GRIB file, no download): one column per member, maximum over
+lead times, only the flooded cells listed.
 
     python -m pytest tests/test_surge_bathtub.py -v
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import rasterio
 import xarray as xr
 from rasterio.transform import from_origin
@@ -101,7 +102,7 @@ class TestBathtubSurge(unittest.TestCase):
 
 
 class TestSurgeRaster(unittest.TestCase):
-    """End-to-end on synthetic inputs: elevation cache -> surge -> GeoTIFF."""
+    """End-to-end on synthetic inputs: elevation cache -> surge -> sparse Parquet table."""
 
     RES = 15 / 3600                      # 15" grid, as the real cache
     WEST, NORTH = -78.0, 18.5            # small 40 x 40 cell area
@@ -168,46 +169,56 @@ class TestSurgeRaster(unittest.TestCase):
     def _run(self):
         files = surge._process_storm("TEST", str(self.track), self.wind_files, self.dem, self.out, verbose=False)
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].name, "TEST_20251028T00Z_surge_raster.tif")
+        self.assertEqual(files[0].name, "TEST_20251028T00Z_surge.parquet")
         return files[0]
 
-    def test_bands_members_and_tags(self):
-        with rasterio.open(self._run()) as r:
-            self.assertEqual(r.count, 51)
-            self.assertEqual(r.descriptions[0], "member_1")
-            self.assertEqual(r.descriptions[50], "member_51")
-            self.assertEqual(r.tags()["member_numbers"], ",".join(str(m) for m in range(1, 52)))
-            self.assertEqual(r.tags()["units"], "m")
-            self.assertEqual(r.tags()["lead_times_h"], "0-6")
-            # Cropped to the coastal cells, on the cache grid
-            self.assertEqual(r.shape, (10, 20))
-            self.assertAlmostEqual(r.res[0], self.RES)
-            self.assertAlmostEqual(r.bounds.left, self.WEST + 10 * self.RES)
-            self.assertAlmostEqual(r.bounds.top, self.NORTH - 10 * self.RES)
+    def _expected_surge(self, wind):
+        """Surge of one member over the 10 x 20 coastal block, as a (10, 20) array."""
+        return bathtub_surge(np.full(self.elev_block.size, wind), self.elev_block.ravel().astype(float),
+                             np.ones(self.elev_block.size)).reshape(self.elev_block.shape)
+
+    def test_columns_members_and_metadata(self):
+        path = self._run()
+        df = pd.read_parquet(path)
+        self.assertEqual(list(df.columns), ["cell_row", "cell_col", "longitude", "latitude"]
+                         + [f"member_{m}" for m in range(1, 52)])
+        self.assertTrue(all(df[f"member_{m}"].dtype == np.float32 for m in range(1, 52)))
+        meta = {k.decode(): v.decode() for k, v in pq.read_schema(path).metadata.items()}
+        self.assertEqual(meta["member_numbers"], ",".join(str(m) for m in range(1, 52)))
+        self.assertEqual(meta["units"], "m")
+        self.assertEqual(meta["lead_times_h"], "0-6")
+        self.assertEqual(meta["grid_crs"], "EPSG:4326")
+        self.assertEqual((meta["grid_height"], meta["grid_width"]), (str(self.N), str(self.N)))
+        # Cell index and centre coordinates are on the cache grid
+        row, col = df["cell_row"].to_numpy(), df["cell_col"].to_numpy()
+        np.testing.assert_allclose(df["longitude"], self.WEST + (col + 0.5) * self.RES)
+        np.testing.assert_allclose(df["latitude"], self.NORTH - (row + 0.5) * self.RES)
 
     def test_values_are_the_maximum_over_lead_times(self):
-        with rasterio.open(self._run()) as r:
-            data = r.read()
-        dist = np.ones(self.elev_block.size)
-        for band, wind in ((0, 50.1), (49, 55.0), (50, 50.0)):   # member 1, member 50, control
-            expected = bathtub_surge(np.full(self.elev_block.size, wind), self.elev_block.ravel().astype(float),
-                                     dist).reshape(self.elev_block.shape)
-            np.testing.assert_allclose(data[band], expected, atol=1e-4)
-        # Low cells flooded, high cells dry (0, not nodata), and nothing is nodata on the coast
-        self.assertTrue((data[50][:, 0] > 0).all())
-        self.assertTrue((data[50][:, -1] == 0).all())
-        self.assertFalse(np.isnan(data).any())
+        df = pd.read_parquet(self._run())
+        for member, wind in ((1, 50.1), (50, 55.0), (51, 50.0)):     # member 1, member 50, control
+            expected = self._expected_surge(wind)
+            got = np.zeros_like(expected)                            # cells not listed are 0 for this member
+            got[df["cell_row"] - 10, df["cell_col"] - 10] = df[f"member_{member}"]
+            np.testing.assert_allclose(got, expected, atol=1e-4)
 
-    def test_nodata_outside_coastal_cells(self):
-        # Remove one coastal cell from the cache: it must come out as nodata, not 0
+    def test_only_flooded_cells_are_listed(self):
+        df = pd.read_parquet(self._run())
+        flooded_by_any = self._expected_surge(55.0) > 0              # member 50 has the highest wind
+        self.assertEqual(len(df), int(flooded_by_any.sum()))
+        self.assertTrue(0 < len(df) < self.elev_block.size)
+        self.assertFalse((df["cell_col"] == 29).any())               # the 9 m cells stay dry: not listed
+        self.assertTrue((df[[f"member_{m}" for m in range(1, 52)]].max(axis=1) > 0).all())
+
+    def test_cell_removed_from_the_cache_is_not_listed(self):
+        # Remove the lowest coastal cell (elevation 0 m, certainly flooded) from the cache
         with rasterio.open(self.dem, "r+") as dst:
             elev = dst.read(1)
             elev[10, 10] = np.nan
             dst.write(elev, 1)
-        with rasterio.open(self._run()) as r:
-            band = r.read(51)
-        self.assertTrue(np.isnan(band[0, 0]))
-        self.assertEqual(int(np.isnan(band).sum()), 1)
+        df = pd.read_parquet(self._run())
+        self.assertFalse(((df["cell_row"] == 10) & (df["cell_col"] == 10)).any())
+        self.assertTrue(((df["cell_row"] == 11) & (df["cell_col"] == 10)).any())
 
 
 if __name__ == "__main__":

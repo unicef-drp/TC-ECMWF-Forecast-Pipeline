@@ -46,14 +46,14 @@ Coverage
     Only 1x1 degree tiles within --max-dist-km of a coastline are processed.
 
 Destination (the three sources SURGE_DEM_SOURCE can read from)
-    --upload snowflake  Snowflake stage, @SNOWFLAKE_STAGE_NAME/surge/coastal_dem/v1/ (default)
-    --upload blob       Azure Blob Storage, surge/coastal_dem/v1/ in CONTAINER_NAME
+    --upload blob       Azure Blob Storage, surge/coastal_dem/v1/ in CONTAINER_NAME (default)
                         (ACCOUNT_URL, SAS_TOKEN, CONTAINER_NAME, same variables as the pipeline)
+    --upload snowflake  Snowflake stage, @SNOWFLAKE_STAGE_NAME/surge/coastal_dem/v1/
     --local-only DIR    kept locally only, no upload
 
 Usage:
-    python3 setup_surge_dem.py --deltadtm-dir deltadtm                       # global, Snowflake stage
-    python3 setup_surge_dem.py --deltadtm-dir deltadtm --upload blob         # global, Blob Storage
+    python3 setup_surge_dem.py --deltadtm-dir deltadtm                       # global, Blob Storage
+    python3 setup_surge_dem.py --deltadtm-dir deltadtm --upload snowflake    # global, Snowflake stage
     python3 setup_surge_dem.py --deltadtm-dir deltadtm --local-only surge_dem
     python3 setup_surge_dem.py --deltadtm-dir deltadtm --bbox -79 17 -76 19 --local-only surge_dem
                                                                          # small region, for testing
@@ -501,7 +501,7 @@ def main():
     parser.add_argument("--deltadtm-dir", default="deltadtm",
                         help=f"Folder where the DeltaDTM archives are downloaded and kept, from "
                              f"{DELTADTM_URL} (default: deltadtm)")
-    parser.add_argument("--upload", choices=("snowflake", "blob"), default="snowflake",
+    parser.add_argument("--upload", choices=("snowflake", "blob"), default="blob",
                         help="Where to upload the cache, under surge/coastal_dem/v1/: Snowflake "
                              "stage or Azure Blob Storage (default: snowflake)")
     parser.add_argument("--local-only", metavar="DIR", default=None,
